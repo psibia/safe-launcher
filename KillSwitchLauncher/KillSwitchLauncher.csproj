@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>KillSwitchLauncher</AssemblyName>
+    <RootNamespace>KillSwitchLauncher</RootNamespace>
+    <ApplicationIcon>Assets\logo.ico</ApplicationIcon>
+    <Product>Безопасный лаунчер</Product>
+    <AssemblyTitle>Безопасный лаунчер</AssemblyTitle>
+    <Version>1.0.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Тестам (KillSwitchLauncher.Tests) нужны внутренние методы -->
+    <InternalsVisibleTo Include="KillSwitchLauncher.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Resource Include="Assets\logo.png" />
+    <Resource Include="Assets\logo.ico" />
+  </ItemGroup>
+
+</Project>

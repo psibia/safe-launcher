@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Тесты лаунчера. Запуск: Visual Studio → Тест → Обозреватель тестов → «Запустить все»,
+       или в консоли из папки решения: dotnet test -->
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+    <RootNamespace>KillSwitchLauncher.Tests</RootNamespace>
+
+    <!-- Сборка тестов — ещё и маленькая программа-«приложение» для тестов контроля процессов
+         (см. TestApp.cs). Поэтому своя точка входа вместо сгенерированной,
+         а WinExe — чтобы при тестах не мелькали окна консоли. -->
+    <OutputType>WinExe</OutputType>
+    <GenerateProgramFile>false</GenerateProgramFile>
+    <StartupObject>KillSwitchLauncher.Tests.TestApp</StartupObject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.1" />
+    <PackageReference Include="xunit" Version="2.9.2" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.8.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Тесты запускают настоящие процессы и мьютексы: по очереди надёжнее -->
+    <Content Include="xunit.runner.json" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\KillSwitchLauncher\KillSwitchLauncher.csproj" />
+  </ItemGroup>
+
+</Project>
