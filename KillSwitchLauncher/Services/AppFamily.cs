@@ -254,7 +254,10 @@ public sealed class AppFamily
         return length > 0 && length < buffer.Capacity ? buffer.ToString() : null;
     }
 
-    private static string? GetFinalPath(string path)
+    /// <summary>
+    /// Настоящий путь: без коротких имён, ссылок и дисков subst; сетевой диск — путём \\сервер\папка. null — не открыть.
+    /// </summary>
+    internal static string? GetFinalPath(string path)
     {
         const uint fileReadAttributes = 0x0080;
         const uint shareAll = 0x00000007;

@@ -51,6 +51,20 @@ public static class Wait
 
         return condition();
     }
+
+    /// <summary>То же, но не занимает поток: для таймеров, которые работают в пуле потоков.</summary>
+    public static async Task<bool> UntilAsync(Func<bool> condition, TimeSpan timeout)
+    {
+        var watch = Stopwatch.StartNew();
+        while (watch.Elapsed < timeout)
+        {
+            if (condition())
+                return true;
+            await Task.Delay(50);
+        }
+
+        return condition();
+    }
 }
 
 /// <summary>IProgress без SynchronizationContext: отчёты приходят сразу.</summary>

@@ -2,6 +2,7 @@ using System;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
+using KillSwitchLauncher.ViewModels;
 using KillSwitchLauncher.Views;
 using Microsoft.Win32;
 
@@ -11,6 +12,7 @@ namespace KillSwitchLauncher.Services;
 public interface IDialogService
 {
     string? PickExecutableOrShortcut();
+    void ShowInfo(string message, string title);
     void ShowWarning(string message, string title = "Внимание");
     void ShowError(string message, string title = "Ошибка");
     bool Confirm(string title, string message, string confirmText, bool destructive = false);
@@ -26,6 +28,21 @@ public interface IDialogService
 
     /// <summary>Окно журнала событий.</summary>
     void ShowActivityLog(ActivityLog log);
+
+    /// <summary>Окно журнала DNS приложения. Не модальное; если уже открыто — выводится на передний план.</summary>
+    void ShowDnsJournal(AppTileViewModel tile, DnsJournal journal);
+
+    /// <summary>Закрыть окно журнала DNS приложения, если оно открыто.</summary>
+    void CloseDnsJournal(Guid appId);
+
+    /// <summary>Несохранённые изменения: true — сохранить, false — не сохранять, null — остаться на странице.</summary>
+    bool? AskSave(string title, string message, string saveText);
+
+    /// <summary>Файл .conf WireGuard; null — не выбран.</summary>
+    string? PickWireGuardFile();
+
+    /// <summary>Текст из буфера обмена; null — там не текст или буфер занят другой программой.</summary>
+    string? ReadClipboardText();
 }
 
 public sealed class DialogService : IDialogService
@@ -45,6 +62,9 @@ public sealed class DialogService : IDialogService
 
         return dialog.ShowDialog(Application.Current.MainWindow) == true ? dialog.FileName : null;
     }
+
+    public void ShowInfo(string message, string title) =>
+        WithDimmedOwner(owner => AlertWindow.ShowMessage(owner, AlertKind.Info, title, message));
 
     public void ShowWarning(string message, string title = "Внимание") =>
         WithDimmedOwner(owner => AlertWindow.ShowMessage(owner, AlertKind.Warning, title, message));
@@ -83,6 +103,43 @@ public sealed class DialogService : IDialogService
     }
 
     public void ShowActivityLog(ActivityLog log) => WithDimmedOwner(owner => ActivityLogWindow.Show(owner, log));
+
+    public void ShowDnsJournal(AppTileViewModel tile, DnsJournal journal) =>
+        DnsJournalWindow.ShowFor(Application.Current?.MainWindow, tile, journal);
+
+    public void CloseDnsJournal(Guid appId) => DnsJournalWindow.CloseFor(appId);
+
+    public bool? AskSave(string title, string message, string saveText)
+    {
+        bool? result = null;
+        WithDimmedOwner(owner => result = AlertWindow.AskSave(owner, title, message, saveText));
+        return result;
+    }
+
+    public string? PickWireGuardFile()
+    {
+        var dialog = new OpenFileDialog
+        {
+            Title = "Выберите файл WireGuard",
+            Filter = "Файлы WireGuard (*.conf)|*.conf|Все файлы (*.*)|*.*",
+            CheckFileExists = true,
+            Multiselect = false
+        };
+
+        return dialog.ShowDialog(Application.Current.MainWindow) == true ? dialog.FileName : null;
+    }
+
+    public string? ReadClipboardText()
+    {
+        try
+        {
+            return Clipboard.ContainsText() ? Clipboard.GetText() : null;
+        }
+        catch (System.Runtime.InteropServices.COMException)
+        {
+            return null; // буфер обмена открыт другой программой
+        }
+    }
 
     /// <summary>
     /// Пока открыт диалог, главное окно затемняется. Если окно свёрнуто или убрано в трей, сначала оно

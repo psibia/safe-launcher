@@ -12,6 +12,13 @@ public partial class App : Application
     {
         base.OnStartup(e);
 
+        // Помощник журнала DNS: та же программа с правами администратора, без окон (см. DnsCollector).
+        if (e.Args.Length > 0 && e.Args[0] == DnsCollector.Argument)
+        {
+            Shutdown(DnsCollector.Run(e.Args));
+            return;
+        }
+
         // После установки обновления старая копия может ещё закрываться: даём ей время.
         var wait = UpdateService.IsUpdatePending ? TimeSpan.FromSeconds(15) : TimeSpan.Zero;
         _instance = SingleInstance.TryAcquire(wait);
@@ -23,10 +30,19 @@ public partial class App : Application
             return;
         }
 
+        // При выходе из Windows лаунчер закрывается последним из программ: приложения под его защитой успевают
+        // закрыться сами, пока подключение ещё работает.
+        NativeMethods.SetProcessShutdownParameters(0x100, 0);
+
         var window = new MainWindow();
         MainWindow = window;
         _instance.ListenForActivation(() => Dispatcher.BeginInvoke(window.ShowFromTray));
-        window.Show();
+
+        // Автозапуск при входе в Windows: сразу в трей, окно откроется по значку.
+        if (Array.IndexOf(e.Args, AutoStart.Argument) >= 0)
+            window.StartInTray();
+        else
+            window.Show();
     }
 
     protected override void OnSessionEnding(SessionEndingCancelEventArgs e)

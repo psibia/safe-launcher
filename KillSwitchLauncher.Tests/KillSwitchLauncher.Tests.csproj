@@ -33,6 +33,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\KillSwitchLauncher\KillSwitchLauncher.csproj" />
+    <ProjectReference Include="..\SafeLauncher.Service\SafeLauncher.Service.csproj" />
   </ItemGroup>
 
 </Project>

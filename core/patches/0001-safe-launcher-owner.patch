@@ -1,0 +1,280 @@
+diff --git a/common/process/launcher_owner_windows.go b/common/process/launcher_owner_windows.go
+new file mode 100644
+index 0000000..4550784
+--- /dev/null
++++ b/common/process/launcher_owner_windows.go
+@@ -0,0 +1,258 @@
++package process
++
++// Safe Launcher: which app of the launcher owns a process.
++//
++// The launcher starts the core with SAFE_LAUNCHER_OWNER_PIPE set to the name of its named pipe.
++// For every new connection the core asks the launcher about the owning PID. If the process was
++// started from the launcher (or is a descendant of such a process), the launcher answers with the
++// app's tag and the process path becomes "launcher:<tag>|<real path>". Route rules match it with
++// process_path_regex; process_name still sees the real executable name.
++//
++// Protocol: request uint32 PID (little endian); response uint16 length + UTF-8 tag, length 0 means
++// "not a launcher process". If the launcher is unreachable, the path is left untouched, except for
++// processes the launcher has already tagged: their last answer is remembered (by PID and process
++// creation time), so a briefly busy launcher does not send a known app's new connections direct.
++// For a second after a failed question such processes are answered from memory without waiting
++// for the pipe; other processes keep asking the launcher.
++//
++// SAFE_LAUNCHER_OWNER_PID (required) is the launcher's PID: answers are accepted only from a pipe
++// served by that process, and only processes in the launcher's Windows session can be tagged, so a
++// launcher of one user cannot claim processes of another. Tags are limited to [A-Za-z0-9_-]{1,64}.
++
++import (
++	"encoding/binary"
++	"io"
++	"net"
++	"os"
++	"strconv"
++	"sync"
++	"sync/atomic"
++	"time"
++
++	E "github.com/sagernet/sing/common/exceptions"
++
++	"github.com/tailscale/go-winio"
++	"golang.org/x/sys/windows"
++)
++
++const (
++	launcherOwnerPipeEnv   = "SAFE_LAUNCHER_OWNER_PIPE"
++	launcherOwnerServerEnv = "SAFE_LAUNCHER_OWNER_PID"
++	launcherOwnerTimeout   = 500 * time.Millisecond
++	launcherTagPrefix      = "launcher:"
++	launcherTagSeparator   = "|"
++	launcherKnownLimit     = 4096
++	launcherOwnerRecovery  = time.Second
++)
++
++type launcherOwnerClient struct {
++	path          string
++	serverPID     uint32
++	serverSession uint32
++	access        sync.Mutex // the pipe
++	conn          net.Conn
++	knownAccess   sync.Mutex
++	known         map[uint32]launcherKnownProcess
++	failedAt      atomic.Int64 // time of the last failed question since launcherOwnerEpoch, 0 if none
++}
++
++// launcherKnownProcess is the last tag the launcher gave a process (guarded by knownAccess).
++type launcherKnownProcess struct {
++	created uint64
++	tag     string
++}
++
++var (
++	launcherOwnerEpoch = time.Now() // monotonic clock base for failedAt
++	launcherOwner      = newLauncherOwnerClient()
++)
++
++func newLauncherOwnerClient() *launcherOwnerClient {
++	name := os.Getenv(launcherOwnerPipeEnv)
++	if name == "" {
++		return nil
++	}
++	pid, err := strconv.ParseUint(os.Getenv(launcherOwnerServerEnv), 10, 32)
++	if err != nil || pid == 0 {
++		return nil
++	}
++	client := &launcherOwnerClient{path: `\\.\pipe\` + name, serverPID: uint32(pid), known: make(map[uint32]launcherKnownProcess)}
++	if windows.ProcessIdToSessionId(client.serverPID, &client.serverSession) != nil {
++		return nil
++	}
++	return client
++}
++
++// lookup asks the launcher about the process and remembers the answer. The answer is stored while
++// the pipe is still held, so answers for one PID are remembered in the order they were given.
++func (c *launcherOwnerClient) lookup(pid uint32, created uint64, createdOK bool) (string, error) {
++	c.access.Lock()
++	defer c.access.Unlock()
++	var lastErr error
++	for attempt := 0; attempt < 2; attempt++ {
++		if c.conn == nil {
++			conn, err := c.dial()
++			if err != nil {
++				lastErr = err
++				break
++			}
++			c.conn = conn
++		}
++		tag, err := c.query(pid)
++		if err == nil {
++			c.remember(pid, created, createdOK, tag)
++			return tag, nil
++		}
++		lastErr = err
++		c.conn.Close()
++		c.conn = nil
++	}
++	c.failedAt.Store(int64(time.Since(launcherOwnerEpoch)) | 1)
++	return "", lastErr
++}
++
++// recovering reports whether a question to the launcher failed less than a second ago.
++func (c *launcherOwnerClient) recovering() bool {
++	failed := c.failedAt.Load()
++	return failed != 0 && time.Since(launcherOwnerEpoch)-time.Duration(failed) < launcherOwnerRecovery
++}
++
++func (c *launcherOwnerClient) dial() (net.Conn, error) {
++	timeout := launcherOwnerTimeout
++	conn, err := winio.DialPipe(c.path, &timeout)
++	if err != nil {
++		return nil, err
++	}
++	// Answers are trusted only from the launcher that started the core.
++	var serverPID uint32
++	if fd, ok := conn.(interface{ Fd() uintptr }); ok {
++		err = windows.GetNamedPipeServerProcessId(windows.Handle(fd.Fd()), &serverPID)
++	} else {
++		err = E.New("launcher owner pipe: no handle")
++	}
++	if err != nil || serverPID != c.serverPID {
++		conn.Close()
++		return nil, E.New("launcher owner pipe: unexpected server")
++	}
++	return conn, nil
++}
++
++func (c *launcherOwnerClient) query(pid uint32) (string, error) {
++	err := c.conn.SetDeadline(time.Now().Add(launcherOwnerTimeout))
++	if err != nil {
++		return "", err
++	}
++	var request [4]byte
++	binary.LittleEndian.PutUint32(request[:], pid)
++	if _, err = c.conn.Write(request[:]); err != nil {
++		return "", err
++	}
++	var length [2]byte
++	if _, err = io.ReadFull(c.conn, length[:]); err != nil {
++		return "", err
++	}
++	size := binary.LittleEndian.Uint16(length[:])
++	if size == 0 {
++		return "", nil
++	}
++	tag := make([]byte, size)
++	if _, err = io.ReadFull(c.conn, tag); err != nil {
++		return "", err
++	}
++	return string(tag), nil
++}
++
++// launcherTaggedPath returns the process path with the launcher tag, or ok=false if the process
++// does not belong to an app of the launcher.
++func launcherTaggedPath(pid uint32, path string) (string, bool) {
++	if launcherOwner == nil || pid == 0 || pid == 4 {
++		return path, false
++	}
++	var session uint32
++	if windows.ProcessIdToSessionId(pid, &session) != nil || session != launcherOwner.serverSession {
++		return path, false
++	}
++	created, createdOK := processCreationTime(pid)
++	if createdOK && launcherOwner.recovering() {
++		// The launcher has just failed to answer: a known process does not queue behind the pipe.
++		if tag, known := launcherOwner.knownTag(pid, created); known && validLauncherTag(tag) {
++			return launcherTagPrefix + tag + launcherTagSeparator + path, true
++		}
++	}
++	tag, err := launcherOwner.lookup(pid, created, createdOK)
++	if err != nil {
++		// No answer: a process the launcher has already tagged stays with its app.
++		if !createdOK {
++			return path, false
++		}
++		var known bool
++		tag, known = launcherOwner.knownTag(pid, created)
++		if !known {
++			return path, false
++		}
++	}
++	if !validLauncherTag(tag) {
++		return path, false
++	}
++	return launcherTagPrefix + tag + launcherTagSeparator + path, true
++}
++
++func (c *launcherOwnerClient) knownTag(pid uint32, created uint64) (string, bool) {
++	c.knownAccess.Lock()
++	defer c.knownAccess.Unlock()
++	known, ok := c.known[pid]
++	if !ok || known.created != created {
++		return "", false
++	}
++	return known.tag, true
++}
++
++func (c *launcherOwnerClient) remember(pid uint32, created uint64, createdOK bool, tag string) {
++	c.knownAccess.Lock()
++	defer c.knownAccess.Unlock()
++	if !validLauncherTag(tag) {
++		delete(c.known, pid) // "not ours"
++		return
++	}
++	if !createdOK {
++		return
++	}
++	if _, ok := c.known[pid]; !ok && len(c.known) >= launcherKnownLimit {
++		// Full: forget processes that have exited (or whose PID now belongs to another process).
++		for known, process := range c.known {
++			if current, ok := processCreationTime(known); !ok || current != process.created {
++				delete(c.known, known)
++			}
++		}
++		if len(c.known) >= launcherKnownLimit {
++			c.known = make(map[uint32]launcherKnownProcess)
++		}
++	}
++	c.known[pid] = launcherKnownProcess{created: created, tag: tag}
++}
++
++// processCreationTime identifies a process together with its PID (PIDs are reused).
++func processCreationTime(pid uint32) (uint64, bool) {
++	handle, err := windows.OpenProcess(windows.PROCESS_QUERY_LIMITED_INFORMATION, false, pid)
++	if err != nil {
++		return 0, false
++	}
++	defer windows.CloseHandle(handle)
++	var creation, exit, kernel, user windows.Filetime
++	if windows.GetProcessTimes(handle, &creation, &exit, &kernel, &user) != nil {
++		return 0, false
++	}
++	return uint64(creation.HighDateTime)<<32 | uint64(creation.LowDateTime), true
++}
++
++func validLauncherTag(tag string) bool {
++	if len(tag) == 0 || len(tag) > 64 {
++		return false
++	}
++	for _, r := range tag {
++		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_') {
++			return false
++		}
++	}
++	return true
++}
+diff --git a/common/process/searcher_windows.go b/common/process/searcher_windows.go
+index f011765..003d175 100644
+--- a/common/process/searcher_windows.go
++++ b/common/process/searcher_windows.go
+@@ -41,6 +41,11 @@ func (s *windowsSearcher) FindProcessInfo(ctx context.Context, network string, s
+ 		return nil, err
+ 	}
+ 	path, err := getProcessPath(pid)
++	// Safe Launcher: processes of launcher apps get a tagged path (see launcher_owner_windows.go),
++	// even if the real path could not be read.
++	if tagged, ok := launcherTaggedPath(pid, path); ok {
++		return &adapter.ConnectionOwner{ProcessID: pid, ProcessPath: tagged, UserId: -1}, nil
++	}
+ 	if err != nil {
+ 		return &adapter.ConnectionOwner{ProcessID: pid, UserId: -1}, err
+ 	}

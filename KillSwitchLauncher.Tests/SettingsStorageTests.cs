@@ -87,6 +87,17 @@ public class SettingsStorageTests
     }
 
     [Fact]
+    public void RussianNames_AreReadableInFile()
+    {
+        using var dir = new TempDir();
+        var storage = new SettingsStorage(dir.File("settings.json"));
+        storage.Save(new AppSettings { Apps = { new AppEntry { Name = "Телеграм", ExePath = @"C:\Apps\Telegram.exe" } } });
+
+        Assert.Contains("\"Name\": \"Телеграм\"", File.ReadAllText(storage.FilePath));
+        Assert.Equal("Телеграм", storage.Load().Apps[0].Name);
+    }
+
+    [Fact]
     public void OldSettingsWithoutNewFields_LoadWithDefaults()
     {
         using var dir = new TempDir();

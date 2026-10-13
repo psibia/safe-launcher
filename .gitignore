@@ -3,4 +3,6 @@ obj/
 .vs/
 *.user
 installer/publish/
+installer/publish-core/
 installer/Output/
+installer/launcher-core.exe

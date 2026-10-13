@@ -38,7 +38,7 @@ public class MainViewModelTests : IDisposable
         {
             var log = Log;
             var vm = new MainViewModel(Storage, _dialogs, Dispatcher.CurrentDispatcher, log,
-                new UpdateService(_dir.File("update-pending.json"), _dir.File("download")));
+                new UpdateService(_dir.File("update-pending.json"), _dir.File("download")), guardBackend: QuietGuard.Create, systemProxy: () => null);
             try
             {
                 test(vm, log);
@@ -187,10 +187,10 @@ public class MainViewModelTests : IDisposable
         WithViewModel((vm, _) =>
         {
             vm.OpenSettingsCommand.Execute(null);
-            Assert.True(vm.IsRulesPanelOpen);
+            Assert.True(vm.IsSettingsOpen);
             vm.HideBehavior = HideBehavior.Exit;
 
-            vm.IsRulesPanelOpen = false;
+            vm.IsSettingsOpen = false; // на вопрос «Применить изменения?» — «Не сохранять»
 
             Assert.Equal(HideBehavior.Ask, vm.HideBehavior);
             Assert.False(vm.HasPendingChanges);

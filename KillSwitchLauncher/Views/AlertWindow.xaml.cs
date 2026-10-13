@@ -77,6 +77,26 @@ public partial class AlertWindow : Window
         return choice;
     }
 
+    /// <summary>
+    /// Уход со страницы с несохранёнными изменениями: true — сохранить, false — не сохранять, null — остаться (Esc).
+    /// </summary>
+    public static bool? AskSave(Window? owner, string title, string message, string saveText)
+    {
+        var alert = new AlertWindow(AlertKind.Info, title, message);
+        bool? choice = null;
+        alert.AddChoice("Остаться", "SecondaryButton", isDefault: false, () => choice = null);
+        alert.AddChoice("Не сохранять", "SecondaryButton", isDefault: false, () => choice = false);
+        alert.AddChoice(saveText, "PrimaryButton", isDefault: true, () => choice = true);
+        alert.PreviewKeyDown += (_, e) =>
+        {
+            if (e.Key == Key.Escape)
+                alert.Close();
+        };
+
+        alert.ShowWithOwner(owner);
+        return choice;
+    }
+
     private void AddChoice(string text, string styleKey, bool isDefault, System.Action onClick)
     {
         AddButton(text, styleKey, result: true, isDefault, isCancel: false);

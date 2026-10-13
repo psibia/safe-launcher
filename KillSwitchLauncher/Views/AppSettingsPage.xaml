@@ -1,0 +1,267 @@
+<UserControl x:Class="KillSwitchLauncher.Views.AppSettingsPage"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:views="clr-namespace:KillSwitchLauncher.Views">
+    <!-- Страница приложения (DataContext — AppSettingsViewModel): условие запуска, защита, исключения, журнал DNS,
+         параметры запуска. Изменения попадают в приложение по «Сохранить» (у нового — «Добавить»). -->
+    <UserControl.Resources>
+        <!-- Заголовок раздела на странице -->
+        <Style x:Key="BlockTitle" TargetType="TextBlock" BasedOn="{StaticResource SectionTitle}">
+            <Setter Property="FontSize" Value="15" />
+            <Setter Property="Margin" Value="0,26,0,4" />
+        </Style>
+    </UserControl.Resources>
+
+    <Grid>
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+            <RowDefinition Height="Auto" />
+        </Grid.RowDefinitions>
+
+        <!-- ===================== Заголовок страницы ===================== -->
+        <Grid Grid.Row="0" Margin="40,0,40,14">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+            <Button Grid.Column="0" Style="{StaticResource GhostButton}" Padding="16,9" ToolTip="Вернуться к приложениям (Esc)"
+                    Command="{Binding DataContext.BackCommand, RelativeSource={RelativeSource AncestorType=Window}}">
+                <StackPanel Orientation="Horizontal">
+                    <views:GlyphIcon Glyph="&#xE72B;" Size="12" Margin="0,0,9,0" VerticalAlignment="Center" />
+                    <TextBlock Text="Приложения" VerticalAlignment="Center" />
+                </StackPanel>
+            </Button>
+            <TextBlock Grid.Column="1" Text="{Binding Title}" Style="{StaticResource PageTitle}" Margin="18,0,0,0" VerticalAlignment="Center" />
+        </Grid>
+
+        <Border Grid.Row="1" Margin="20,0,20,0" CornerRadius="28" Background="{StaticResource PanelBg}">
+            <ScrollViewer Margin="0,10,6,10" Focusable="False" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                <StackPanel Margin="30,14,30,26" MaxWidth="760" HorizontalAlignment="Left">
+
+                    <!-- ===== Иконка, название, путь ===== -->
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <Border Grid.Column="0" Width="64" Height="64" CornerRadius="32" Background="{StaticResource CardBg}"
+                                Effect="{StaticResource SmallShadow}" VerticalAlignment="Top">
+                            <Grid>
+                                <Image Source="{Binding Icon}" Width="38" Height="38" RenderOptions.BitmapScalingMode="HighQuality" />
+                                <views:GlyphIcon Glyph="&#xE7C3;" Size="22" Foreground="{StaticResource Accent}" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                    <views:GlyphIcon.Style>
+                                        <Style TargetType="views:GlyphIcon">
+                                            <Setter Property="Visibility" Value="Collapsed" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding Icon}" Value="{x:Null}">
+                                                    <Setter Property="Visibility" Value="Visible" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </views:GlyphIcon.Style>
+                                </views:GlyphIcon>
+                            </Grid>
+                        </Border>
+                        <StackPanel Grid.Column="1" Margin="16,0,0,0">
+                            <TextBlock Text="НАЗВАНИЕ" Style="{StaticResource GroupTitle}" Margin="4,0,0,6" />
+                            <TextBox Style="{StaticResource InputBox}" FontSize="14" FontWeight="SemiBold" Tag="Название приложения"
+                                     Text="{Binding Name, UpdateSourceTrigger=PropertyChanged}" />
+                            <TextBlock Text="{Binding PathText}" Style="{StaticResource Caption}" Margin="4,6,0,0" TextWrapping="NoWrap"
+                                       TextTrimming="CharacterEllipsis" ToolTip="{Binding PathText}" />
+                        </StackPanel>
+                    </Grid>
+
+                    <!-- ===== Условие запуска ===== -->
+                    <TextBlock Text="Условие запуска" Style="{StaticResource BlockTitle}" />
+                    <TextBlock Style="{StaticResource Caption}" Margin="0,0,0,12" Text="Через что приложение выходит в интернет и когда его можно запускать." />
+
+                    <StackPanel>
+                        <RadioButton Style="{StaticResource ChoiceCard}"
+                                     IsChecked="{Binding Mode, Converter={StaticResource EnumToBool}, ConverterParameter=Inherit}">
+                            <StackPanel>
+                                <TextBlock Text="Как в общих" FontWeight="Bold" FontSize="13.5" />
+                                <TextBlock Text="{Binding InheritText}" Style="{StaticResource Caption}" Margin="0,2,0,0" />
+                            </StackPanel>
+                        </RadioButton>
+                        <RadioButton Style="{StaticResource ChoiceCard}"
+                                     IsChecked="{Binding Mode, Converter={StaticResource EnumToBool}, ConverterParameter=OwnAdapters}">
+                            <StackPanel>
+                                <TextBlock Text="Свои адаптеры" FontWeight="Bold" FontSize="13.5" />
+                                <TextBlock Style="{StaticResource Caption}" Margin="0,2,0,0"
+                                           Text="Системный VPN со своим правилом: какие VPN-адаптеры должны быть включены. Маршрутом управляет ваша VPN-программа, лаунчер следит, что она включена." />
+                            </StackPanel>
+                        </RadioButton>
+                        <RadioButton Style="{StaticResource ChoiceCard}"
+                                     IsChecked="{Binding Mode, Converter={StaticResource EnumToBool}, ConverterParameter=OwnConnection}">
+                            <StackPanel>
+                                <TextBlock Text="Своё подключение" FontWeight="Bold" FontSize="13.5" />
+                                <TextBlock Style="{StaticResource Caption}" Margin="0,2,0,0"
+                                           Text="Приложение пойдёт через выбранное подключение лаунчера, что бы ни было выбрано в общих настройках." />
+                            </StackPanel>
+                        </RadioButton>
+                    </StackPanel>
+
+                    <!-- Свои адаптеры -->
+                    <Border Style="{StaticResource PageCard}" Margin="0,6,0,0" Padding="18,16"
+                            Visibility="{Binding IsOwnAdapters, Converter={StaticResource BoolToVis}}">
+                        <StackPanel>
+                            <Border Background="{StaticResource SubtleBg}" CornerRadius="14" Padding="4">
+                                <UniformGrid Columns="3">
+                                    <RadioButton Style="{StaticResource SegmentRadio}" Content="Любой VPN"
+                                                 IsChecked="{Binding RuleMode, Converter={StaticResource EnumToBool}, ConverterParameter=AnyVpn}" />
+                                    <RadioButton Style="{StaticResource SegmentRadio}" Content="Один из"
+                                                 IsChecked="{Binding RuleMode, Converter={StaticResource EnumToBool}, ConverterParameter=AnyOfSelected}" />
+                                    <RadioButton Style="{StaticResource SegmentRadio}" Content="Все"
+                                                 IsChecked="{Binding RuleMode, Converter={StaticResource EnumToBool}, ConverterParameter=AllOfSelected}" />
+                                </UniformGrid>
+                            </Border>
+                            <TextBlock Text="{Binding RuleHint}" Style="{StaticResource Caption}" Margin="4,8,0,12" />
+                            <Border Style="{StaticResource WarnBox}" Margin="0,0,0,12"
+                                    Visibility="{Binding NeedsAdapterSelection, Converter={StaticResource BoolToVis}}">
+                                <TextBlock TextWrapping="Wrap" Foreground="{StaticResource Warn}" FontSize="12"
+                                           Text="Не включён ни один адаптер: приложение не запустится. Включите нужный VPN ниже." />
+                            </Border>
+                            <ItemsControl ItemsSource="{Binding Adapters}" ItemTemplate="{StaticResource AdapterRowTemplate}" />
+                            <TextBlock Style="{StaticResource Caption}" Margin="4,0,0,0"
+                                       Text="Лаунчер пока не видел ни одного VPN-адаптера. Включите вашу VPN-программу, и он появится здесь."
+                                       Visibility="{Binding Adapters.Count, Converter={StaticResource ZeroToVis}}" />
+                        </StackPanel>
+                    </Border>
+
+                    <!-- Своё подключение: «Выбрать» или «Добавить подключение» -->
+                    <Border Style="{StaticResource PageCard}" Margin="0,6,0,0" Padding="18,16"
+                            Visibility="{Binding IsOwnConnection, Converter={StaticResource BoolToVis}}">
+                        <StackPanel>
+                            <Border Background="{StaticResource SubtleBg}" CornerRadius="14" Padding="4" HorizontalAlignment="Left">
+                                <StackPanel Orientation="Horizontal">
+                                    <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="120" Content="Выбрать"
+                                                 IsChecked="{Binding IsChooseTab, Mode=OneWay}" Command="{Binding ChooseTabCommand}" />
+                                    <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="190" Content="Добавить подключение"
+                                                 IsChecked="{Binding IsAddTab}" />
+                                </StackPanel>
+                            </Border>
+
+                            <StackPanel Margin="0,12,0,0" Visibility="{Binding IsChooseTab, Converter={StaticResource BoolToVis}}">
+                                <ListBox Style="{StaticResource ChoiceList}" ItemContainerStyle="{StaticResource ChoiceItem}"
+                                         ItemTemplate="{StaticResource ConnectionChoiceTemplate}"
+                                         ItemsSource="{Binding Connections}" SelectedValuePath="Id" SelectedValue="{Binding ConnectionId}" />
+                                <TextBlock Style="{StaticResource Caption}" Margin="4,0,0,0"
+                                           Text="Подключений пока нет. Откройте «Добавить подключение» и вставьте ссылку от вашего VPN-сервиса."
+                                           Visibility="{Binding HasConnections, Converter={StaticResource InverseBoolToVis}}" />
+                            </StackPanel>
+
+                            <Border Margin="0,12,0,0" Visibility="{Binding IsAddTab, Converter={StaticResource BoolToVis}}">
+                                <views:AddConnectionForm DataContext="{Binding AddConnection}" />
+                            </Border>
+                        </StackPanel>
+                    </Border>
+
+                    <!-- ===== Защита ===== -->
+                    <TextBlock Text="Защита" Style="{StaticResource BlockTitle}" />
+                    <TextBlock Style="{StaticResource Caption}" Margin="0,0,0,12" Text="По умолчанию — как в общих настройках." />
+
+                    <Border Style="{StaticResource SettingRow}">
+                        <StackPanel>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="Не запускать без VPN" FontWeight="Bold" FontSize="13.5" VerticalAlignment="Center" />
+                                <Border Grid.Column="1" Background="{StaticResource SubtleBg}" CornerRadius="14" Padding="4" Margin="12,0,0,0">
+                                    <StackPanel Orientation="Horizontal">
+                                        <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="140" Content="{Binding RequireVpnInheritText}"
+                                                     IsChecked="{Binding RequireVpn, Converter={StaticResource EnumToBool}, ConverterParameter=Inherit}" />
+                                        <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="56" Content="Вкл"
+                                                     IsChecked="{Binding RequireVpn, Converter={StaticResource EnumToBool}, ConverterParameter=On}" />
+                                        <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="56" Content="Выкл"
+                                                     IsChecked="{Binding RequireVpn, Converter={StaticResource EnumToBool}, ConverterParameter=Off}" />
+                                    </StackPanel>
+                                </Border>
+                            </Grid>
+                            <TextBlock Text="{Binding RequireVpnHint}" Style="{StaticResource Caption}" Margin="0,6,0,0" />
+                        </StackPanel>
+                    </Border>
+
+                    <Border Style="{StaticResource SettingRow}" Margin="0,8,0,0">
+                        <StackPanel>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="Закрывать при обрыве" FontWeight="Bold" FontSize="13.5" VerticalAlignment="Center" />
+                                <Border Grid.Column="1" Background="{StaticResource SubtleBg}" CornerRadius="14" Padding="4" Margin="12,0,0,0">
+                                    <StackPanel Orientation="Horizontal">
+                                        <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="140" Content="{Binding CloseOnDropInheritText}"
+                                                     IsChecked="{Binding CloseOnDrop, Converter={StaticResource EnumToBool}, ConverterParameter=Inherit}" />
+                                        <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="56" Content="Вкл"
+                                                     IsChecked="{Binding CloseOnDrop, Converter={StaticResource EnumToBool}, ConverterParameter=On}" />
+                                        <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="56" Content="Выкл"
+                                                     IsChecked="{Binding CloseOnDrop, Converter={StaticResource EnumToBool}, ConverterParameter=Off}" />
+                                    </StackPanel>
+                                </Border>
+                            </Grid>
+                            <TextBlock Text="{Binding CloseOnDropHint}" Style="{StaticResource Caption}" Margin="0,6,0,0" />
+                        </StackPanel>
+                    </Border>
+
+                    <!-- ===== Исключения ===== -->
+                    <TextBlock Text="Исключения" Style="{StaticResource BlockTitle}" />
+                    <TextBlock Text="{Binding DomainsHint}" Style="{StaticResource Caption}" Margin="0,0,0,10" />
+                    <TextBox Style="{StaticResource InputArea}" Tag="kaspi.kz&#x0a;gosuslugi.ru"
+                             Text="{Binding DomainsText, UpdateSourceTrigger=PropertyChanged}" />
+
+                    <!-- ===== Журнал DNS ===== -->
+                    <TextBlock Text="Журнал DNS" Style="{StaticResource BlockTitle}" Margin="0,26,0,10" />
+                    <Border Style="{StaticResource SettingRow}">
+                        <CheckBox Style="{StaticResource ToggleSwitch}" IsChecked="{Binding TrackDns}">
+                            <StackPanel>
+                                <TextBlock Text="Записывать, к каким сайтам обращается приложение" FontSize="13.5" FontWeight="SemiBold" TextWrapping="Wrap" />
+                                <TextBlock Style="{StaticResource Caption}" Margin="0,1,0,0"
+                                           Text="Пригодится, чтобы найти адреса для исключений. Журнал открывается из меню плитки." />
+                            </StackPanel>
+                        </CheckBox>
+                    </Border>
+
+                    <!-- ===== Параметры запуска ===== -->
+                    <TextBlock Text="Параметры запуска" Style="{StaticResource BlockTitle}" Margin="0,26,0,10" />
+                    <TextBox Style="{StaticResource InputBox}" Tag="Без параметров" IsEnabled="{Binding CanEditArguments}"
+                             Text="{Binding Arguments, UpdateSourceTrigger=PropertyChanged}" />
+                    <TextBlock Text="{Binding ArgumentsHint}" Style="{StaticResource Caption}" Margin="4,6,0,0" />
+                </StackPanel>
+            </ScrollViewer>
+        </Border>
+
+        <!-- ===================== Сохранить / Отмена ===================== -->
+        <Border Grid.Row="2" Margin="20,12,20,14" Background="{StaticResource CardBg}" CornerRadius="22" Padding="20,10,10,10"
+                Effect="{StaticResource SmallShadow}" Visibility="{Binding HasChanges, Converter={StaticResource BoolToVis}}">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <TextBlock Grid.Column="0" VerticalAlignment="Center" TextWrapping="Wrap" FontWeight="SemiBold">
+                    <TextBlock.Style>
+                        <Style TargetType="TextBlock">
+                            <Setter Property="Text" Value="{Binding Error}" />
+                            <Setter Property="Foreground" Value="{StaticResource Danger}" />
+                            <Style.Triggers>
+                                <DataTrigger Binding="{Binding Error}" Value="{x:Null}">
+                                    <Setter Property="Text" Value="Изменения не сохранены" />
+                                    <Setter Property="Foreground" Value="{StaticResource Warn}" />
+                                </DataTrigger>
+                            </Style.Triggers>
+                        </Style>
+                    </TextBlock.Style>
+                </TextBlock>
+                <Button Grid.Column="1" Style="{StaticResource SecondaryButton}" Padding="18,8" Margin="12,0,8,0" Content="Отмена"
+                        Command="{Binding CancelCommand}" />
+                <Button Grid.Column="2" Style="{StaticResource PrimaryButton}" Padding="18,8" Content="{Binding SaveText}"
+                        Command="{Binding SaveCommand}" />
+            </Grid>
+        </Border>
+    </Grid>
+</UserControl>

@@ -1,6 +1,8 @@
 <Application x:Class="KillSwitchLauncher.App"
              xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:conv="clr-namespace:KillSwitchLauncher.Converters"
+             xmlns:views="clr-namespace:KillSwitchLauncher.Views"
              ShutdownMode="OnMainWindowClose">
     <Application.Resources>
 
@@ -642,5 +644,355 @@
                 </Trigger>
             </Style.Triggers>
         </Style>
+
+        <!-- ================================================================
+             Общее для страниц (настройки, приложение, мастер первого запуска)
+             ================================================================ -->
+
+        <BooleanToVisibilityConverter x:Key="BoolToVis" />
+        <conv:InverseBooleanToVisibilityConverter x:Key="InverseBoolToVis" />
+        <conv:EnumToBooleanConverter x:Key="EnumToBool" />
+        <conv:EnumToVisibilityConverter x:Key="EnumToVis" />
+        <conv:NullToCollapsedConverter x:Key="NullToCollapsed" />
+        <conv:AllTrueToVisibilityConverter x:Key="AllTrueToVis" />
+        <conv:ZeroToVisibleConverter x:Key="ZeroToVis" />
+        <conv:InverseBooleanConverter x:Key="InverseBool" />
+
+        <Style x:Key="PageTitle" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="22" />
+            <Setter Property="FontWeight" Value="Bold" />
+            <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+        </Style>
+        <Style x:Key="SectionTitle" TargetType="TextBlock">
+            <Setter Property="FontSize" Value="14" />
+            <Setter Property="FontWeight" Value="Bold" />
+            <Setter Property="VerticalAlignment" Value="Center" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+        </Style>
+        <!-- Подпись группы: мелкие прописные -->
+        <Style x:Key="GroupTitle" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{StaticResource TextMuted}" />
+            <Setter Property="FontSize" Value="11" />
+            <Setter Property="FontWeight" Value="Bold" />
+            <Setter Property="Margin" Value="4,0,0,0" />
+        </Style>
+        <Style x:Key="Caption" TargetType="TextBlock">
+            <Setter Property="Foreground" Value="{StaticResource TextMuted}" />
+            <Setter Property="FontSize" Value="12" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+        </Style>
+        <!-- Строка настроек: серая скруглённая подложка -->
+        <Style x:Key="SettingRow" TargetType="Border">
+            <Setter Property="Background" Value="{StaticResource RowBg}" />
+            <Setter Property="CornerRadius" Value="16" />
+            <Setter Property="Padding" Value="14,12" />
+        </Style>
+        <!-- Белая карточка раздела на странице -->
+        <Style x:Key="PageCard" TargetType="Border">
+            <Setter Property="Background" Value="{StaticResource CardBg}" />
+            <Setter Property="CornerRadius" Value="22" />
+            <Setter Property="Padding" Value="22,20" />
+            <Setter Property="Effect" Value="{StaticResource SoftShadow}" />
+        </Style>
+        <!-- Предупреждение: жёлтая плашка -->
+        <Style x:Key="WarnBox" TargetType="Border">
+            <Setter Property="Background" Value="{StaticResource WarnSoft}" />
+            <Setter Property="CornerRadius" Value="16" />
+            <Setter Property="Padding" Value="14,12" />
+        </Style>
+
+        <!-- ============ Поле ввода: скруглённое, подсказка внутри (Tag), пока пусто ============ -->
+        <Style x:Key="InputBox" TargetType="TextBox">
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
+            <Setter Property="CaretBrush" Value="{StaticResource Accent}" />
+            <Setter Property="SelectionBrush" Value="{StaticResource Accent}" />
+            <Setter Property="FontSize" Value="13" />
+            <Setter Property="MinHeight" Value="40" />
+            <Setter Property="VerticalContentAlignment" Value="Center" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="TextBox">
+                        <Border x:Name="Bd" Background="{StaticResource RowBg}" CornerRadius="14" Padding="12,8"
+                                BorderThickness="1.5" BorderBrush="Transparent">
+                            <Grid>
+                                <TextBlock x:Name="Placeholder" Text="{TemplateBinding Tag}" Foreground="{StaticResource TextMuted}"
+                                           VerticalAlignment="{TemplateBinding VerticalContentAlignment}" TextWrapping="Wrap"
+                                           Margin="2,0,0,0" Visibility="Collapsed" IsHitTestVisible="False" />
+                                <ScrollViewer x:Name="PART_ContentHost" VerticalAlignment="{TemplateBinding VerticalContentAlignment}"
+                                              Focusable="False" HorizontalScrollBarVisibility="Hidden" />
+                            </Grid>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="Text" Value="">
+                                <Setter TargetName="Placeholder" Property="Visibility" Value="Visible" />
+                            </Trigger>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="#E2E2E8" />
+                            </Trigger>
+                            <Trigger Property="IsKeyboardFocused" Value="True">
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="{StaticResource Accent}" />
+                                <Setter TargetName="Bd" Property="Background" Value="{StaticResource CardBg}" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Foreground" Value="{StaticResource TextMuted}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <!-- Многострочное поле: ссылки, текст WireGuard, домены -->
+        <Style x:Key="InputArea" TargetType="TextBox" BasedOn="{StaticResource InputBox}">
+            <Setter Property="AcceptsReturn" Value="True" />
+            <Setter Property="TextWrapping" Value="Wrap" />
+            <Setter Property="VerticalContentAlignment" Value="Top" />
+            <Setter Property="VerticalScrollBarVisibility" Value="Auto" />
+            <Setter Property="MinHeight" Value="76" />
+            <Setter Property="MaxHeight" Value="140" />
+        </Style>
+
+        <!-- ============ Пункт меню слева в настройках ============ -->
+        <Style x:Key="NavItem" TargetType="RadioButton">
+            <Setter Property="Foreground" Value="{StaticResource TextSecondary}" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="FontSize" Value="13" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Margin" Value="0,0,0,4" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RadioButton">
+                        <Border x:Name="Bd" CornerRadius="14" Padding="14,10" Background="Transparent">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="{TemplateBinding Tag}" FontFamily="{StaticResource IconFont}" FontSize="14"
+                                           VerticalAlignment="Center" Margin="0,0,12,0" FontWeight="Normal" />
+                                <ContentPresenter Grid.Column="1" VerticalAlignment="Center" />
+                            </Grid>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="{StaticResource SubtleBg}" />
+                                <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
+                            </Trigger>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="{StaticResource CardBg}" />
+                                <Setter TargetName="Bd" Property="Effect" Value="{StaticResource SmallShadow}" />
+                                <Setter Property="Foreground" Value="{StaticResource Accent}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ============ Вариант выбора карточкой: кружок слева, заголовок и пояснение в содержимом ============ -->
+        <Style x:Key="ChoiceCard" TargetType="RadioButton">
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+            <Setter Property="Margin" Value="0,0,0,8" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="RadioButton">
+                        <Border x:Name="Bd" CornerRadius="16" Padding="14,12" Background="{StaticResource RowBg}"
+                                BorderThickness="1.5" BorderBrush="Transparent">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                </Grid.ColumnDefinitions>
+                                <Grid Grid.Column="0" Width="20" Height="20" VerticalAlignment="Top" Margin="0,1,12,0">
+                                    <Ellipse x:Name="Ring" Stroke="#D0D0D8" StrokeThickness="1.5" Fill="{StaticResource CardBg}" />
+                                    <Ellipse x:Name="Dot" Width="10" Height="10" Fill="{StaticResource AccentGradient}" Opacity="0" />
+                                </Grid>
+                                <ContentPresenter Grid.Column="1" VerticalAlignment="Center" />
+                            </Grid>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Ring" Property="Stroke" Value="{StaticResource Accent}" />
+                            </Trigger>
+                            <Trigger Property="IsChecked" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="{StaticResource AccentSoft}" />
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="{StaticResource Accent}" />
+                                <Setter TargetName="Ring" Property="Stroke" Value="{StaticResource Accent}" />
+                                <Setter TargetName="Dot" Property="Opacity" Value="1" />
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Opacity" Value="0.5" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- ============ Строка списка выбора (подключения, серверы подписки) ============ -->
+        <!-- Без своей прокрутки: список растёт по содержимому, а колесо мыши прокручивает страницу -->
+        <Style x:Key="ChoiceList" TargetType="ListBox">
+            <Setter Property="Background" Value="Transparent" />
+            <Setter Property="BorderThickness" Value="0" />
+            <Setter Property="Padding" Value="0" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ListBox">
+                        <ItemsPresenter />
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style x:Key="ChoiceItem" TargetType="ListBoxItem">
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Margin" Value="0,0,0,6" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ListBoxItem">
+                        <Border x:Name="Bd" CornerRadius="14" Padding="12,10" Background="{StaticResource RowBg}"
+                                BorderThickness="1.5" BorderBrush="Transparent">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <ContentPresenter Grid.Column="0" VerticalAlignment="Center" />
+                                <TextBlock x:Name="Mark" Grid.Column="1" Text="&#xE73E;" FontFamily="{StaticResource IconFont}" FontSize="13"
+                                           Foreground="{StaticResource Accent}" VerticalAlignment="Center" Margin="10,0,2,0" Visibility="Hidden" />
+                            </Grid>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="#E2E2E8" />
+                            </Trigger>
+                            <Trigger Property="IsSelected" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="{StaticResource AccentSoft}" />
+                                <Setter TargetName="Bd" Property="BorderBrush" Value="{StaticResource Accent}" />
+                                <Setter TargetName="Mark" Property="Visibility" Value="Visible" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Кнопка-ссылка: текст акцентного цвета без подложки -->
+        <Style x:Key="LinkButton" TargetType="Button">
+            <Setter Property="Foreground" Value="{StaticResource Accent}" />
+            <Setter Property="FontWeight" Value="SemiBold" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <ContentPresenter x:Name="Content" />
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Opacity" Value="0.75" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
+        <!-- Подключение в списке выбора: глиф, название, вид и сервер -->
+        <DataTemplate x:Key="ConnectionChoiceTemplate">
+            <Grid>
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+                <Border Grid.Column="0" Width="32" Height="32" CornerRadius="16" Background="{StaticResource CardBg}" VerticalAlignment="Center">
+                    <TextBlock Text="{Binding Glyph}" FontFamily="{StaticResource IconFont}" FontSize="13" Foreground="{StaticResource Accent}"
+                               HorizontalAlignment="Center" VerticalAlignment="Center" />
+                </Border>
+                <StackPanel Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center">
+                    <TextBlock Text="{Binding Name}" FontWeight="Bold" FontSize="13.5" TextTrimming="CharacterEllipsis" />
+                    <TextBlock FontSize="11.5" Foreground="{StaticResource TextMuted}" TextTrimming="CharacterEllipsis">
+                        <Run Text="{Binding KindText, Mode=OneWay}" />
+                        <Run Text=" · " />
+                        <Run Text="{Binding Details, Mode=OneWay}" />
+                    </TextBlock>
+                </StackPanel>
+            </Grid>
+        </DataTemplate>
+
+        <!-- Строка адаптера: переключатель, а у удалённых ещё и кнопка «забыть» -->
+        <DataTemplate x:Key="AdapterRowTemplate">
+            <Border Style="{StaticResource SettingRow}" Margin="0,0,0,8">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <CheckBox Grid.Column="0" Style="{StaticResource ToggleSwitch}" IsChecked="{Binding IsSelected}"
+                              IsEnabled="{Binding DataContext.IsAdapterSelectionEnabled, RelativeSource={RelativeSource AncestorType=ItemsControl}}">
+                        <Grid>
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="Auto" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <Border Grid.Column="0" Width="36" Height="36" CornerRadius="18" VerticalAlignment="Center">
+                                <Border.Style>
+                                    <Style TargetType="Border">
+                                        <Setter Property="Background" Value="{StaticResource SubtleBg}" />
+                                        <Style.Triggers>
+                                            <DataTrigger Binding="{Binding IsUp}" Value="True">
+                                                <Setter Property="Background" Value="{StaticResource SuccessSoft}" />
+                                            </DataTrigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Border.Style>
+                                <views:GlyphIcon Glyph="&#xE72E;" Size="13" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                    <views:GlyphIcon.Style>
+                                        <Style TargetType="views:GlyphIcon">
+                                            <Setter Property="Foreground" Value="{StaticResource TextMuted}" />
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding IsUp}" Value="True">
+                                                    <Setter Property="Foreground" Value="{StaticResource Success}" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </views:GlyphIcon.Style>
+                                </views:GlyphIcon>
+                            </Border>
+                            <StackPanel Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center">
+                                <TextBlock Text="{Binding Product}" FontWeight="Bold" FontSize="13.5" TextTrimming="CharacterEllipsis" />
+                                <TextBlock FontSize="11.5" Margin="0,1,0,0" TextWrapping="Wrap">
+                                    <Run Text="{Binding StateText, Mode=OneWay}">
+                                        <Run.Style>
+                                            <Style TargetType="Run">
+                                                <Setter Property="Foreground" Value="{StaticResource TextMuted}" />
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding="{Binding IsUp}" Value="True">
+                                                        <Setter Property="Foreground" Value="{StaticResource Success}" />
+                                                    </DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </Run.Style>
+                                    </Run>
+                                    <Run Text=" · " Foreground="{StaticResource TextMuted}" />
+                                    <Run Text="{Binding Details, Mode=OneWay}" Foreground="{StaticResource TextSecondary}" />
+                                </TextBlock>
+                            </StackPanel>
+                        </Grid>
+                    </CheckBox>
+
+                    <!-- «Забыть» — только у удалённых адаптеров (у вариантов на странице приложения команды нет) -->
+                    <Button Grid.Column="1" Style="{StaticResource IconButton}" Margin="10,0,0,0" VerticalAlignment="Center"
+                            Command="{Binding ForgetCommand, FallbackValue={x:Null}}" ToolTip="Забыть этот адаптер"
+                            Visibility="{Binding ForgetCommand, Converter={StaticResource NullToCollapsed}, FallbackValue=Collapsed}">
+                        <views:GlyphIcon Glyph="&#xE74D;" Size="12" />
+                    </Button>
+                </Grid>
+            </Border>
+        </DataTemplate>
     </Application.Resources>
 </Application>

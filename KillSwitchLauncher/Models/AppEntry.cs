@@ -34,6 +34,12 @@ public sealed class AppEntry
     /// <summary>Приложение Microsoft Store (упакованное): идентификатор вида «Publisher.App_8wekyb3d8bbwe!App».</summary>
     public string? AppUserModelId { get; set; }
 
+    /// <summary>Записывать DNS-запросы приложения в журнал DNS (пункт «Журнал DNS» в меню плитки).</summary>
+    public bool TrackDns { get; set; }
+
+    /// <summary>Условие запуска, своя защита и исключения (страница приложения, раздел «Сеть»).</summary>
+    public AppNetwork Network { get; set; } = new();
+
     /// <summary>Ярлык, из которого добавлено приложение, или null, если выбран сам .exe.</summary>
     [JsonIgnore]
     public string? ShortcutPath =>

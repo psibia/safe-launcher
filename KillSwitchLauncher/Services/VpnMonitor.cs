@@ -165,7 +165,7 @@ public sealed class VpnMonitor : IDisposable
 
     private static string BuildSignature(VpnSnapshot s) =>
         s.IsConnected + "|" + s.Explanation + "|" +
-        string.Join(";", s.Adapters.Select(a => $"{a.Name}:{a.Description}:{a.IsUp}:{a.IsVpnLike}"));
+        string.Join(";", s.Adapters.Select(a => $"{a.Name}:{a.Description}:{a.IsUp}:{a.IsVpnLike}:{a.Index}:{a.HasDns}"));
 
     private void OnNetworkChanged(object? sender, EventArgs e) => Evaluate();
 

@@ -1,0 +1,43 @@
+diff --git a/transport/wireguard/endpoint.go b/transport/wireguard/endpoint.go
+index f942851..eabfc06 100644
+--- a/transport/wireguard/endpoint.go
++++ b/transport/wireguard/endpoint.go
+@@ -143,7 +143,7 @@ func (e *Endpoint) Start(postStart bool) error {
+ 	udpListener, isUDPListener := common.Cast[dialer.UDPListener](e.options.Dialer)
+ 	if isUDPListener {
+ 		listenerControl, egressEnabled := udpListener.UDPListenerControl()
+-		standardBind := conn.NewStdNetBind(listenerControl).(*conn.StdNetBind)
++		standardBind := conn.NewStdNetBind(optionalIPv6Listener(listenerControl)).(*conn.StdNetBind)
+ 		if e.options.ListenPort == 0 && len(e.peers) == 1 && e.peers[0].endpoint.IsValid() {
+ 			standardBind.SetSinglePeerMode()
+ 		}
+diff --git a/transport/wireguard/optional_ipv6.go b/transport/wireguard/optional_ipv6.go
+new file mode 100644
+index 0000000..4f86db8
+--- /dev/null
++++ b/transport/wireguard/optional_ipv6.go
+@@ -0,0 +1,24 @@
++package wireguard
++
++import (
++	"syscall"
++
++	"github.com/sagernet/sing/common/control"
++)
++
++// Safe Launcher: with auto_detect_interface the WireGuard sockets are bound to the default interface.
++// On Windows binding the IPv6 socket fails ("An invalid argument was supplied") when that interface
++// has no IPv6, and wireguard-go then drops the whole bind, IPv4 included: the endpoint sends nothing.
++// Such an IPv6 listener is reported as unsupported instead, and the bind works over IPv4 alone.
++func optionalIPv6Listener(listenerControl control.Func) control.Func {
++	if listenerControl == nil {
++		return nil
++	}
++	return func(network, address string, conn syscall.RawConn) error {
++		err := listenerControl(network, address, conn)
++		if err != nil && network == "udp6" {
++			return syscall.EAFNOSUPPORT
++		}
++		return err
++	}
++}

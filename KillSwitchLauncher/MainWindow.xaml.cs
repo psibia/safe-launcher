@@ -1,5 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
+using System.Linq;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Input;
@@ -42,7 +44,7 @@ public partial class MainWindow : Window
         SourceInitialized += (_, _) => RoundCorners();
 
         _tray = new TrayIcon(BuildTrayToolTip());
-        _tray.Update(BuildTrayToolTip(), alert: !_viewModel.IsVpnConnected);
+        _tray.Update(BuildTrayToolTip(), alert: IsTrayAlert);
         _tray.OpenRequested += (_, _) => ShowFromTray();
         _tray.MenuRequested += (_, _) => ShowTrayMenu();
         _viewModel.PropertyChanged += OnViewModelPropertyChanged;
@@ -98,29 +100,43 @@ public partial class MainWindow : Window
 
     // ---------------------------------------------------------------- окно
 
-    /// <summary>Клик мимо панели настроек закрывает её (кроме кнопки «Настройки», она сама переключает панель).</summary>
-    protected override void OnPreviewMouseDown(MouseButtonEventArgs e)
+    /// <summary>Esc: закрыть сводку, а на странице настроек или приложения — вернуться к плиткам.</summary>
+    protected override void OnKeyDown(KeyEventArgs e)
     {
-        base.OnPreviewMouseDown(e);
+        base.OnKeyDown(e);
+        if (e.Handled || e.Key != Key.Escape)
+            return;
 
-        if (_viewModel.IsRulesPanelOpen && e.OriginalSource is DependencyObject source &&
-            !IsInside(source, SettingsCard) && !IsInside(source, SettingsToggle))
-        {
-            _viewModel.IsRulesPanelOpen = false;
-        }
+        if (_viewModel.IsSummaryOpen)
+            _viewModel.IsSummaryOpen = false;
+        else if (_viewModel.IsSettingsOpen || _viewModel.IsAppPage)
+            _viewModel.GoBack();
+        else
+            return;
+        e.Handled = true;
     }
 
-    private static bool IsInside(DependencyObject? element, DependencyObject container)
-    {
-        while (element is not null)
-        {
-            if (ReferenceEquals(element, container))
-                return true;
-            element = element is Visual ? VisualTreeHelper.GetParent(element) : LogicalTreeHelper.GetParent(element);
-        }
+    // ---------------------------------------------------------------- перетаскивание программ в окно
 
-        return false;
+    private void OnDragOver(object sender, DragEventArgs e)
+    {
+        e.Effects = _viewModel.IsAppsPage && DroppedFiles(e) is { Length: > 0 } ? DragDropEffects.Copy : DragDropEffects.None;
+        e.Handled = true;
     }
+
+    /// <summary>Перетащили .exe или ярлыки: одну программу — на её страницу, несколько — сразу в список.</summary>
+    private void OnDrop(object sender, DragEventArgs e)
+    {
+        if (!_viewModel.IsAppsPage || DroppedFiles(e) is not { Length: > 0 } files)
+            return;
+        e.Handled = true;
+        Activate();
+        // Окно с вопросами откроется уже после того, как Проводник закончит перетаскивание.
+        Dispatcher.BeginInvoke(() => _viewModel.AddFromPaths(files));
+    }
+
+    private static string[]? DroppedFiles(DragEventArgs e) =>
+        e.Data.GetDataPresent(DataFormats.FileDrop) ? e.Data.GetData(DataFormats.FileDrop) as string[] : null;
 
     // ---------------------------------------------------------------- свой заголовок окна
 
@@ -157,6 +173,15 @@ public partial class MainWindow : Window
                 "Он продолжает следить за VPN. Открыть — двойной клик по значку, закрыть — правый клик.", warning: false);
     }
 
+    /// <summary>Запуск вместе с Windows: окно не показывается, лаунчер работает в трее. Значка нет — окно свёрнуто.</summary>
+    public void StartInTray()
+    {
+        if (_tray.IsShown)
+            return;
+        WindowState = WindowState.Minimized;
+        Show();
+    }
+
     /// <summary>Показать окно из трея или из свёрнутого состояния и вывести на передний план.</summary>
     public void ShowFromTray()
     {
@@ -191,34 +216,56 @@ public partial class MainWindow : Window
     // ---------------------------------------------------------------- трей
 
     private string BuildTrayToolTip() =>
-        $"Безопасный лаунчер\n{_viewModel.VpnStatusText} · {_viewModel.RunningSummary}" +
+        $"Безопасный лаунчер\n{_viewModel.SummaryTitle} · {_viewModel.SummarySubtitle}" +
         (_viewModel.IsKillSwitchOff ? "\nKill-Switch выключен" : string.Empty);
+
+    /// <summary>Красный значок: есть приложения без защиты или ждущие сеть, либо системный VPN нужен и не подключён.</summary>
+    private bool IsTrayAlert => _viewModel.SummaryTone is SummaryTone.Danger or SummaryTone.Warn;
 
     private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
     {
         switch (e.PropertyName)
         {
-            case nameof(MainViewModel.IsVpnConnected):
-            case nameof(MainViewModel.RunningSummary):
+            case nameof(MainViewModel.SummaryTitle):
+            case nameof(MainViewModel.SummarySubtitle):
+            case nameof(MainViewModel.SummaryTone):
             case nameof(MainViewModel.IsKillSwitchOff):
-                _tray.Update(BuildTrayToolTip(), alert: !_viewModel.IsVpnConnected);
-                break;
-
-            case nameof(MainViewModel.IsRulesPanelOpen) when _viewModel.IsRulesPanelOpen && _viewModel.IsUpdateAvailable:
-                // Есть обновление: панель настроек сразу прокручивается к нему.
-                Dispatcher.BeginInvoke(DispatcherPriority.Loaded, () => AboutRow.BringIntoView());
+                _tray.Update(BuildTrayToolTip(), alert: IsTrayAlert);
                 break;
         }
     }
 
-    /// <summary>Меню значка в трее: обычное меню Windows («Открыть» — по умолчанию, жирным).</summary>
-    private void ShowTrayMenu() => _tray.ShowMenu(new TrayMenuItem?[]
+    /// <summary>
+    /// Меню значка в трее: обычное меню Windows («Открыть» — по умолчанию, жирным). Запущенные приложения
+    /// можно завершить прямо отсюда.
+    /// </summary>
+    private void ShowTrayMenu()
     {
-        new("Открыть", ShowFromTray, IsDefault: true),
-        new("Журнал событий", () => _viewModel.ShowLogCommand.Execute(null)),
-        null,
-        new("Закрыть лаунчер", ExitApp)
-    });
+        var items = new List<TrayMenuItem?> { new("Открыть", ShowFromTray, IsDefault: true) };
+
+        var running = _viewModel.Apps.Where(a => a.IsRunning).ToList();
+        if (running.Count > 0)
+        {
+            items.Add(null);
+            foreach (var tile in running)
+                items.Add(new TrayMenuItem($"Завершить «{tile.Name}»", () =>
+                {
+                    ShowFromTray(); // вопрос «Завершить?» должен быть виден
+                    tile.KillCommand.Execute(null);
+                }));
+        }
+
+        items.Add(null);
+        items.Add(new TrayMenuItem("Настройки", () =>
+        {
+            ShowFromTray();
+            _viewModel.OpenSettings();
+        }));
+        items.Add(new TrayMenuItem("Журнал событий", () => _viewModel.ShowLogCommand.Execute(null)));
+        items.Add(null);
+        items.Add(new TrayMenuItem("Закрыть лаунчер", ExitApp));
+        _tray.ShowMenu(items);
+    }
 
     // ---------------------------------------------------------------- окно
 

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
@@ -6,6 +7,7 @@ using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
 using KillSwitchLauncher.Services;
+using KillSwitchLauncher.ViewModels;
 using KillSwitchLauncher.Views;
 
 namespace KillSwitchLauncher.Tests;
@@ -35,6 +37,26 @@ public static class Sta
     }
 }
 
+/// <summary>Фильтры Windows для тестов окна: служба не нужна, набор просто запоминается.</summary>
+public sealed class QuietGuard : IGuardBackend
+{
+    public static readonly Func<IGuardBackend> Create = () => new QuietGuard();
+
+    public bool IsConnected => true;
+
+    public event Action? Lost
+    {
+        add { }
+        remove { }
+    }
+
+    public Task<GuardReply> ApplyAsync(GuardRequest request, CancellationToken cancellation) => Task.FromResult(GuardReply.Empty);
+
+    public void Dispose()
+    {
+    }
+}
+
 /// <summary>Диалоги без окон: ответы задаёт тест, вызовы считаются.</summary>
 public sealed class FakeDialogs : IDialogService
 {
@@ -49,9 +71,13 @@ public sealed class FakeDialogs : IDialogService
 
     public string? PickExecutableOrShortcut() => null;
 
-    public void ShowWarning(string message, string title = "Внимание")
+    public List<string> Warnings { get; } = new();
+
+    public void ShowInfo(string message, string title)
     {
     }
+
+    public void ShowWarning(string message, string title = "Внимание") => Warnings.Add(message);
 
     public void ShowError(string message, string title = "Ошибка") => ErrorCalls++;
 
@@ -74,6 +100,30 @@ public sealed class FakeDialogs : IDialogService
     }
 
     public void ShowActivityLog(ActivityLog log) => ShownLog = log;
+
+    public DnsJournal? ShownDnsJournal { get; private set; }
+
+    public void ShowDnsJournal(AppTileViewModel tile, DnsJournal journal) => ShownDnsJournal = journal;
+
+    public void CloseDnsJournal(Guid appId)
+    {
+    }
+
+    /// <summary>Ответ на «Сохранить изменения?»: true — сохранить, false — не сохранять, null — остаться.</summary>
+    public bool? SaveAnswer { get; set; } = false;
+    public int AskSaveCalls { get; private set; }
+
+    public bool? AskSave(string title, string message, string saveText)
+    {
+        AskSaveCalls++;
+        return SaveAnswer;
+    }
+
+    public string? WireGuardFile { get; set; }
+    public string? PickWireGuardFile() => WireGuardFile;
+
+    public string? ClipboardText { get; set; }
+    public string? ReadClipboardText() => ClipboardText;
 }
 
 /// <summary>Тестовое «приложение» KillSwitchLauncher.Tests.exe (см. TestApp) и уборка его копий.</summary>

@@ -26,16 +26,23 @@ internal static class NativeMethods
     // ---- права на процесс
     public const uint ProcessTerminate = 0x0001;
     public const uint ProcessSetQuota = 0x0100;
+    public const uint ProcessSuspendResume = 0x0800;
     public const uint ProcessQueryLimitedInformation = 0x1000;
     public const uint Synchronize = 0x00100000;
 
     // ---- флаги CreateProcess
     public const uint CreateSuspended = 0x00000004;
     public const uint CreateDefaultErrorMode = 0x04000000;
+    public const uint CreateUnicodeEnvironment = 0x00000400;
 
     // ---- задания
     public const int JobInfoBasicAccounting = 1;
+    public const int JobInfoBasicProcessIdList = 3;
     public const int JobInfoExtendedLimit = 9;
+    public const int JobInfoAssociateCompletionPort = 7;
+    public const uint JobMsgNewProcess = 6;
+    public const uint JobMsgExitProcess = 7;
+    public const uint JobMsgAbnormalExitProcess = 8;
     public const uint JobObjectLimitActiveProcess = 0x00000008;
     public const uint JobObjectLimitBreakawayOk = 0x00000800;
     public const uint JobObjectLimitKillOnJobClose = 0x00002000;
@@ -45,6 +52,7 @@ internal static class NativeMethods
     public const uint Th32csSnapProcess = 0x00000002;
     public const int ErrorAccessDenied = 5;
     public const int ErrorElevationRequired = 740;
+    public const int ErrorAbandonedWait0 = 735;
 
     [StructLayout(LayoutKind.Sequential)]
     public struct JobObjectBasicLimitInformation
@@ -80,6 +88,13 @@ internal static class NativeMethods
         public UIntPtr JobMemoryLimit;
         public UIntPtr PeakProcessMemoryUsed;
         public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct JobObjectAssociateCompletionPort
+    {
+        public IntPtr CompletionKey;
+        public IntPtr CompletionPort;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -155,8 +170,16 @@ internal static class NativeMethods
         ref JobObjectExtendedLimitInformation info, uint infoLength);
 
     [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetInformationJobObject(SafeKernelHandle hJob, int infoClass,
+        ref JobObjectAssociateCompletionPort info, uint infoLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool QueryInformationJobObject(SafeKernelHandle hJob, int infoClass,
         out JobObjectBasicAccountingInformation info, uint infoLength, IntPtr returnLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool QueryInformationJobObject(SafeKernelHandle hJob, int infoClass,
+        [Out] UIntPtr[] info, uint infoLength, IntPtr returnLength);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool AssignProcessToJobObject(SafeKernelHandle hJob, SafeHandle hProcess);
@@ -166,6 +189,20 @@ internal static class NativeMethods
 
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool IsProcessInJob(SafeHandle processHandle, SafeKernelHandle jobHandle, out bool result);
+
+    // ---- порт уведомлений заданий (какие процессы появились и завершились)
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern SafeKernelHandle CreateIoCompletionPort(IntPtr fileHandle, IntPtr existingPort,
+        UIntPtr completionKey, uint concurrentThreads);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetQueuedCompletionStatus(SafeKernelHandle port, out uint numberOfBytes,
+        out UIntPtr completionKey, out IntPtr overlapped, uint milliseconds);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool PostQueuedCompletionStatus(SafeKernelHandle port, uint numberOfBytes,
+        UIntPtr completionKey, IntPtr overlapped);
 
     // ---- процессы
 
@@ -202,6 +239,17 @@ internal static class NativeMethods
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern bool Process32NextW(SafeKernelHandle snapshot, ref ProcessEntry32 entry);
+
+    /// <summary>Приостановить все потоки процесса (без новых соединений, пока перезапускается ядро). 0 — успех.</summary>
+    [DllImport("ntdll.dll")]
+    public static extern int NtSuspendProcess(SafeHandle process);
+
+    [DllImport("ntdll.dll")]
+    public static extern int NtResumeProcess(SafeHandle process);
+
+    /// <summary>Порядок завершения при выходе из Windows: 0x100 — последними среди программ.</summary>
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool SetProcessShutdownParameters(uint level, uint flags);
 
     // ---- пути
 

@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Прототип: проверка службы и ядра так, как ими будет пользоваться лаунчер (см. prototype/README.md). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>RouteCheck</AssemblyName>
+    <RootNamespace>RouteCheck</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Version>0.3.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Связь со службой и ответы ядру «чей процесс» — те же файлы, что в лаунчере. -->
+    <Compile Include="..\..\KillSwitchLauncher\Services\CoreServiceClient.cs" Link="Launcher\CoreServiceClient.cs" />
+    <Compile Include="..\..\KillSwitchLauncher\Services\OwnerPipeServer.cs" Link="Launcher\OwnerPipeServer.cs" />
+  </ItemGroup>
+
+</Project>

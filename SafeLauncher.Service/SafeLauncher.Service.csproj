@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Служба Windows «Безопасный лаунчер — сеть»: запускает ядро VPN (launcher-core.exe) по команде лаунчера.
+       Ставится вместе с ядром в C:\Program Files\SafeLauncher\core (путь только латиницей, см. core/README.md). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>SafeLauncher.Service</AssemblyName>
+    <RootNamespace>SafeLauncher.Service</RootNamespace>
+    <Product>Безопасный лаунчер</Product>
+    <AssemblyTitle>Безопасный лаунчер — сеть</AssemblyTitle>
+    <Version>2.1.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.ServiceProcess.ServiceController" Version="8.0.1" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="KillSwitchLauncher.Tests" />
+  </ItemGroup>
+
+</Project>

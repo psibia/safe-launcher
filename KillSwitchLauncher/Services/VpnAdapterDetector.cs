@@ -9,13 +9,17 @@ using System.Text.RegularExpressions;
 namespace KillSwitchLauncher.Services;
 
 /// <summary>Сетевой адаптер в том виде, в котором он нужен лаунчеру.</summary>
+/// <param name="Index">Номер адаптера в Windows (IfIndex) для фильтров «только через VPN»; 0 — неизвестен.</param>
+/// <param name="HasDns">У адаптера указан свой DNS-сервер (тогда DNS можно пускать только через него).</param>
 public sealed record VpnAdapterInfo(
     string Name,
     string Description,
     NetworkInterfaceType Type,
     bool IsUp,
     bool IsVpnLike,
-    string Product);
+    string Product,
+    int Index = 0,
+    bool HasDns = false);
 
 /// <summary>
 /// Определяет, какие сетевые интерфейсы Windows являются VPN-туннелями.
@@ -30,6 +34,12 @@ public sealed record VpnAdapterInfo(
 /// </summary>
 public static class VpnAdapterDetector
 {
+    /// <summary>
+    /// Адаптер ядра лаунчера. Это не «VPN на весь компьютер»: через него идут только приложения лаунчера, поэтому
+    /// для правил адаптеров его нет, иначе приложение под системным VPN запустилось бы без него.
+    /// </summary>
+    public const string OwnTunnelName = "SafeLauncher";
+
     private static readonly Regex VpnKeywords = new(
         @"\bvpn\b|wireguard|wintun|amneziawg|nordlynx|\btap\b|tap-windows|\btun\b|openvpn|anyconnect|cisco|" +
         @"fortinet|forticlient|globalprotect|pangp|juniper|pulse secure|ivanti|check ?point|sonicwall|" +
@@ -53,18 +63,54 @@ public static class VpnAdapterDetector
         }
 
         return all
-            .Where(n => n.NetworkInterfaceType != NetworkInterfaceType.Loopback)
+            .Where(n => n.NetworkInterfaceType != NetworkInterfaceType.Loopback && !IsOwnTunnel(n.Name))
             .Select(n => new VpnAdapterInfo(
                 n.Name,
                 n.Description,
                 n.NetworkInterfaceType,
                 IsActive(n),
                 IsVpnLike(n.Name, n.Description, n.NetworkInterfaceType),
-                GetProduct(n.Description, n.NetworkInterfaceType)))
+                GetProduct(n.Description, n.NetworkInterfaceType),
+                IndexOf(n),
+                HasOwnDns(n)))
             .OrderByDescending(a => a.IsVpnLike)
             .ThenBy(a => a.Name, StringComparer.CurrentCultureIgnoreCase)
             .ToList();
     }
+
+    /// <summary>IfIndex адаптера (у IPv4 и IPv6 он один и тот же); 0 — не узнать.</summary>
+    private static int IndexOf(NetworkInterface nic)
+    {
+        try
+        {
+            var properties = nic.GetIPProperties();
+            if (nic.Supports(NetworkInterfaceComponent.IPv4) && properties.GetIPv4Properties() is { } v4)
+                return v4.Index;
+            if (nic.Supports(NetworkInterfaceComponent.IPv6) && properties.GetIPv6Properties() is { } v6)
+                return v6.Index;
+        }
+        catch (Exception ex) when (ex is NetworkInformationException or PlatformNotSupportedException)
+        {
+        }
+
+        return 0;
+    }
+
+    /// <summary>Есть ли у адаптера свой DNS-сервер. Адреса fec0:0:0:ffff::1–3 Windows подставляет, когда DNS не задан.</summary>
+    private static bool HasOwnDns(NetworkInterface nic)
+    {
+        try
+        {
+            return nic.GetIPProperties().DnsAddresses.Any(a =>
+                !(a.AddressFamily == AddressFamily.InterNetworkV6 && a.IsIPv6SiteLocal));
+        }
+        catch (NetworkInformationException)
+        {
+            return false;
+        }
+    }
+
+    public static bool IsOwnTunnel(string name) => string.Equals(name, OwnTunnelName, StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Up и есть хотя бы один «настоящий» адрес (не APIPA 169.254.x.x и не IPv6 link-local).</summary>
     private static bool IsActive(NetworkInterface nic)
