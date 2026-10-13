@@ -13,7 +13,6 @@
   <a href="https://github.com/psibia/safe-launcher/releases/latest">Скачать</a> ·
   <a href="#как-пользоваться">Как пользоваться</a> ·
   <a href="#как-это-устроено">Как это устроено</a> ·
-  <a href="docs/DETAILS.md">Подробное описание</a>
 </p>
 
 ---
