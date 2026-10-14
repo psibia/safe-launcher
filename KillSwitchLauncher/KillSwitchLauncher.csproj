@@ -21,6 +21,11 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!-- Технический журнал: формат, хранение, скрытие адресов (общая библиотека с службой) -->
+    <ProjectReference Include="..\SafeLauncher.Logging\SafeLauncher.Logging.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Resource Include="Assets\logo.png" />
     <Resource Include="Assets\logo.ico" />
   </ItemGroup>

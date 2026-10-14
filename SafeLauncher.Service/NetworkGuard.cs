@@ -7,6 +7,7 @@ using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Win32;
+using SafeLauncher.Logging;
 
 namespace SafeLauncher.Service;
 
@@ -109,7 +110,10 @@ internal sealed class NetworkGuard : IDisposable
             if (_disposed || !_owners.Remove(owner))
                 return;
             if (Rebuild() is { } error)
+            {
                 _log("Не удалось снять фильтры лаунчера: " + error);
+                ServiceLog.Error(LogAreas.Wfp, LogCodes.WfpFail, null, "Не удалось снять фильтры лаунчера: " + error);
+            }
         }
     }
 
@@ -124,7 +128,10 @@ internal sealed class NetworkGuard : IDisposable
             if (_owners.Count == 0)
                 return;
             if (Rebuild() is { } error)
+            {
                 _log("Не удалось обновить фильтры под адаптер ядра: " + error);
+                ServiceLog.Error(LogAreas.Wfp, LogCodes.WfpFail, null, "Не удалось обновить фильтры под адаптер ядра: " + error);
+            }
         }
     }
 
@@ -487,6 +494,8 @@ internal sealed class NetworkGuard : IDisposable
     {
         if (_owners.Count == 0 && _filters.Count == 0)
             return null;
+        var watch = System.Diagnostics.Stopwatch.StartNew();
+        var before = _filters.Count;
         string step = "открытие фильтров Windows";
         var memory = new Unmanaged();
         try
@@ -587,11 +596,27 @@ internal sealed class NetworkGuard : IDisposable
 
             _filters.Clear();
             _filters.AddRange(added);
+            var rules = _owners.Values.SelectMany(r => r.Apps).ToList();
+            ServiceLog.Info(LogAreas.Wfp, LogCodes.WfpApply, null,
+                $"Фильтры Windows: лаунчеров {_owners.Count}, правил {rules.Count} (через ядро {rules.Count(r => r.ViaCore)}), " +
+                $"путей {rules.Sum(r => r.Paths.Count)}, адаптер ядра {(_coreLuid is { } c ? "LUID " + c : "нет")}, " +
+                $"DNS-адаптеров {_owners.Values.Where(r => r.DnsInterfaces is { Count: > 0 }).SelectMany(r => r.DnsInterfaces!).Distinct().Count()}, " +
+                $"фильтров {added.Count} (было {before}), {watch.ElapsedMilliseconds} мс");
+            if (ServiceLog.Detailed)
+            {
+                foreach (var rule in rules)
+                {
+                    ServiceLog.Debug(LogAreas.Wfp, LogCodes.WfpApply, null,
+                        $"Правило: {(rule.ViaCore ? "через ядро" : "адаптеры [" + string.Join(",", rule.Interfaces) + "]")}, " +
+                        $"программы: {string.Join(", ", rule.Paths)}");
+                }
+            }
             return null;
         }
         catch (Exception ex) when (ex is WfpException or DllNotFoundException or EntryPointNotFoundException)
         {
             _log($"Фильтры Windows: {step}: {ex.Message}");
+            ServiceLog.Error(LogAreas.Wfp, LogCodes.WfpFail, null, $"Фильтры Windows: {step}: {ex.Message}");
             return $"фильтры Windows не приняли правила ({step}: {ex.Message})";
         }
         finally

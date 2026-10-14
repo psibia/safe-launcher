@@ -14,77 +14,101 @@
             </StackPanel>
         </Border>
 
-        <!-- ===== Ссылка, подписка или WireGuard ===== -->
-        <StackPanel Margin="0,12,0,0" Visibility="{Binding IsLink, Converter={StaticResource BoolToVis}}">
-            <TextBox Style="{StaticResource InputArea}" Text="{Binding Text, UpdateSourceTrigger=PropertyChanged}"
-                     Tag="Вставьте ссылку (vless://, vmess://, trojan://, ss://, hysteria2://, tuic://), адрес подписки или текст файла WireGuard" />
+        <!-- Обе вкладки лежат друг на друге, неактивная только скрыта (Hidden): высота формы — по большей из них,
+             поэтому при переключении вкладок ничего не прыгает -->
+        <Grid Margin="0,12,0,0">
+            <!-- ===== Ссылка, подписка или WireGuard ===== -->
+            <StackPanel>
+                <StackPanel.Style>
+                    <Style TargetType="StackPanel">
+                        <Setter Property="Visibility" Value="Hidden" />
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding IsLink}" Value="True">
+                                <Setter Property="Visibility" Value="Visible" />
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </StackPanel.Style>
+                <TextBox Style="{StaticResource InputArea}" Text="{Binding Text, UpdateSourceTrigger=PropertyChanged}"
+                         Tag="Вставьте ссылку (vless://, vmess://, trojan://, ss://, hysteria2://, tuic://), адрес подписки или текст файла WireGuard" />
 
-            <StackPanel Orientation="Horizontal" Margin="4,8,0,0" Visibility="{Binding Recognized, Converter={StaticResource NullToCollapsed}}">
-                <TextBlock Text="&#xE73E;" FontFamily="{StaticResource IconFont}" FontSize="11" Foreground="{StaticResource Success}"
-                           VerticalAlignment="Center" Margin="0,1,8,0" />
-                <TextBlock Text="{Binding Recognized}" Foreground="{StaticResource TextSecondary}" FontSize="12" TextWrapping="Wrap" MaxWidth="560" />
-            </StackPanel>
+                <StackPanel Orientation="Horizontal" Margin="4,8,0,0" Visibility="{Binding Recognized, Converter={StaticResource NullToCollapsed}}">
+                    <TextBlock Text="&#xE73E;" FontFamily="{StaticResource IconFont}" FontSize="11" Foreground="{StaticResource Success}"
+                               VerticalAlignment="Center" Margin="0,1,8,0" />
+                    <TextBlock Text="{Binding Recognized}" Foreground="{StaticResource TextSecondary}" FontSize="12" TextWrapping="Wrap" MaxWidth="560" />
+                </StackPanel>
 
-            <Grid Margin="0,12,0,0">
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="Auto" />
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="Auto" />
-                </Grid.ColumnDefinitions>
-                <Button Grid.Column="0" Style="{StaticResource SecondaryButton}" Padding="14,8" Command="{Binding PickFileCommand}"
-                        IsEnabled="{Binding IsIdle}" ToolTip="Выбрать файл .conf, который выдал ваш VPN-сервис">
-                    <StackPanel Orientation="Horizontal">
-                        <views:GlyphIcon Glyph="&#xE8E5;" Size="12" Margin="0,0,8,0" VerticalAlignment="Center" />
-                        <TextBlock Text="Файл WireGuard…" VerticalAlignment="Center" />
-                    </StackPanel>
-                </Button>
-                <Button Grid.Column="2" Style="{StaticResource PrimaryButton}" Padding="20,8" Command="{Binding AddCommand}"
-                        IsEnabled="{Binding IsIdle}" Content="Добавить" />
-            </Grid>
-        </StackPanel>
-
-        <!-- ===== Прокси другой VPN-программы ===== -->
-        <StackPanel Margin="0,12,0,0" Visibility="{Binding IsProxy, Converter={StaticResource BoolToVis}}">
-            <TextBlock Style="{StaticResource Caption}" Margin="4,0,0,10"
-                       Text="Если у вас уже есть v2rayN, Clash, Hiddify или похожая программа, лаунчер может направить приложения в её прокси. Включите в ней локальный прокси (SOCKS или HTTP)." />
-
-            <Border Style="{StaticResource SettingRow}" Background="{StaticResource AccentSoft}" Margin="0,0,0,10"
-                    Visibility="{Binding ProxyHintText, Converter={StaticResource NullToCollapsed}}">
-                <Grid>
+                <Grid Margin="0,12,0,0">
                     <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="Auto" />
                         <ColumnDefinition Width="*" />
                         <ColumnDefinition Width="Auto" />
                     </Grid.ColumnDefinitions>
-                    <TextBlock Grid.Column="0" Text="{Binding ProxyHintText}" TextWrapping="Wrap" FontSize="12.5"
-                               Foreground="{StaticResource Accent}" VerticalAlignment="Center" />
-                    <Button Grid.Column="1" Style="{StaticResource SecondaryButton}" MinHeight="30" Padding="12,6" FontSize="12"
-                            Margin="10,0,0,0" Content="Подставить" Command="{Binding UseHintCommand}" />
+                    <Button Grid.Column="0" Style="{StaticResource SecondaryButton}" Padding="14,8" Command="{Binding PickFileCommand}"
+                            IsEnabled="{Binding IsIdle}" ToolTip="Выбрать файл .conf, который выдал ваш VPN-сервис">
+                        <StackPanel Orientation="Horizontal">
+                            <views:GlyphIcon Glyph="&#xE8E5;" Size="12" Margin="0,0,8,0" VerticalAlignment="Center" />
+                            <TextBlock Text="Файл WireGuard" VerticalAlignment="Center" />
+                        </StackPanel>
+                    </Button>
+                    <Button Grid.Column="2" Style="{StaticResource PrimaryButton}" Padding="20,8" Command="{Binding AddCommand}"
+                            IsEnabled="{Binding IsIdle}" Content="Добавить" />
                 </Grid>
-            </Border>
+            </StackPanel>
 
-            <Grid>
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*" />
-                    <ColumnDefinition Width="110" />
-                    <ColumnDefinition Width="Auto" />
-                </Grid.ColumnDefinitions>
-                <TextBox Grid.Column="0" Style="{StaticResource InputBox}" Tag="Адрес, обычно 127.0.0.1"
-                         Text="{Binding ProxyHost, UpdateSourceTrigger=PropertyChanged}" />
-                <TextBox Grid.Column="1" Style="{StaticResource InputBox}" Margin="8,0,0,0" Tag="Порт"
-                         Text="{Binding ProxyPort, UpdateSourceTrigger=PropertyChanged}" />
-                <Border Grid.Column="2" Background="{StaticResource SubtleBg}" CornerRadius="14" Padding="4" Margin="8,0,0,0">
-                    <StackPanel Orientation="Horizontal">
-                        <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="72" Content="SOCKS5"
-                                     IsChecked="{Binding ProxyProtocol, Converter={StaticResource EnumToBool}, ConverterParameter=Socks5}" />
-                        <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="60" Content="HTTP"
-                                     IsChecked="{Binding ProxyProtocol, Converter={StaticResource EnumToBool}, ConverterParameter=Http}" />
-                    </StackPanel>
+            <!-- ===== Прокси другой VPN-программы ===== -->
+            <StackPanel>
+                <StackPanel.Style>
+                    <Style TargetType="StackPanel">
+                        <Setter Property="Visibility" Value="Hidden" />
+                        <Style.Triggers>
+                            <DataTrigger Binding="{Binding IsProxy}" Value="True">
+                                <Setter Property="Visibility" Value="Visible" />
+                            </DataTrigger>
+                        </Style.Triggers>
+                    </Style>
+                </StackPanel.Style>
+                <TextBlock Style="{StaticResource Caption}" Margin="4,0,0,10"
+                           Text="Если у вас уже есть v2rayN, Clash, Hiddify или похожая программа, лаунчер может направить приложения в её прокси. Включите в ней локальный прокси (SOCKS или HTTP)." />
+
+                <Border Style="{StaticResource SettingRow}" Background="{StaticResource AccentSoft}" Margin="0,0,0,10"
+                        Visibility="{Binding ProxyHintText, Converter={StaticResource NullToCollapsed}}">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <TextBlock Grid.Column="0" Text="{Binding ProxyHintText}" TextWrapping="Wrap" FontSize="12.5"
+                                   Foreground="{StaticResource Accent}" VerticalAlignment="Center" />
+                        <Button Grid.Column="1" Style="{StaticResource SecondaryButton}" MinHeight="30" Padding="12,6" FontSize="12"
+                                Margin="10,0,0,0" Content="Подставить" Command="{Binding UseHintCommand}" />
+                    </Grid>
                 </Border>
-            </Grid>
 
-            <Button Style="{StaticResource PrimaryButton}" Padding="20,8" Margin="0,12,0,0" HorizontalAlignment="Right"
-                    Command="{Binding AddCommand}" IsEnabled="{Binding IsIdle}" Content="Добавить" />
-        </StackPanel>
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="110" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBox Grid.Column="0" Style="{StaticResource InputBox}" Tag="Адрес, обычно 127.0.0.1"
+                             Text="{Binding ProxyHost, UpdateSourceTrigger=PropertyChanged}" />
+                    <TextBox Grid.Column="1" Style="{StaticResource InputBox}" Margin="8,0,0,0" Tag="Порт"
+                             Text="{Binding ProxyPort, UpdateSourceTrigger=PropertyChanged}" />
+                    <Border Grid.Column="2" Background="{StaticResource SubtleBg}" CornerRadius="14" Padding="4" Margin="8,0,0,0">
+                        <StackPanel Orientation="Horizontal">
+                            <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="72" Content="SOCKS5"
+                                         IsChecked="{Binding ProxyProtocol, Converter={StaticResource EnumToBool}, ConverterParameter=Socks5}" />
+                            <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="60" Content="HTTP"
+                                         IsChecked="{Binding ProxyProtocol, Converter={StaticResource EnumToBool}, ConverterParameter=Http}" />
+                        </StackPanel>
+                    </Border>
+                </Grid>
+
+                <Button Style="{StaticResource PrimaryButton}" Padding="20,8" Margin="0,12,0,0" HorizontalAlignment="Right"
+                        Command="{Binding AddCommand}" IsEnabled="{Binding IsIdle}" Content="Добавить" />
+            </StackPanel>
+        </Grid>
 
         <!-- Почему не добавилось -->
         <Border Margin="0,10,0,0" Background="{StaticResource DangerSoft}" CornerRadius="14" Padding="12,10"

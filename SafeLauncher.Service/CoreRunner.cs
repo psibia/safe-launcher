@@ -215,9 +215,10 @@ internal sealed class CoreRunner : IDisposable
     {
         if (line is null)
             return;
+        var tail = ServiceLog.CoreLine(line);
         lock (_log)
         {
-            _log.AddLast(line);
+            _log.AddLast(tail);
             while (_log.Count > LogLines)
                 _log.RemoveFirst();
         }

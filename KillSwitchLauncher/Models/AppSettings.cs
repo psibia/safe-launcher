@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using KillSwitchLauncher.Services;
+using SafeLauncher.Logging;
 
 namespace KillSwitchLauncher.Models;
 
@@ -64,4 +65,10 @@ public sealed class AppSettings
 
     /// <summary>Запускать лаунчер при входе в Windows (свёрнутым в трей).</summary>
     public bool StartWithWindows { get; set; }
+
+    /// <summary>
+    /// Журналы (раздел «Журналы»): где хранить, сколько дней, скрывать ли IP-адреса, подробный журнал.
+    /// По умолчанию: в файлах, 7 дней, адреса не скрываются (см. notes/logging).
+    /// </summary>
+    public LogSettings Logs { get; set; } = new();
 }

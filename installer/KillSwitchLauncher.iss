@@ -96,9 +96,13 @@ Filename: "{app}\{#MyAppExeName}"; Flags: nowait runasoriginaluser skipifnotsile
 Type: filesandordirs; Name: "{#CoreDir}\run"
 Type: dirifempty; Name: "{#CoreDir}"
 Type: dirifempty; Name: "{commonpf64}\SafeLauncher"
+; Журналы службы и ядра (%ProgramData%\SafeLauncher\logs: журналы, очищенные конфиги ядра, описания падений).
+Type: filesandordirs; Name: "{commonappdata}\SafeLauncher\logs"
+Type: dirifempty; Name: "{commonappdata}\SafeLauncher"
 
 ; Настройки пользователя (%LOCALAPPDATA%\KillSwitchLauncher\settings.json) при удалении намеренно
 ; не трогаем: при переустановке список приложений, подключения и правила VPN сохранятся.
+; Журналы лаунчера (%LOCALAPPDATA%\KillSwitchLauncher\logs) остаются вместе с настройками: их срок хранения ограничен.
 
 [Code]
 const

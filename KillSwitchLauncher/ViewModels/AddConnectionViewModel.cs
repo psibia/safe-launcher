@@ -46,7 +46,7 @@ public sealed class AddConnectionViewModel : ObservableObject
 
     public ICommand AddCommand { get; }
 
-    /// <summary>«Файл WireGuard…»: прочитать .conf и подставить его текст.</summary>
+    /// <summary>«Файл WireGuard»: прочитать .conf и подставить его текст.</summary>
     public ICommand PickFileCommand { get; }
 
     /// <summary>Подставить прокси запущенной VPN-программы.</summary>

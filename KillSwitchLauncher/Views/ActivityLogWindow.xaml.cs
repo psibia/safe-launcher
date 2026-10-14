@@ -5,8 +5,11 @@ using System.IO;
 using System.Linq;
 using System.Windows;
 using System.Windows.Input;
+using System.Text;
 using System.Windows.Media;
 using KillSwitchLauncher.Services;
+using KillSwitchLauncher.ViewModels;
+using Microsoft.Win32;
 
 namespace KillSwitchLauncher.Views;
 
@@ -14,12 +17,17 @@ namespace KillSwitchLauncher.Views;
 public partial class ActivityLogWindow : Window
 {
     private readonly ActivityLog _log;
+    private readonly ILogActions _logs;
     private readonly ObservableCollection<ActivityRow> _rows;
 
-    private ActivityLogWindow(ActivityLog log)
+    /// <summary>Что открыть после закрытия окна (технический журнал, выгрузка): окна не громоздятся друг на друга.</summary>
+    private Action? _after;
+
+    private ActivityLogWindow(ActivityLog log, ILogActions logs)
     {
         InitializeComponent();
         _log = log;
+        _logs = logs;
         _rows = new ObservableCollection<ActivityRow>(log.Snapshot().Reverse().Select(e => new ActivityRow(e)));
         EntriesList.ItemsSource = _rows;
         UpdateSummary();
@@ -32,7 +40,9 @@ public partial class ActivityLogWindow : Window
             _log.Cleared -= OnCleared;
         };
 
-        OpenFileButton.Click += (_, _) => OpenFile();
+        ExportButton.Click += (_, _) => Export();
+        TechLogButton.Click += (_, _) => CloseThen(_logs.ShowTechLog);
+        BannerExportButton.Click += (_, _) => CloseThen(() => _logs.ShowExport(null));
         ClearButton.Click += (_, _) => ClearLog();
         CloseButton.Click += (_, _) => Close();
 
@@ -43,15 +53,24 @@ public partial class ActivityLogWindow : Window
         };
     }
 
-    public static void Show(Window? owner, ActivityLog log)
+    public static void Show(Window? owner, ActivityLog log, ILogActions logs)
     {
-        var window = new ActivityLogWindow(log);
+        var window = new ActivityLogWindow(log, logs);
         if (owner is { IsLoaded: true, IsVisible: true })
             window.Owner = owner;
         else
             window.WindowStartupLocation = WindowStartupLocation.CenterScreen;
 
         window.ShowDialog();
+        // Следующее окно — когда это закрыто и главное окно снова не затемнено.
+        if (window._after is { } after)
+            window.Dispatcher.BeginInvoke(after);
+    }
+
+    private void CloseThen(Action action)
+    {
+        _after = action;
+        Close();
     }
 
     private void OnAdded(object? sender, ActivityEntry entry) => Dispatcher.BeginInvoke(() =>
@@ -70,12 +89,18 @@ public partial class ActivityLogWindow : Window
 
     private void UpdateSummary()
     {
-        SubtitleText.Text = _rows.Count == 0
+        SubtitleText.Text = (_rows.Count == 0
             ? "Обрывы VPN, запуски и закрытия приложений"
-            : $"Последние события: {_rows.Count} из {ActivityLog.Keep} хранимых";
+            : $"Последние события: {_rows.Count} из {ActivityLog.Keep} хранимых") + (_log.Persist ? string.Empty : ", до закрытия лаунчера");
         EmptyText.Visibility = _rows.Count == 0 ? Visibility.Visible : Visibility.Collapsed;
         ClearButton.IsEnabled = _rows.Count > 0;
+        ExportButton.IsEnabled = _rows.Count > 0;
+        ErrorsBanner.Visibility = HasRecentErrors(_log.Snapshot(), DateTime.Now) ? Visibility.Visible : Visibility.Collapsed;
     }
+
+    /// <summary>Есть ли за последний час ошибки (не запустилось, закрыто без VPN, обрыв): тогда предлагаем выгрузку.</summary>
+    internal static bool HasRecentErrors(System.Collections.Generic.IEnumerable<ActivityEntry> entries, DateTime now) =>
+        entries.Any(e => e.Time >= now.AddHours(-1) && e.Kind is LogKind.Failed or LogKind.Blocked or LogKind.VpnDown);
 
     private void ClearLog()
     {
@@ -83,21 +108,29 @@ public partial class ActivityLogWindow : Window
             _log.Clear();
     }
 
-    private void OpenFile()
+    /// <summary>Сохранить журнал событий в .txt (по времени, старые сверху).</summary>
+    private void Export()
     {
+        var dialog = new SaveFileDialog
+        {
+            Title = "Сохранить журнал событий",
+            Filter = "Текстовые файлы (*.txt)|*.txt",
+            FileName = $"events-{DateTime.Now:yyyyMMdd-HHmm}.txt",
+            InitialDirectory = ExportWindow.DownloadsFolder()
+        };
+        if (dialog.ShowDialog(this) != true)
+            return;
+
         try
         {
-            if (!File.Exists(_log.FilePath))
-            {
-                Directory.CreateDirectory(Path.GetDirectoryName(_log.FilePath)!);
-                File.WriteAllText(_log.FilePath, string.Empty);
-            }
-
-            Process.Start(new ProcessStartInfo(_log.FilePath) { UseShellExecute = true });
+            var text = new StringBuilder();
+            foreach (var entry in _log.Snapshot())
+                text.Append(entry.Time.ToString("yyyy-MM-dd HH:mm:ss")).Append('\t').Append(entry.Kind).Append('\t').Append(entry.Text).Append("\r\n");
+            File.WriteAllText(dialog.FileName, text.ToString(), new UTF8Encoding(true));
         }
         catch (Exception ex)
         {
-            AlertWindow.ShowMessage(this, AlertKind.Error, "Не удалось открыть файл", ex.Message);
+            AlertWindow.ShowMessage(this, AlertKind.Error, "Не удалось сохранить файл", ex.Message);
         }
     }
 

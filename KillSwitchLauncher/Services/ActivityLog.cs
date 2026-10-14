@@ -25,6 +25,8 @@ public sealed record ActivityEntry(DateTime Time, LogKind Kind, string Text);
 /// Журнал событий: обрывы и подключения VPN, запуски и закрытия приложений, обновления.
 /// Хранится в %LOCALAPPDATA%\KillSwitchLauncher\events.log (строка = время, тип, текст через табуляцию),
 /// последние <see cref="Keep"/> записей. Методы можно вызывать из любого потока.
+/// Каждая запись дублируется в технический журнал (<see cref="TechLog"/>, область event). В режиме журналов «только в памяти»
+/// (<see cref="Persist"/> = false) файл не пишется.
 /// </summary>
 public sealed class ActivityLog
 {
@@ -49,6 +51,41 @@ public sealed class ActivityLog
 
     public string FilePath { get; }
 
+    /// <summary>Писать ли на диск. false — режим «только пока лаунчер работает»: файл удаляется, записи живут в памяти.</summary>
+    public bool Persist
+    {
+        get
+        {
+            lock (_gate)
+                return _persist;
+        }
+        set
+        {
+            lock (_gate)
+            {
+                if (_persist == value)
+                    return;
+                _persist = value;
+                try
+                {
+                    if (value)
+                    {
+                        Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
+                        WriteAll();
+                    }
+                    else if (File.Exists(FilePath))
+                        File.Delete(FilePath);
+                }
+                catch (Exception)
+                {
+                    // файл занят: не страшно
+                }
+            }
+        }
+    }
+
+    private bool _persist = true;
+
     /// <summary>Новая запись. Вызывается в том потоке, где запись добавлена.</summary>
     public event EventHandler<ActivityEntry>? Added;
 
@@ -65,6 +102,7 @@ public sealed class ActivityLog
     public void Add(LogKind kind, string text)
     {
         var entry = new ActivityEntry(DateTime.Now, kind, Clean(text));
+        TechLog.Event(kind, entry.Text);
 
         lock (_gate)
         {
@@ -72,28 +110,34 @@ public sealed class ActivityLog
             if (_entries.Count > Keep)
                 _entries.RemoveRange(0, _entries.Count - Keep);
 
-            try
-            {
-                Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
-
-                // Файл дописывается, а раз в сотню записей переписывается целиком, чтобы не рос бесконечно.
-                if (_linesInFile >= Keep + 100)
-                {
-                    WriteAll();
-                }
-                else
-                {
-                    File.AppendAllText(FilePath, Format(entry) + Environment.NewLine, Encoding.UTF8);
-                    _linesInFile++;
-                }
-            }
-            catch (Exception)
-            {
-                // журнал не должен мешать работе: в памяти запись всё равно есть
-            }
+            if (_persist)
+                Append(entry);
         }
 
         Added?.Invoke(this, entry);
+    }
+
+    private void Append(ActivityEntry entry)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
+
+            // Файл дописывается, а раз в сотню записей переписывается целиком, чтобы не рос бесконечно.
+            if (_linesInFile >= Keep + 100)
+            {
+                WriteAll();
+            }
+            else
+            {
+                File.AppendAllText(FilePath, Format(entry) + Environment.NewLine, Encoding.UTF8);
+                _linesInFile++;
+            }
+        }
+        catch (Exception)
+        {
+            // журнал не должен мешать работе: в памяти запись всё равно есть
+        }
     }
 
     public void Clear()
@@ -103,7 +147,8 @@ public sealed class ActivityLog
             _entries.Clear();
             try
             {
-                WriteAll();
+                if (_persist)
+                    WriteAll();
             }
             catch (Exception)
             {

@@ -113,6 +113,38 @@ internal static class Native
         return QueryFullProcessImageNameW(process, native ? 1u : 0u, buffer, ref size) ? new string(buffer, 0, (int)size) : null;
     }
 
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool OpenProcessToken(SafeProcessHandle process, uint access, out IntPtr token);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool CloseHandle(IntPtr handle);
+
+    private const uint TokenQuery = 0x0008;
+
+    /// <summary>SID пользователя, от имени которого работает процесс (клиент канала), или null.</summary>
+    public static string? ProcessUserSid(int processId)
+    {
+        try
+        {
+            using var process = OpenProcess(ProcessQueryLimitedInformation, false, processId);
+            if (process.IsInvalid || !OpenProcessToken(process, TokenQuery, out var token))
+                return null;
+            try
+            {
+                using var identity = new System.Security.Principal.WindowsIdentity(token);
+                return identity.User?.Value;
+            }
+            finally
+            {
+                CloseHandle(token);
+            }
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
+
     /// <summary>
     /// Настоящий путь к файлу: без коротких имён (PROGRA~1), ссылок и точек соединения — под ним Windows и запустит
     /// программу. null — файла нет или его не открыть.

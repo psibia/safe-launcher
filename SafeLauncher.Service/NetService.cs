@@ -24,6 +24,7 @@ internal sealed class NetService : ServiceBase
     /// <summary>Запуск и в службе, и в консоли (--console).</summary>
     public void StartAll(Action<string> log)
     {
+        ServiceLog.Initialize(log);
         _core = new CoreRunner(AppContext.BaseDirectory);
         _core.KillLeftovers();
         _guard = new NetworkGuard(log);
@@ -45,6 +46,7 @@ internal sealed class NetService : ServiceBase
         _server = null;
         _core = null;
         _guard = null;
+        ServiceLog.Shutdown();
     }
 
     private void Log(string message)

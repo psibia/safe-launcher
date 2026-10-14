@@ -1,5 +1,7 @@
+using System.Text.RegularExpressions;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Documents;
 using System.Windows.Input;
 
 namespace KillSwitchLauncher.Views;
@@ -21,8 +23,15 @@ public partial class AlertWindow : Window
     {
         InitializeComponent();
         TitleText.Text = title;
-        MessageText.Text = message;
+        SetMessage(message);
         MessageText.Visibility = string.IsNullOrWhiteSpace(message) ? Visibility.Collapsed : Visibility.Visible;
+        // Длинное объяснение в узкой карточке превращается в высокую «портянку»: чем длиннее текст, тем шире карточка.
+        Card.Width = message.Length switch
+        {
+            > 900 => 720,
+            > 400 => 560,
+            _ => Card.Width
+        };
         ApplyKind(kind);
 
         // Окно без рамки: перетаскивание за любую точку
@@ -47,6 +56,15 @@ public partial class AlertWindow : Window
         var alert = new AlertWindow(destructive ? AlertKind.Danger : AlertKind.Info, title, message);
         alert.AddButton("Отмена", "SecondaryButton", result: false, isDefault: destructive, isCancel: true);
         alert.AddButton(confirmText, destructive ? "DangerButton" : "PrimaryButton", result: true, isDefault: !destructive, isCancel: false);
+        return alert.ShowWithOwner(owner) == true;
+    }
+
+    /// <summary>Ошибка с кнопкой «Выгрузить журналы» (UI-6): true — пользователь хочет выгрузить журналы.</summary>
+    public static bool ShowWithLogs(Window? owner, AlertKind kind, string title, string message)
+    {
+        var alert = new AlertWindow(kind, title, message);
+        alert.AddButton("Выгрузить журналы", "SecondaryButton", result: true, isDefault: false, isCancel: false);
+        alert.AddButton("Закрыть", "PrimaryButton", result: false, isDefault: true, isCancel: true);
         return alert.ShowWithOwner(owner) == true;
     }
 
@@ -101,6 +119,44 @@ public partial class AlertWindow : Window
     {
         AddButton(text, styleKey, result: true, isDefault, isCancel: false);
         ((Button)ButtonsHost.Children[^1]).Click += (_, _) => onClick();
+    }
+
+    /// <summary>
+    /// Текст сообщения. В длинных объяснениях абзац может начинаться с заголовка («Зачем.», «Как работает.»):
+    /// он выделяется жирным, а между абзацами остается пустая строка.
+    /// </summary>
+    private void SetMessage(string message)
+    {
+        if (message.Length <= 400)
+        {
+            MessageText.Text = message;
+            return;
+        }
+
+        MessageText.Inlines.Clear();
+        var paragraphs = message.Split("\n\n");
+        for (var i = 0; i < paragraphs.Length; i++)
+        {
+            if (i > 0)
+            {
+                MessageText.Inlines.Add(new LineBreak());
+                MessageText.Inlines.Add(new LineBreak());
+            }
+            var text = paragraphs[i];
+            var heading = Regex.Match(text, @"^([^.\n:]{2,30}\.) ");
+            if (heading.Success)
+            {
+                MessageText.Inlines.Add(new Run(heading.Groups[1].Value) { FontWeight = FontWeights.SemiBold, Foreground = (System.Windows.Media.Brush)FindResource("TextPrimary") });
+                text = text[heading.Groups[1].Length..];
+            }
+            var lines = text.Split('\n');
+            for (var j = 0; j < lines.Length; j++)
+            {
+                if (j > 0)
+                    MessageText.Inlines.Add(new LineBreak());
+                MessageText.Inlines.Add(new Run(lines[j]));
+            }
+        }
     }
 
     private void ApplyKind(AlertKind kind)

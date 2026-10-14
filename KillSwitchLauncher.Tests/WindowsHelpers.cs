@@ -99,7 +99,22 @@ public sealed class FakeDialogs : IDialogService
         return HideAnswer;
     }
 
-    public void ShowActivityLog(ActivityLog log) => ShownLog = log;
+    public void ShowActivityLog(ActivityLog log, ILogActions logs) => ShownLog = log;
+
+    public List<string> LogWarnings { get; } = new();
+    public bool ExportAnswer { get; set; }
+    public List<string?> ShownExports { get; } = new();
+    public int TechLogShown { get; private set; }
+
+    public bool ShowWarningWithLogs(string message, string title)
+    {
+        LogWarnings.Add(message);
+        return ExportAnswer;
+    }
+
+    public void ShowExport(ILogActions logs, string? preset) => ShownExports.Add(preset);
+
+    public void ShowTechLog(ILogActions logs) => TechLogShown++;
 
     public DnsJournal? ShownDnsJournal { get; private set; }
 

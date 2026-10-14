@@ -17,6 +17,7 @@ namespace KillSwitchLauncher;
 public partial class MainWindow : Window
 {
     private static readonly TimeSpan ToastLifetime = TimeSpan.FromSeconds(3.5);
+    private static readonly TimeSpan ActionToastLifetime = TimeSpan.FromSeconds(8);
 
     private readonly MainViewModel _viewModel;
     private readonly DispatcherTimer _toastTimer;
@@ -27,6 +28,10 @@ public partial class MainWindow : Window
     private bool _sessionEnding;
     private bool _closing;
     private WindowState _restoreState = WindowState.Normal;
+
+    // Уведомление Windows с действием (например «Выгрузить журналы»): щелчок по нему выполняет действие.
+    private Action? _notificationAction;
+    private DateTime _notificationShownUtc;
 
     public MainWindow()
     {
@@ -46,6 +51,7 @@ public partial class MainWindow : Window
         _tray = new TrayIcon(BuildTrayToolTip());
         _tray.Update(BuildTrayToolTip(), alert: IsTrayAlert);
         _tray.OpenRequested += (_, _) => ShowFromTray();
+        _tray.NotificationClicked += (_, _) => OnNotificationClicked();
         _tray.MenuRequested += (_, _) => ShowTrayMenu();
         _viewModel.PropertyChanged += OnViewModelPropertyChanged;
     }
@@ -60,11 +66,15 @@ public partial class MainWindow : Window
         // Окно в трее или свёрнуто: баннер никто не увидит, поэтому показываем уведомление Windows.
         if (!IsVisible || WindowState == WindowState.Minimized)
         {
-            _tray.ShowNotification(toast.Title, toast.Subtitle, warning: toast.Kind == ToastKind.Danger);
+            _notificationAction = toast.HasAction ? toast.Action : null;
+            _notificationShownUtc = DateTime.UtcNow;
+            _tray.ShowNotification(toast.Title, toast.HasAction ? toast.Subtitle + " · Щелкните: " + toast.ActionText : toast.Subtitle,
+                warning: toast.Kind == ToastKind.Danger);
             return;
         }
 
         _toastTimer.Stop();
+        _toastTimer.Interval = toast.HasAction ? ActionToastLifetime : ToastLifetime;
         ToastHost.DataContext = toast;
         ToastHost.Visibility = Visibility.Visible;
 
@@ -97,6 +107,24 @@ public partial class MainWindow : Window
     }
 
     private void OnToastClicked(object sender, MouseButtonEventArgs e) => HideToast();
+
+    private void OnToastActionClicked(object sender, RoutedEventArgs e)
+    {
+        e.Handled = true;
+        var action = (ToastHost.DataContext as ToastInfo)?.Action;
+        HideToast();
+        action?.Invoke();
+    }
+
+    private void OnNotificationClicked()
+    {
+        var action = _notificationAction;
+        _notificationAction = null;
+        ShowFromTray();
+        // Старое уведомление (больше минуты): Windows держит его в центре уведомлений, действие уже не к месту.
+        if (action is not null && DateTime.UtcNow - _notificationShownUtc < TimeSpan.FromMinutes(1))
+            action();
+    }
 
     // ---------------------------------------------------------------- окно
 
@@ -261,7 +289,6 @@ public partial class MainWindow : Window
             ShowFromTray();
             _viewModel.OpenSettings();
         }));
-        items.Add(new TrayMenuItem("Журнал событий", () => _viewModel.ShowLogCommand.Execute(null)));
         items.Add(null);
         items.Add(new TrayMenuItem("Закрыть лаунчер", ExitApp));
         _tray.ShowMenu(items);

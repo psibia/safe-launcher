@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -23,9 +24,13 @@ public static class ControlProtocol
     /// службу, если она старше (номер версии службы для этого не годится: он меняется вместе с лаунчером).
     /// 1 — запуск ядра (служба без этого поля); 2 — управление ядром для проверки серверов (ApiPort/ApiSecret);
     /// 3 — перехват DNS и подменные адреса (HideDns, OutboundDns), сброс кэша DNS, блокировка обхода VPN (guard);
-    /// 4 — непроверенные программы в ответе (Unguarded), DNS-правило для службы DNS Windows и приложений (DnsPaths).
+    /// 4 — непроверенные программы в ответе (Unguarded), DNS-правило для службы DNS Windows и приложений (DnsPaths);
+    /// 5 — журналы службы и ядра (logConfig, logRead, logMark, logClear, logFiles), корреляция команд (Cid).
     /// </summary>
-    public const int Revision = 4;
+    public const int Revision = 5;
+
+    /// <summary>С какой ревизии есть команды журналов.</summary>
+    public const int LogsRevision = 5;
 
     /// <summary>Самое длинное сообщение: настройки ядра со всеми подключениями и исключениями.</summary>
     public const int MaxMessageBytes = 4 * 1024 * 1024;
@@ -36,6 +41,21 @@ public static class ControlProtocol
 
     /// <summary>Какие программы пускать в сеть только через VPN (<see cref="ControlMessage.Guard"/>). Заменяет прежний список этого лаунчера.</summary>
     public const string OpGuard = "guard";
+
+    /// <summary>Настройки журналов (<see cref="LogRequest"/>); ответ — ключ меток адресов и занятое место.</summary>
+    public const string OpLogConfig = "logConfig";
+
+    /// <summary>Строки журналов службы и ядра за период, порциями (<see cref="LogRequest.Cursor"/>).</summary>
+    public const string OpLogRead = "logRead";
+
+    /// <summary>Отметка пользователя «здесь проблема» в журналах службы и ядра.</summary>
+    public const string OpLogMark = "logMark";
+
+    /// <summary>Удалить журналы службы и ядра (кнопка «Удалить все журналы»); ключ меток меняется.</summary>
+    public const string OpLogClear = "logClear";
+
+    /// <summary>Файлы рядом с журналами за период: очищенные конфиги ядра и падения службы (для выгрузки).</summary>
+    public const string OpLogFiles = "logFiles";
 
     /// <summary>Ядро завершилось само (упало или не смогло работать дальше).</summary>
     public const string EventCoreExited = "coreExited";
@@ -62,6 +82,88 @@ public sealed class ControlMessage
 
     /// <summary>Для guard: что разрешать в сеть только через VPN.</summary>
     public GuardRequest? Guard { get; set; }
+
+    /// <summary>Корреляция: id операции лаунчера (L + 4 hex), служба ставит его в свои строки журнала по этой команде.</summary>
+    public string? Cid { get; set; }
+
+    /// <summary>Для команд журналов (logConfig, logRead, logMark, logFiles).</summary>
+    public LogRequest? Logs { get; set; }
+}
+
+/// <summary>Запрос к журналам службы. Какие поля нужны — см. описание команды в <see cref="ControlProtocol"/>.</summary>
+public sealed class LogRequest
+{
+    /// <summary>logConfig: files или memory.</summary>
+    public string? Storage { get; set; }
+
+    /// <summary>logConfig: срок хранения, дней.</summary>
+    public int? RetentionDays { get; set; }
+
+    /// <summary>logConfig: скрывать IP-адреса и серверы подключений при записи.</summary>
+    public bool? HideAddresses { get; set; }
+
+    /// <summary>logConfig: подробный журнал до этого времени (UTC); null — выключен.</summary>
+    public DateTime? DetailedUntilUtc { get; set; }
+
+    /// <summary>logRead, logFiles: период (UTC).</summary>
+    public DateTime? FromUtc { get; set; }
+
+    public DateTime? ToUtc { get; set; }
+
+    /// <summary>logRead: service и/или core; пусто — оба.</summary>
+    public List<string>? Sources { get; set; }
+
+    /// <summary>logRead: откуда продолжить (из прошлого ответа); null — с начала периода.</summary>
+    public string? Cursor { get; set; }
+
+    /// <summary>logRead: примерный размер порции, байт (служба ограничивает сама).</summary>
+    public int? MaxBytes { get; set; }
+
+    /// <summary>logMark: текст отметки (необязательно).</summary>
+    public string? Text { get; set; }
+}
+
+/// <summary>Ответ команд журналов.</summary>
+public sealed class LogReply
+{
+    /// <summary>logConfig: ключ меток адресов (base64), чтобы метки лаунчера совпадали с метками службы.</summary>
+    public string? MaskKey { get; set; }
+
+    /// <summary>Занято файлами журналов службы и ядра (с конфигами и падениями), байт.</summary>
+    public long? ServiceBytes { get; set; }
+
+    public long? CoreBytes { get; set; }
+
+    /// <summary>Сколько строк служба и ядро потеряли (переполнение, ошибки записи).</summary>
+    public long? Dropped { get; set; }
+
+    /// <summary>Пишется ли сейчас подробный журнал ядра.</summary>
+    public bool? Detailed { get; set; }
+
+    /// <summary>Где хранятся журналы службы (files или memory).</summary>
+    public string? Storage { get; set; }
+
+    /// <summary>logRead: строки в формате журнала.</summary>
+    public List<string>? Lines { get; set; }
+
+    /// <summary>logRead: продолжение; null — дочитано.</summary>
+    public string? Cursor { get; set; }
+
+    /// <summary>logFiles: файлы за период.</summary>
+    public List<LogFileItem>? Files { get; set; }
+
+    /// <summary>logClear: освобождено байт.</summary>
+    public long? Freed { get; set; }
+}
+
+/// <summary>Файл рядом с журналами (очищенный конфиг ядра, описание падения).</summary>
+public sealed class LogFileItem
+{
+    public string Name { get; set; } = string.Empty;
+
+    public DateTime Utc { get; set; }
+
+    public string Content { get; set; } = string.Empty;
 }
 
 /// <summary>
@@ -147,6 +249,9 @@ public sealed class ControlReply
 
     /// <summary>Для guard: что не удалось включить (фильтры частично не добавлены), иначе null.</summary>
     public string? Warning { get; set; }
+
+    /// <summary>Для команд журналов.</summary>
+    public LogReply? Logs { get; set; }
 
     /// <summary>
     /// Для guard: пути из запроса, которые служба не смогла проверить (сетевой диск, нет доступа) и поэтому не ограничила.

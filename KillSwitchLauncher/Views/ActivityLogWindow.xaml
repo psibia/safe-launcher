@@ -38,6 +38,7 @@
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
             </Grid.RowDefinitions>
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="Auto" />
@@ -49,10 +50,20 @@
                 <local:GlyphIcon Glyph="&#xE81C;" Size="18" Foreground="{StaticResource Accent}" HorizontalAlignment="Center" VerticalAlignment="Center" />
             </Border>
 
-            <StackPanel Grid.Row="0" Grid.Column="1" VerticalAlignment="Center">
-                <TextBlock Text="Журнал событий" FontSize="17" FontWeight="Bold" />
-                <TextBlock x:Name="SubtitleText" Foreground="{StaticResource TextMuted}" FontSize="12" Margin="0,3,0,0" TextWrapping="Wrap" />
-            </StackPanel>
+            <Grid Grid.Row="0" Grid.Column="1" VerticalAlignment="Center">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                    <TextBlock Text="Журнал событий" FontSize="17" FontWeight="Bold" />
+                    <TextBlock x:Name="SubtitleText" Foreground="{StaticResource TextMuted}" FontSize="12" Margin="0,3,0,0" TextWrapping="Wrap" />
+                </StackPanel>
+                <Button x:Name="TechLogButton" Grid.Column="1" Style="{StaticResource LinkButton}" VerticalAlignment="Top" Margin="12,2,0,0"
+                        ToolTip="Подробности работы лаунчера, службы и подключений">
+                    <TextBlock Text="Технический журнал →" />
+                </Button>
+            </Grid>
 
             <Border Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,18,0,0" Background="{StaticResource RowBg}" CornerRadius="16">
                 <Grid>
@@ -88,15 +99,30 @@
                 </Grid>
             </Border>
 
-            <Grid Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,20,0,0">
+            <!-- Плашка: есть ошибки за последний час (без ошибок ее нет) -->
+            <Border x:Name="ErrorsBanner" Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,12,0,0" Padding="14,10"
+                    CornerRadius="14" Background="{StaticResource DangerSoft}" Visibility="Collapsed">
+                <Grid>
+                    <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="*" />
+                        <ColumnDefinition Width="Auto" />
+                    </Grid.ColumnDefinitions>
+                    <TextBlock Grid.Column="0" Text="Есть ошибки за последний час. Выгрузить журналы для анализа?" TextWrapping="Wrap"
+                               VerticalAlignment="Center" FontSize="12.5" />
+                    <Button x:Name="BannerExportButton" Grid.Column="1" Style="{StaticResource SecondaryButton}" MinHeight="30" Padding="12,6"
+                            FontSize="12" Margin="12,0,0,0" VerticalAlignment="Center" Content="Выгрузить" />
+                </Grid>
+            </Border>
+
+            <Grid Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,20,0,0">
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="*" />
                     <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
-                <Button x:Name="OpenFileButton" Grid.Column="0" Style="{StaticResource SecondaryButton}" Padding="16,9" Content="Открыть файл"
-                        ToolTip="Открыть журнал в текстовом редакторе" />
+                <Button x:Name="ExportButton" Grid.Column="0" Style="{StaticResource SecondaryButton}" Padding="16,9" Content="Экспорт"
+                        ToolTip="Сохранить журнал событий в текстовый файл" />
                 <Button x:Name="ClearButton" Grid.Column="1" Style="{StaticResource SecondaryButton}" Padding="16,9" Margin="10,0,0,0"
                         Content="Очистить" />
                 <Button x:Name="CloseButton" Grid.Column="3" Style="{StaticResource PrimaryButton}" Padding="20,9" MinWidth="104"

@@ -516,6 +516,7 @@
                 <Grid.ColumnDefinitions>
                     <ColumnDefinition Width="Auto" />
                     <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
                 <Border Grid.Column="0" Width="40" Height="40" CornerRadius="20">
                     <Border.Style>
@@ -539,6 +540,10 @@
                     <TextBlock Text="{Binding Subtitle}" FontSize="12.5" Foreground="{StaticResource TextMuted}" Margin="0,1,0,0"
                                TextTrimming="CharacterEllipsis" />
                 </StackPanel>
+                <!-- Действие уведомления, например «Выгрузить» после отметки проблемы -->
+                <Button Grid.Column="2" Style="{StaticResource SecondaryButton}" MinHeight="30" Padding="12,6" FontSize="12" Margin="14,0,-12,0"
+                        VerticalAlignment="Center" Content="{Binding ActionText}" Click="OnToastActionClicked"
+                        Visibility="{Binding HasAction, Converter={StaticResource BoolToVis}, FallbackValue=Collapsed}" />
             </Grid>
         </Border>
     </Grid>

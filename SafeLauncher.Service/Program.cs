@@ -13,6 +13,10 @@ internal static class Program
 
     private static int Main(string[] args)
     {
+        // Падение службы: стек в журнал службы (и в Журнал Windows), до того как процесс завершится.
+        AppDomain.CurrentDomain.UnhandledException += (_, e) => ServiceLog.Crash(e.ExceptionObject as Exception, "AppDomain", terminating: true);
+        System.Threading.Tasks.TaskScheduler.UnobservedTaskException += (_, e) => ServiceLog.Crash(e.Exception, "Task", terminating: false);
+
         var command = args.Length > 0 ? args[0] : string.Empty;
         if (command.StartsWith("--", StringComparison.Ordinal))
         {

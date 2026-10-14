@@ -58,6 +58,9 @@ public sealed class TrayIcon : IDisposable
     /// <summary>Правый клик по значку: пора показать меню (<see cref="ShowMenu"/>).</summary>
     public event EventHandler? MenuRequested;
 
+    /// <summary>Щелчок по уведомлению Windows от значка.</summary>
+    public event EventHandler? NotificationClicked;
+
     /// <summary>Значок действительно показан (без Проводника, например, его некуда добавить).</summary>
     public bool IsShown => _added && !_disposed;
 
@@ -197,8 +200,11 @@ public sealed class TrayIcon : IDisposable
         {
             case WmLButtonDblClk:
             case NinKeySelect:
-            case NinBalloonUserClick:
                 OpenRequested?.Invoke(this, EventArgs.Empty);
+                break;
+
+            case NinBalloonUserClick:
+                NotificationClicked?.Invoke(this, EventArgs.Empty);
                 break;
 
             case WmContextMenu:

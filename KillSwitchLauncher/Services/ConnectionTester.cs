@@ -12,6 +12,7 @@ using System.Text;
 using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
+using SafeLauncher.Logging;
 
 namespace KillSwitchLauncher.Services;
 
@@ -54,6 +55,24 @@ public sealed class ConnectionTester
     }
 
     public async Task<ConnectionCheck> CheckAsync(JsonObject server, CancellationToken cancellation = default)
+    {
+        using var operation = TechLog.CurrentCid is null ? TechLog.Begin(out _) : null;
+        var watch = Stopwatch.StartNew();
+        TechLog.Info(LogAreas.Check, LogCodes.CheckStart,
+            $"Проверка подключения: {(string?)server["type"] ?? "?"}, сервер {(string?)server["server"] ?? FirstPeer(server) ?? "?"}");
+        var result = await CheckCoreAsync(server, cancellation).ConfigureAwait(false);
+        if (result.Ok)
+            TechLog.Info(LogAreas.Check, LogCodes.CheckResult,
+                $"Проверка прошла за {watch.ElapsedMilliseconds} мс: задержка {result.LatencyMs} мс, внешний адрес {result.Ip ?? "?"}, страна {result.CountryCode ?? "?"}");
+        else
+            TechLog.Warn(LogAreas.Check, LogCodes.CheckFail, $"Проверка не прошла за {watch.ElapsedMilliseconds} мс: {result.Error}");
+        return result;
+    }
+
+    private static string? FirstPeer(JsonObject server) =>
+        server["peers"] is JsonArray { Count: > 0 } peers && peers[0] is JsonObject peer ? (string?)peer["address"] : null;
+
+    private async Task<ConnectionCheck> CheckCoreAsync(JsonObject server, CancellationToken cancellation)
     {
         if (!File.Exists(_coreExe))
             return Fail("Не найдено ядро VPN. Переустановите лаунчер.", Array.Empty<string>());
@@ -159,10 +178,14 @@ public sealed class ConnectionTester
             info.ArgumentList.Add(arg);
 
         var process = new Process { StartInfo = info };
+        var parser = new CoreLogParser();
+        var cid = TechLog.CurrentCid;
         DataReceivedEventHandler onLine = (_, e) =>
         {
             if (e.Data is null)
                 return;
+            lock (log)
+                TechLog.CheckCoreLine(parser, e.Data, cid);
             lock (log)
             {
                 log.Add(e.Data);

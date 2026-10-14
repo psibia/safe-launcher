@@ -4,6 +4,7 @@ using System.Linq;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using SafeLauncher.Logging;
 
 namespace KillSwitchLauncher.Services;
 
@@ -168,7 +169,20 @@ public sealed class VpnGuard : IDisposable
             _desiredKey = Key(request);
         }
 
+        TechLog.Debug(LogAreas.Guard, LogCodes.GuardApply, "Новый набор фильтров (в фоне): " + Describe(request));
         Pump();
+    }
+
+    /// <summary>Набор фильтров для журнала: сколько правил и каких, без полных путей (они в подробном журнале службы).</summary>
+    internal static string Describe(GuardRequest request)
+    {
+        var apps = request.Apps;
+        return $"приложений {apps.Count} (через ядро {apps.Count(a => a.ViaCore)}, через адаптеры {apps.Count(a => !a.ViaCore && a.Interfaces.Count > 0)}" +
+               (apps.Any(a => !a.ViaCore && a.Interfaces.Count > 0) ? " [" + string.Join(",", apps.SelectMany(a => a.Interfaces).Distinct()) + "]" : string.Empty) +
+               $", без сети {apps.Count(a => !a.ViaCore && a.Interfaces.Count == 0)}), программ " +
+               string.Join(", ", apps.SelectMany(a => a.Paths).Select(System.IO.Path.GetFileName).Distinct(StringComparer.OrdinalIgnoreCase)) +
+               (request.DnsInterfaces is { Count: > 0 } dns ? $"; DNS только через адаптеры [{string.Join(",", dns)}]" : string.Empty) +
+               (request.DnsPaths is { Count: > 0 } dnsPaths ? $"; DNS программ {dnsPaths.Count}" : string.Empty);
     }
 
     /// <summary>Поставить набор сейчас (перед запуском приложения). null — получилось, иначе причина для пользователя.</summary>
@@ -251,6 +265,7 @@ public sealed class VpnGuard : IDisposable
             }
 
             GuardReply reply;
+            var watch = System.Diagnostics.Stopwatch.StartNew();
             try
             {
                 reply = await backend.ApplyAsync(request, cancellation).ConfigureAwait(false);
@@ -259,6 +274,9 @@ public sealed class VpnGuard : IDisposable
                     _appliedKey = key;
                     _unguarded = new HashSet<string>(reply.Unguarded, StringComparer.OrdinalIgnoreCase);
                 }
+                TechLog.Info(LogAreas.Guard, LogCodes.GuardApply, $"Фильтры применены за {watch.ElapsedMilliseconds} мс: {Describe(request)}" +
+                    (reply.Unguarded.Count > 0 ? "; служба не проверила: " + string.Join(", ", reply.Unguarded) : string.Empty) +
+                    (reply.Notice is { } n ? "; замечание службы: " + n : string.Empty));
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
@@ -268,6 +286,7 @@ public sealed class VpnGuard : IDisposable
                     _appliedKey = null; // что сейчас в службе — неизвестно: отправим снова
                 if (!backend.IsConnected)
                     DropBackend(backend);
+                TechLog.Error(LogAreas.Guard, LogCodes.GuardFail, $"Фильтры не применены ({watch.ElapsedMilliseconds} мс): {ex.Message}; набор: {Describe(request)}");
                 return ex is CoreServiceException ? ex.Message : "нет связи со службой «Безопасный лаунчер — сеть» (" + ex.Message + ")";
             }
 
@@ -333,7 +352,10 @@ public sealed class VpnGuard : IDisposable
         if (error is not null && error != previous)
             Failed?.Invoke(error);
         else if (error is null && previous is not null)
+        {
+            TechLog.Info(LogAreas.Guard, LogCodes.GuardRestored, "Фильтры снова работают");
             Restored?.Invoke();
+        }
     }
 
     private void RetryIfNeeded()
@@ -347,6 +369,7 @@ public sealed class VpnGuard : IDisposable
 
     private void OnLost()
     {
+        TechLog.Warn(LogAreas.Guard, LogCodes.GuardFail, "Связь со службой для фильтров пропала: служба сняла фильтры, набор отправляется заново");
         IGuardBackend? backend;
         lock (_state)
         {

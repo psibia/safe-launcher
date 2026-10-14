@@ -152,7 +152,7 @@
                                  IsChecked="{Binding Section, Converter={StaticResource EnumToBool}, ConverterParameter=Protection}" />
                     <RadioButton Style="{StaticResource NavItem}" Tag="&#xE8A7;" Content="Окно и трей"
                                  IsChecked="{Binding Section, Converter={StaticResource EnumToBool}, ConverterParameter=Window}" />
-                    <RadioButton Style="{StaticResource NavItem}" Tag="&#xE81C;" Content="Журнал событий"
+                    <RadioButton Style="{StaticResource NavItem}" Tag="&#xE81C;" Content="Журналы"
                                  IsChecked="{Binding Section, Converter={StaticResource EnumToBool}, ConverterParameter=Log}" />
                     <RadioButton Style="{StaticResource NavItem}" Tag="&#xE946;"
                                  IsChecked="{Binding Section, Converter={StaticResource EnumToBool}, ConverterParameter=About}">
@@ -168,7 +168,11 @@
                 </StackPanel>
 
                 <ScrollViewer Grid.Column="1" Margin="0,10,6,10" Focusable="False" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                    <Grid Margin="10,12,28,24" MaxWidth="760" HorizontalAlignment="Left">
+                    <!-- Ширина содержимого постоянная (до 760): не зависит от длины текстов в разделе, поэтому ничего не прыгает -->
+                    <Grid Margin="10,12,28,24">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" MaxWidth="760" />
+                        </Grid.ColumnDefinitions>
 
                         <!-- ===== Подключение: общее условие запуска ===== -->
                         <StackPanel Visibility="{Binding Section, Converter={StaticResource EnumToVis}, ConverterParameter=Connection}">
@@ -321,23 +325,19 @@
                                 </Button>
                             </Grid>
 
-                            <!-- Фильтр списка: применяется сразу и не сохраняется -->
-                            <Border Style="{StaticResource SettingRow}">
-                                <CheckBox Style="{StaticResource ToggleSwitch}" IsChecked="{Binding ShowAllAdapters}">
-                                    <StackPanel>
-                                        <TextBlock Text="Показывать все адаптеры" FontSize="13.5" FontWeight="SemiBold" TextWrapping="Wrap" />
-                                        <TextBlock Text="Если ваш VPN не распознался автоматически" Style="{StaticResource Caption}" Margin="0,1,0,0" />
-                                    </StackPanel>
-                                </CheckBox>
-                            </Border>
+                            <ItemsControl ItemsSource="{Binding Adapters}" ItemTemplate="{StaticResource AdapterRowTemplate}" />
 
-                            <ItemsControl ItemsSource="{Binding Adapters}" Margin="0,8,0,0" ItemTemplate="{StaticResource AdapterRowTemplate}" />
-
-                            <StackPanel Margin="0,14,0,0" Visibility="{Binding ShowOtherGroup, Converter={StaticResource BoolToVis}}">
+                            <StackPanel Margin="0,6,0,0" Visibility="{Binding ShowOtherGroup, Converter={StaticResource BoolToVis}}">
                                 <TextBlock Text="ДРУГИЕ АДАПТЕРЫ" Style="{StaticResource GroupTitle}" />
                                 <TextBlock Text="Не похожи на VPN. Включите нужный, если ваш VPN не распознался." Style="{StaticResource Caption}" Margin="4,2,0,10" />
                                 <ItemsControl ItemsSource="{Binding OtherAdapters}" ItemTemplate="{StaticResource AdapterRowTemplate}" />
                             </StackPanel>
+
+                            <!-- Под списком: развернуть все адаптеры (если VPN не распознался) или свернуть обратно. Сразу и без сохранения -->
+                            <ToggleButton Style="{StaticResource ExpanderToggle}" IsChecked="{Binding ShowAllAdapters}" Margin="0,2,0,0"
+                                          ToolTip="Если ваш VPN не распознался автоматически, он среди остальных адаптеров">
+                                <TextBlock Text="{Binding AllAdaptersToggleText}" Margin="0,0,8,0" />
+                            </ToggleButton>
 
                             <StackPanel Margin="0,14,0,0" Visibility="{Binding HasRemovedAdapters, Converter={StaticResource BoolToVis}}">
                                 <Grid>
@@ -502,27 +502,144 @@
                             </Border>
                         </StackPanel>
 
-                        <!-- ===== Журнал событий ===== -->
+                        <!-- ===== Журналы (UI-1): окна журналов — строки целиком; хранение и скрытие адресов — по «Применить», подробный журнал — сразу ===== -->
                         <StackPanel Visibility="{Binding Section, Converter={StaticResource EnumToVis}, ConverterParameter=Log}">
-                            <TextBlock Text="Журнал событий" Style="{StaticResource SectionTitle}" FontSize="16" Margin="0,0,0,14" />
-                            <Border Style="{StaticResource SettingRow}" Padding="14,10">
+                            <TextBlock Text="Журналы" Style="{StaticResource SectionTitle}" FontSize="16" Margin="0,0,0,14" />
+                            <Button Style="{StaticResource SettingLinkRow}" Margin="0,0,0,8" Command="{Binding ShowLogCommand}">
                                 <Grid>
                                     <Grid.ColumnDefinitions>
                                         <ColumnDefinition Width="Auto" />
                                         <ColumnDefinition Width="*" />
-                                        <ColumnDefinition Width="Auto" />
                                     </Grid.ColumnDefinitions>
                                     <Border Grid.Column="0" Width="36" Height="36" CornerRadius="18" Background="{StaticResource AccentSoft}" VerticalAlignment="Center">
                                         <views:GlyphIcon Glyph="&#xE81C;" Size="14" Foreground="{StaticResource Accent}" HorizontalAlignment="Center" VerticalAlignment="Center" />
                                     </Border>
-                                    <StackPanel Grid.Column="1" Margin="12,0,8,0" VerticalAlignment="Center">
+                                    <StackPanel Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center">
                                         <TextBlock Text="Журнал событий" FontWeight="Bold" FontSize="13.5" TextTrimming="CharacterEllipsis" />
-                                        <TextBlock Text="VPN и подключения, запуски и закрытия приложений" Style="{StaticResource Caption}" Margin="0,1,0,0" />
+                                        <TextBlock Text="Запуски и закрытия приложений, обрывы подключений" Style="{StaticResource Caption}" Margin="0,1,0,0" TextWrapping="Wrap" />
                                     </StackPanel>
-                                    <Button Grid.Column="2" Style="{StaticResource SecondaryButton}" MinHeight="30" Padding="12,6" FontSize="12"
-                                            VerticalAlignment="Center" Content="Открыть" Command="{Binding ShowLogCommand}" />
                                 </Grid>
+                            </Button>
+                            <Button Style="{StaticResource SettingLinkRow}" Margin="0,0,0,8" Command="{Binding ShowTechLogCommand}">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Border Grid.Column="0" Width="36" Height="36" CornerRadius="18" Background="{StaticResource AccentSoft}" VerticalAlignment="Center">
+                                        <views:GlyphIcon Glyph="&#xE9D9;" Size="14" Foreground="{StaticResource Accent}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                                    </Border>
+                                    <StackPanel Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center">
+                                        <TextBlock Text="Технический журнал" FontWeight="Bold" FontSize="13.5" TextTrimming="CharacterEllipsis" />
+                                        <TextBlock Text="Подробности работы лаунчера, службы и подключений. Нужен для поиска ошибок" Style="{StaticResource Caption}" Margin="0,1,0,0" TextWrapping="Wrap" />
+                                    </StackPanel>
+                                </Grid>
+                            </Button>
+                            <Button Style="{StaticResource SettingLinkRow}" Margin="0,0,0,8" Command="{Binding ShowExportCommand}">
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <Border Grid.Column="0" Width="36" Height="36" CornerRadius="18" Background="{StaticResource AccentSoft}" VerticalAlignment="Center">
+                                        <views:GlyphIcon Glyph="&#xE896;" Size="14" Foreground="{StaticResource Accent}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                                    </Border>
+                                    <StackPanel Grid.Column="1" Margin="12,0,0,0" VerticalAlignment="Center">
+                                        <TextBlock Text="Выгрузить для анализа" FontWeight="Bold" FontSize="13.5" TextTrimming="CharacterEllipsis" />
+                                        <TextBlock Text="Все журналы за выбранное время в одном архиве" Style="{StaticResource Caption}" Margin="0,1,0,0" TextWrapping="Wrap" />
+                                    </StackPanel>
+                                </Grid>
+                            </Button>
+
+                            <TextBlock Text="Хранение" Style="{StaticResource SectionTitle}" FontSize="14" Margin="0,14,0,10" />
+                            <TextBlock Text="Где хранить" Style="{StaticResource Caption}" Margin="4,0,0,6" />
+                            <Border Background="{StaticResource SubtleBg}" CornerRadius="14" Padding="4">
+                                <UniformGrid Columns="2">
+                                    <RadioButton Style="{StaticResource SegmentRadio}" Content="В файлах на компьютере" GroupName="LogStorage"
+                                                 IsChecked="{Binding LogsInFiles}" />
+                                    <RadioButton Style="{StaticResource SegmentRadio}" Content="Только пока лаунчер открыт" GroupName="LogStorage"
+                                                 IsChecked="{Binding LogsInMemory}" />
+                                </UniformGrid>
                             </Border>
+                            <TextBlock Style="{StaticResource Caption}" Margin="4,6,0,0" TextWrapping="Wrap"
+                                       Text="Журналы удаляются при закрытии лаунчера. Если лаунчер упадет, сохранится только описание ошибки"
+                                       Visibility="{Binding LogsInMemory, Converter={StaticResource BoolToVis}}" />
+
+                            <Grid Margin="0,14,0,6">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Grid.Column="0" Text="Сколько хранить" Style="{StaticResource Caption}" Margin="4,0,0,0" />
+                                <TextBlock Grid.Column="1" Text="{Binding LogUsageText}" Style="{StaticResource Caption}" />
+                            </Grid>
+                            <Border Background="{StaticResource SubtleBg}" CornerRadius="14" Padding="4"
+                                    IsEnabled="{Binding LogsInFiles}">
+                                <Border.Style>
+                                    <Style TargetType="Border">
+                                        <Style.Triggers>
+                                            <Trigger Property="IsEnabled" Value="False">
+                                                <Setter Property="Opacity" Value="0.5" />
+                                            </Trigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </Border.Style>
+                                <UniformGrid Columns="5">
+                                        <RadioButton Style="{StaticResource SegmentRadio}" Content="1 день"
+                                                     IsChecked="{Binding LogRetentionDays, Converter={StaticResource EqualsToBool}, ConverterParameter=1}" />
+                                        <RadioButton Style="{StaticResource SegmentRadio}" Content="3 дня"
+                                                     IsChecked="{Binding LogRetentionDays, Converter={StaticResource EqualsToBool}, ConverterParameter=3}" />
+                                        <RadioButton Style="{StaticResource SegmentRadio}" Content="7 дней"
+                                                     IsChecked="{Binding LogRetentionDays, Converter={StaticResource EqualsToBool}, ConverterParameter=7}" />
+                                        <RadioButton Style="{StaticResource SegmentRadio}" Content="14 дней"
+                                                     IsChecked="{Binding LogRetentionDays, Converter={StaticResource EqualsToBool}, ConverterParameter=14}" />
+                                        <RadioButton Style="{StaticResource SegmentRadio}" Content="30 дней"
+                                                     IsChecked="{Binding LogRetentionDays, Converter={StaticResource EqualsToBool}, ConverterParameter=30}" />
+                                </UniformGrid>
+                            </Border>
+
+                            <Border Style="{StaticResource SettingRow}" Margin="0,16,0,0">
+                                <CheckBox Style="{StaticResource ToggleSwitch}" IsChecked="{Binding HideLogAddresses}">
+                                    <StackPanel Margin="4,0,0,0">
+                                        <TextBlock Text="Скрывать IP-адреса" FontWeight="Bold" FontSize="14" />
+                                        <TextBlock Margin="0,1,0,0" TextWrapping="Wrap">
+                                            <TextBlock.Style>
+                                                <Style TargetType="TextBlock" BasedOn="{StaticResource Caption}">
+                                                    <Setter Property="Text" Value="Адреса записываются как есть. Скрыть их можно и при выгрузке" />
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding HideLogAddresses}" Value="True">
+                                                            <Setter Property="Text" Value="Вместо адресов в журналах будут метки вида ip4-pub-3f2a1c. Одинаковые адреса получают одинаковые метки, ошибки разбирать можно" />
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </TextBlock.Style>
+                                        </TextBlock>
+                                        <TextBlock Text="{Binding LogRemaskText}" Foreground="{StaticResource Accent}" FontSize="12" Margin="0,4,0,0"
+                                                   Visibility="{Binding IsRemasking, Converter={StaticResource BoolToVis}}" />
+                                    </StackPanel>
+                                </CheckBox>
+                            </Border>
+
+                            <!-- Подробный журнал включается и выключается сразу этим переключателем; пока включен, рядом с названием метка «до 22:14» -->
+                            <Border Style="{StaticResource SettingRow}" Margin="0,8,0,0">
+                                <CheckBox Style="{StaticResource ToggleSwitch}" IsChecked="{Binding IsDetailedLog}">
+                                    <StackPanel Margin="4,0,0,0">
+                                        <StackPanel Orientation="Horizontal">
+                                            <TextBlock Text="Подробный журнал на 1 час" FontWeight="Bold" FontSize="14" VerticalAlignment="Center" />
+                                            <Border Background="{StaticResource AccentSoft}" CornerRadius="8" Padding="7,1" Margin="8,0,0,0" VerticalAlignment="Center"
+                                                    Visibility="{Binding IsDetailedLog, Converter={StaticResource BoolToVis}}">
+                                                <TextBlock Text="{Binding DetailedLogText}" Foreground="{StaticResource Accent}" FontSize="11" FontWeight="SemiBold" />
+                                            </Border>
+                                        </StackPanel>
+                                        <TextBlock Style="{StaticResource Caption}" Margin="0,1,0,0" TextWrapping="Wrap"
+                                                   Text="Записывает больше деталей о соединениях. Включайте, когда повторяете ошибку. Включается сразу, через час выключится сам. Работающие приложения не прерываются" />
+                                    </StackPanel>
+                                </CheckBox>
+                            </Border>
+
+                            <Button Style="{StaticResource LinkButton}" HorizontalAlignment="Left" Margin="4,14,0,0" Command="{Binding DeleteAllLogsCommand}">
+                                <TextBlock Text="Удалить все журналы" Foreground="{StaticResource Danger}" />
+                            </Button>
                         </StackPanel>
 
                         <!-- ===== О программе ===== -->

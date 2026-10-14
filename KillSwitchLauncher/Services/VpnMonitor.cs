@@ -111,6 +111,7 @@ public sealed class VpnMonitor : IDisposable
             var previous = _current;
             _current = snapshot;
             _signature = signature;
+            LogChange(previous, snapshot);
 
             // Поднимаем событие под блокировкой, чтобы обработчики видели изменения строго по порядку
             // (иначе «подключён» из одного потока мог бы обогнать «отключён» из другого).
@@ -160,6 +161,39 @@ public sealed class VpnMonitor : IDisposable
                 return new VpnSnapshot(active.Count > 0, adapters, active,
                     active.Count > 0 ? "Обнаружен активный VPN" : "Нет защищённого соединения");
             }
+        }
+    }
+
+    /// <summary>Что изменилось в адаптерах (технический журнал, область monitor).</summary>
+    private static void LogChange(VpnSnapshot? previous, VpnSnapshot current)
+    {
+        try
+        {
+            string Describe(VpnAdapterInfo a) =>
+                $"{a.Name} ({(a.IsVpnLike ? "VPN, " : string.Empty)}{(a.IsUp ? "up" : "down")}, #{a.Index}{(a.HasDns ? ", DNS" : string.Empty)})";
+            var parts = new List<string>();
+            var before = previous?.Adapters.ToDictionary(a => a.Name, StringComparer.OrdinalIgnoreCase)
+                         ?? new Dictionary<string, VpnAdapterInfo>(StringComparer.OrdinalIgnoreCase);
+            foreach (var a in current.Adapters)
+            {
+                if (!before.TryGetValue(a.Name, out var old))
+                    parts.Add("+" + Describe(a));
+                else if (old.IsUp != a.IsUp || old.Index != a.Index || old.HasDns != a.HasDns || old.IsVpnLike != a.IsVpnLike)
+                    parts.Add(Describe(old) + " → " + Describe(a));
+            }
+            foreach (var name in before.Keys.Except(current.Adapters.Select(a => a.Name), StringComparer.OrdinalIgnoreCase))
+                parts.Add("-" + name);
+
+            TechLog.Info(SafeLauncher.Logging.LogAreas.Monitor, SafeLauncher.Logging.LogCodes.AdapterChange,
+                (previous is null ? "Адаптеры при старте: " + string.Join("; ", current.Adapters.Select(Describe)) : "Адаптеры изменились: " + string.Join("; ", parts)) +
+                $". VPN по правилу: {(current.IsConnected ? "есть" : "нет")} ({current.Explanation})" +
+                (current.ActiveVpnNames.Count > 0 ? ", активны: " + string.Join(", ", current.ActiveVpnNames) : string.Empty));
+            if (TechLog.Detailed)
+                TechLog.Debug(SafeLauncher.Logging.LogAreas.Monitor, SafeLauncher.Logging.LogCodes.NetSnapshot, SafeLauncher.Logging.NetworkSnapshot.Describe());
+        }
+        catch (Exception)
+        {
+            // журнал не должен мешать мониторингу
         }
     }
 

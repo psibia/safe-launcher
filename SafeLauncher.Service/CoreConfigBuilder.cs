@@ -268,7 +268,8 @@ public static class CoreConfigBuilder
 
         var config = new JsonObject
         {
-            ["log"] = new JsonObject { ["level"] = "info", ["timestamp"] = true },
+            // Время строк ставит служба при приеме (UTC, мс, общее с журналами лаунчера и службы), см. ServiceLog.
+            ["log"] = new JsonObject { ["level"] = "info", ["timestamp"] = false },
             ["inbounds"] = new JsonArray(new JsonObject
             {
                 ["type"] = "tun",

@@ -83,6 +83,7 @@ public sealed class SettingsStorage
         settings.KnownAdapters ??= new List<KnownAdapter>();
         settings.Connections ??= new List<VpnConnection>();
         settings.Connections.RemoveAll(c => c is null);
+        settings.Logs = (settings.Logs ?? new SafeLauncher.Logging.LogSettings()).Normalized();
 
         if (settings.Apps.Count > 0)
             settings.WelcomeDone = true;

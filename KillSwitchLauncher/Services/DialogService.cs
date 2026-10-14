@@ -27,7 +27,16 @@ public interface IDialogService
     bool? AskHide(out bool remember);
 
     /// <summary>Окно журнала событий.</summary>
-    void ShowActivityLog(ActivityLog log);
+    void ShowActivityLog(ActivityLog log, ILogActions logs);
+
+    /// <summary>Предупреждение об ошибке подключения с кнопкой «Выгрузить журналы»: true — нажата она.</summary>
+    bool ShowWarningWithLogs(string message, string title);
+
+    /// <summary>Окно «Выгрузить журналы для анализа». <paramref name="preset"/> — период, выбранный заранее (null — по правилам).</summary>
+    void ShowExport(ILogActions logs, string? preset);
+
+    /// <summary>Окно технического журнала. Не модальное; если уже открыто — выводится на передний план.</summary>
+    void ShowTechLog(ILogActions logs);
 
     /// <summary>Окно журнала DNS приложения. Не модальное; если уже открыто — выводится на передний план.</summary>
     void ShowDnsJournal(AppTileViewModel tile, DnsJournal journal);
@@ -102,7 +111,18 @@ public sealed class DialogService : IDialogService
         return result;
     }
 
-    public void ShowActivityLog(ActivityLog log) => WithDimmedOwner(owner => ActivityLogWindow.Show(owner, log));
+    public void ShowActivityLog(ActivityLog log, ILogActions logs) => WithDimmedOwner(owner => ActivityLogWindow.Show(owner, log, logs));
+
+    public bool ShowWarningWithLogs(string message, string title)
+    {
+        var result = false;
+        WithDimmedOwner(owner => result = AlertWindow.ShowWithLogs(owner, AlertKind.Warning, title, message));
+        return result;
+    }
+
+    public void ShowExport(ILogActions logs, string? preset) => WithDimmedOwner(owner => ExportWindow.Show(owner, logs, preset));
+
+    public void ShowTechLog(ILogActions logs) => TechLogWindow.ShowFor(Application.Current?.MainWindow, logs);
 
     public void ShowDnsJournal(AppTileViewModel tile, DnsJournal journal) =>
         DnsJournalWindow.ShowFor(Application.Current?.MainWindow, tile, journal);

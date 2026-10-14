@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using SafeLauncher.Logging;
 
 namespace KillSwitchLauncher.Services;
 
@@ -92,6 +93,9 @@ public sealed class LauncherNetwork : IDisposable
     private ICoreBackend? _backend;
     private CorePlan _desired = CorePlan.Empty;
     private CorePlan? _applied;
+
+    /// <summary>Ядро потеряно (упало, пропала служба): следующий запуск — «после потери ядра».</summary>
+    private string? _lostReason;
     private int _healthRunning;
     private bool _disposed;
 
@@ -185,22 +189,29 @@ public sealed class LauncherNetwork : IDisposable
         lock (_state)
             desired = _desired;
         if (desired.Problems.TryGetValue(appId, out var problem))
+        {
+            TechLog.Warn(LogAreas.Network, LogCodes.AppReject, "Приложение не может идти через подключение: " + problem);
             return problem;
+        }
         if (!desired.Apps.TryGetValue(appId, out var app))
             return null; // приложение не через ядро
 
         _idleTimer.Change(Timeout.Infinite, Timeout.Infinite);
         try
         {
-            await EnsureCoreAsync(desired, cancellation).ConfigureAwait(false);
+            await EnsureCoreAsync(desired, $"запуск «{app.Name}»", cancellation).ConfigureAwait(false);
         }
         catch (CoreServiceException ex)
         {
+            TechLog.Error(LogAreas.Network, LogCodes.CoreFail, $"Ядро не запустилось для «{app.Name}»: {ex.Message}" + CoreLines(ex.Log));
             return "Не удалось включить подключение: " + ex.Message;
         }
 
         if (!app.RequireVpn)
+        {
+            TechLog.Info(LogAreas.Network, LogCodes.ProbeOk, $"«{app.Name}» без «Не запускать без VPN»: сервер «{app.ConnectionName}» перед запуском не проверяется");
             return null;
+        }
 
         var tag = desired.ConnectionTags[app.ConnectionId];
         var backend = Backend();
@@ -211,6 +222,9 @@ public sealed class LauncherNetwork : IDisposable
         {
             attempts++;
             probe = await backend.ProbeAsync(tag, ProbeTimeout, cancellation).ConfigureAwait(false);
+            if (probe.Delay is null)
+                TechLog.Info(LogAreas.Network, LogCodes.ProbeFail,
+                    $"Проверка «{app.ConnectionName}» перед запуском «{app.Name}», попытка {attempts}: {probe.Failure ?? "нет ответа"} ({watch.ElapsedMilliseconds} мс с начала)");
             if (probe.Delay is not null || attempts >= LaunchProbeAttempts || watch.Elapsed + ProbeRetryPause >= LaunchProbeBudget)
                 break;
             await Task.Delay(ProbeRetryPause, cancellation).ConfigureAwait(false);
@@ -221,9 +235,11 @@ public sealed class LauncherNetwork : IDisposable
             await ReportProbeFailureAsync(backend, app, tag, probe, attempts).ConfigureAwait(false);
             ScheduleIdleCheck();
             return $"Сервер подключения «{app.ConnectionName}» не отвечает. Проверьте подключение в настройках или выберите другое. " +
-                   "Подробности — в журнале событий.";
+                   "Подробности сохранены в журналах.";
         }
 
+        TechLog.Info(LogAreas.Network, LogCodes.ProbeOk,
+            $"Сервер «{app.ConnectionName}» ответил за {probe.Delay} мс (попыток {attempts}), можно запускать «{app.Name}»");
         MarkUp(desired, app.ConnectionId);
         return null;
     }
@@ -240,10 +256,18 @@ public sealed class LauncherNetwork : IDisposable
             log = Array.Empty<string>(); // журнал — только подсказка, без него тоже сообщаем
         }
 
+        var important = ImportantLines(log, tag);
+        TechLog.Warn(LogAreas.Network, LogCodes.ProbeFail,
+            $"Сервер «{app.ConnectionName}» не ответил перед запуском «{app.Name}» (попыток {attempts}): {probe.Failure ?? "причина неизвестна"}" +
+            CoreLines(important));
         ProbeFailed?.Invoke(new ProbeFailure(app.ConnectionId,
             $"Проверка сервера «{app.ConnectionName}» через ядро не прошла (попыток: {attempts}): {probe.Failure ?? "причина неизвестна"}",
-            ImportantLines(log, tag)));
+            important));
     }
+
+    /// <summary>Строки ядра для технического журнала (в одну запись).</summary>
+    private static string CoreLines(IReadOnlyList<string> lines) =>
+        lines.Count == 0 ? string.Empty : ". Строки ядра: " + string.Join(" | ", lines);
 
     /// <summary>
     /// Ошибки и предупреждения из журнала ядра; если их нет — последние строки. Сначала — строки о проверяемом
@@ -268,13 +292,35 @@ public sealed class LauncherNetwork : IDisposable
     /// <summary>Процессы приложений изменились: если через ядро больше ничего не работает, ядро скоро выключится.</summary>
     public void OnProcessesChanged() => ScheduleIdleCheck();
 
+    /// <summary>Состояние для state.json выгрузки: работает ли ядро, совпадают ли примененные и желаемые настройки, упавшие подключения.</summary>
+    public System.Text.Json.Nodes.JsonObject DescribeState()
+    {
+        lock (_state)
+        {
+            string? Hash(CorePlan? plan) => plan is null ? null
+                : Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(plan.Fingerprint)), 0, 6).ToLowerInvariant();
+            string Tag(Guid id) => (_applied ?? _desired).ConnectionTags.TryGetValue(id, out var tag) ? tag : CorePlan.ConnectionTag(id);
+            return new System.Text.Json.Nodes.JsonObject
+            {
+                ["coreRunning"] = _applied is not null,
+                ["appliedHash"] = Hash(_applied),
+                ["desiredHash"] = Hash(_desired),
+                ["upToDate"] = _applied is not null && _applied.Fingerprint == _desired.Fingerprint,
+                ["lostReason"] = _lostReason,
+                ["down"] = new System.Text.Json.Nodes.JsonArray(_down.Select(id => (System.Text.Json.Nodes.JsonNode)Tag(id)).ToArray()),
+                ["misses"] = new System.Text.Json.Nodes.JsonObject(_misses.Select(p =>
+                    new KeyValuePair<string, System.Text.Json.Nodes.JsonNode?>(Tag(p.Key), p.Value)))
+            };
+        }
+    }
+
     /// <summary>Выключить ядро сейчас (лаунчер закрывается: приложения уже закрыты).</summary>
     public async Task StopAsync(CancellationToken cancellation = default)
     {
         await _gate.WaitAsync(cancellation).ConfigureAwait(false);
         try
         {
-            await StopLockedAsync(cancellation).ConfigureAwait(false);
+            await StopLockedAsync("лаунчер закрывается", cancellation).ConfigureAwait(false);
         }
         finally
         {
@@ -297,29 +343,46 @@ public sealed class LauncherNetwork : IDisposable
         }
     }
 
-    private async Task EnsureCoreAsync(CorePlan desired, CancellationToken cancellation)
+    private async Task EnsureCoreAsync(CorePlan desired, string trigger, CancellationToken cancellation)
     {
         await _gate.WaitAsync(cancellation).ConfigureAwait(false);
         try
         {
             CorePlan? applied;
+            string? lostReason;
             lock (_state)
+            {
                 applied = _applied;
+                lostReason = _lostReason;
+            }
             if (applied?.Fingerprint == desired.Fingerprint)
+            {
+                TechLog.Debug(LogAreas.Network, LogCodes.CoreStart, $"Ядро уже работает с нужными настройками ({trigger}), перезапуск не нужен");
                 return;
+            }
 
             // Перезапуск: пока адаптера нет, новые соединения работающих приложений ушли бы напрямую.
             var running = applied is null
                 ? Array.Empty<Guid>()
                 : _processes.RunningApps().Where(applied.Apps.ContainsKey).ToArray();
+            var reason = CorePlanDiff.Describe(applied, desired);
+            if (applied is null && lostReason is not null)
+                reason = "после потери ядра (" + lostReason + ")";
+            TechLog.Info(LogAreas.Network, applied is null ? LogCodes.CoreStart : LogCodes.CoreRestart,
+                $"Ядро: {(applied is null ? "запуск" : "перезапуск")} ({trigger}). Причина: {reason}. " +
+                $"Подключений {desired.Request.Outbounds.Count}, приложений в плане {desired.Apps.Count}, IPv6 {(desired.Request.Ipv6 ? "да" : "нет")}" +
+                (running.Length > 0 ? $". Приостановлены на время перезапуска: {string.Join(", ", running.Select(id => applied!.Apps[id].Name))}" : string.Empty));
+            var watch = Stopwatch.StartNew();
             using (running.Length > 0 ? _processes.Freeze(running) : null)
             {
                 try
                 {
                     await Backend().StartAsync(desired.Request, cancellation).ConfigureAwait(false);
                 }
-                catch
+                catch (Exception ex)
                 {
+                    TechLog.Error(LogAreas.Network, LogCodes.CoreFail, $"Ядро не запустилось за {watch.ElapsedMilliseconds} мс: {ex.Message}" +
+                        (ex is CoreServiceException cse ? CoreLines(ImportantLines(cse.Log)) : string.Empty));
                     lock (_state)
                         _applied = null;
                     if (running.Length > 0)
@@ -336,10 +399,14 @@ public sealed class LauncherNetwork : IDisposable
                 lock (_state)
                 {
                     _applied = desired;
+                    _lostReason = null;
                     _down.Clear();
                     _misses.Clear();
                 }
             }
+
+            TechLog.Info(LogAreas.Network, LogCodes.CoreReady,
+                $"Ядро работает с новыми настройками, {watch.ElapsedMilliseconds} мс" + (running.Length > 0 ? " (приложения продолжили работу)" : string.Empty));
 
             _healthTimer.Change(_healthInterval, _healthInterval);
             StateChanged?.Invoke();
@@ -350,13 +417,14 @@ public sealed class LauncherNetwork : IDisposable
         }
     }
 
-    private async Task StopLockedAsync(CancellationToken cancellation)
+    private async Task StopLockedAsync(string reason, CancellationToken cancellation)
     {
         ICoreBackend? backend;
         lock (_state)
         {
             if (_applied is null)
                 return;
+            TechLog.Info(LogAreas.Network, reason == IdleReason ? LogCodes.CoreIdle : LogCodes.CoreStop, "Ядро останавливается: " + reason);
             _applied = null;
             _down.Clear();
             _misses.Clear();
@@ -405,7 +473,7 @@ public sealed class LauncherNetwork : IDisposable
                     applied = _applied;
                 if (applied is null || _processes.RunningApps().Any(applied.Apps.ContainsKey))
                     return;
-                await StopLockedAsync(CancellationToken.None).ConfigureAwait(false);
+                await StopLockedAsync(IdleReason, CancellationToken.None).ConfigureAwait(false);
             }
             finally
             {
@@ -418,6 +486,8 @@ public sealed class LauncherNetwork : IDisposable
         }
     }
 
+    private const string IdleReason = "через ядро больше ничего не работает";
+
     private void OnLost(string reason, IReadOnlyList<string> log)
     {
         CorePlan? applied;
@@ -425,6 +495,7 @@ public sealed class LauncherNetwork : IDisposable
         {
             applied = _applied;
             _applied = null;
+            _lostReason = reason;
             _down.Clear();
             _misses.Clear();
             if (_backend is { } backend)
@@ -441,6 +512,8 @@ public sealed class LauncherNetwork : IDisposable
 
         // Без ядра трафик приложений пошёл бы напрямую: закрываем сразу, что бы ни стояло в «Закрывать при обрыве».
         var report = _processes.KillApps(applied.Apps.Keys.ToList(), blockRelaunch: true);
+        TechLog.Error(LogAreas.Network, LogCodes.CoreLost, $"Ядро потеряно: {reason}. Закрыты: {Names(report.Killed)}" +
+            (report.Failed.Count > 0 ? $", не удалось закрыть: {Names(report.Failed)}" : string.Empty) + CoreLines(log.TakeLast(12).ToList()));
         CoreLost?.Invoke(reason, report);
         StateChanged?.Invoke();
     }
@@ -466,25 +539,44 @@ public sealed class LauncherNetwork : IDisposable
             var running = _processes.RunningApps().Where(applied.Apps.ContainsKey).Select(id => applied.Apps[id]).ToList();
             foreach (var connectionId in running.Select(a => a.ConnectionId).Distinct().ToList())
             {
-                var delay = (await backend.ProbeAsync(applied.ConnectionTags[connectionId], ProbeTimeout, CancellationToken.None)
-                    .ConfigureAwait(false)).Delay;
-                if (delay is not null)
+                var tag = applied.ConnectionTags[connectionId];
+                var name = running.First(a => a.ConnectionId == connectionId).ConnectionName;
+                var probe = await backend.ProbeAsync(tag, ProbeTimeout, CancellationToken.None).ConfigureAwait(false);
+                if (probe.Delay is { } delay)
                 {
+                    TechLog.Debug(LogAreas.Network, LogCodes.ProbeOk, $"Проверка «{name}»: {delay} мс");
                     MarkUp(applied, connectionId);
                     continue;
                 }
 
                 bool justDown;
+                int misses;
                 lock (_state)
                 {
                     if (!ReferenceEquals(_applied, applied))
                         return; // ядро перезапустили, пока шла проверка
-                    var misses = _misses[connectionId] = _misses.GetValueOrDefault(connectionId) + 1;
+                    misses = _misses[connectionId] = _misses.GetValueOrDefault(connectionId) + 1;
                     justDown = misses >= MissesToDown && _down.Add(connectionId);
                 }
 
+                TechLog.Warn(LogAreas.Network, LogCodes.ProbeFail,
+                    $"Сервер «{name}» не ответил на проверку (промах {misses} из {MissesToDown}): {probe.Failure ?? "нет ответа"}");
                 if (justDown)
+                {
+                    IReadOnlyList<string> log;
+                    try
+                    {
+                        log = await backend.LogTailAsync(CancellationToken.None).ConfigureAwait(false);
+                    }
+                    catch (Exception)
+                    {
+                        log = Array.Empty<string>();
+                    }
+
+                    TechLog.Warn(LogAreas.Network, LogCodes.ConnDown,
+                        $"Сервер «{name}» не отвечает: {probe.Failure ?? "нет ответа"}" + CoreLines(ImportantLines(log, tag)));
                     OnConnectionDown(applied, connectionId);
+                }
             }
         }
         catch (Exception)
@@ -504,6 +596,9 @@ public sealed class LauncherNetwork : IDisposable
         var close = apps.Where(a => a.CloseOnDrop).Select(a => a.AppId).ToList();
         var report = close.Count > 0 ? _processes.KillApps(close, blockRelaunch: true) : new KillReport(Array.Empty<string>(), Array.Empty<string>());
         var waiting = apps.Where(a => !a.CloseOnDrop && running.Contains(a.AppId)).Select(a => a.Name).ToList();
+        TechLog.Info(LogAreas.KillSwitch, LogCodes.KsClose, $"Обрыв «{apps[0].ConnectionName}»: закрыты {Names(report.Killed)}" +
+            (report.Failed.Count > 0 ? $", не удалось закрыть {Names(report.Failed)}" : string.Empty) +
+            (waiting.Count > 0 ? $", ждут без сети {Names(waiting)}" : string.Empty));
         ConnectionDown?.Invoke(new ConnectionDownInfo(connectionId, apps[0].ConnectionName, report, waiting));
         StateChanged?.Invoke();
         ScheduleIdleCheck();
@@ -520,11 +615,14 @@ public sealed class LauncherNetwork : IDisposable
 
         if (!wasDown)
             return;
+        TechLog.Info(LogAreas.Network, LogCodes.ConnUp, $"Сервер «{plan.Apps.Values.First(a => a.ConnectionId == connectionId).ConnectionName}» снова отвечает");
         foreach (var app in plan.Apps.Values.Where(a => a.ConnectionId == connectionId))
             _processes.StopBlocking(app.AppId);
         ConnectionUp?.Invoke(connectionId, plan.Apps.Values.First(a => a.ConnectionId == connectionId).ConnectionName);
         StateChanged?.Invoke();
     }
+
+    private static string Names(IReadOnlyCollection<string> names) => names.Count == 0 ? "никто" : string.Join(", ", names);
 
     public void Dispose()
     {

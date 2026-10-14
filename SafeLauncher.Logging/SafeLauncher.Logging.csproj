@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Технический журнал: формат строки, хранение по дням, скрытие адресов и секретов, разбор строк ядра.
+       Общая библиотека лаунчера и службы (см. notes/logging в папке проекта). Без Windows-зависимостей, чтобы тесты шли везде. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>SafeLauncher.Logging</AssemblyName>
+    <RootNamespace>SafeLauncher.Logging</RootNamespace>
+    <Product>Безопасный лаунчер</Product>
+    <Version>2.1.0</Version>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="KillSwitchLauncher.Tests" />
+  </ItemGroup>
+
+</Project>

@@ -1,5 +1,7 @@
 using System;
+using System.Threading.Tasks;
 using System.Windows;
+using System.Windows.Threading;
 using KillSwitchLauncher.Services;
 
 namespace KillSwitchLauncher;
@@ -30,6 +32,14 @@ public partial class App : Application
             return;
         }
 
+        // Технический журнал — до окон: в нем видно и падение при запуске. Настройки журналов читаются отдельно от остальных.
+        TechLog.Initialize(TechLog.ReadSettings(new SettingsStorage().FilePath));
+        AppDomain.CurrentDomain.UnhandledException += (_, args) =>
+            TechLog.Crash(args.ExceptionObject as Exception, "AppDomain.UnhandledException", args.IsTerminating);
+        // Исключение в UI-потоке: записываем и даем процессу упасть, как раньше (Handled не ставим, §3.10).
+        DispatcherUnhandledException += OnDispatcherUnhandledException;
+        TaskScheduler.UnobservedTaskException += (_, args) => TechLog.Crash(args.Exception, "TaskScheduler.UnobservedTaskException", terminating: false);
+
         // При выходе из Windows лаунчер закрывается последним из программ: приложения под его защитой успевают
         // закрыться сами, пока подключение ещё работает.
         NativeMethods.SetProcessShutdownParameters(0x100, 0);
@@ -49,12 +59,18 @@ public partial class App : Application
     {
         // Выход из Windows или установщик закрывает программы: закрываемся, а не уходим в трей.
         (MainWindow as MainWindow)?.PrepareForExit();
+        TechLog.Info(SafeLauncher.Logging.LogAreas.Session, SafeLauncher.Logging.LogCodes.SessionEnd, $"Windows завершает сеанс ({e.ReasonSessionEnding})");
+        TechLog.Store?.Flush();
         base.OnSessionEnding(e);
     }
 
     protected override void OnExit(ExitEventArgs e)
     {
+        TechLog.EndSession();
         _instance?.Dispose();
         base.OnExit(e);
     }
+
+    private void OnDispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e) =>
+        TechLog.Crash(e.Exception, "Application.DispatcherUnhandledException", terminating: true);
 }

@@ -1,11 +1,13 @@
 using System;
 using System.Collections.Concurrent;
 using System.IO;
+using System.Linq;
 using System.IO.Pipes;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using Microsoft.Win32.SafeHandles;
+using SafeLauncher.Logging;
 
 namespace KillSwitchLauncher.Services;
 
@@ -27,12 +29,38 @@ public sealed class OwnerPipeServer : IDisposable
     private int _queries;
     private int _rejected;
 
+    // счетчики за минуту для технического журнала
+    private readonly ConcurrentDictionary<string, int> _minuteTags = new();
+    private readonly Timer _statsTimer;
+    private int _minuteForeign;
+    private int _minuteErrors;
+    private int _minuteRejected;
+
     /// <param name="resolve">PID → метка приложения или null, если процесс не из лаунчера. Вызывается из фоновых потоков.</param>
     public OwnerPipeServer(Func<uint, string?> resolve)
     {
         _resolve = resolve;
         Name = NamePrefix + Guid.NewGuid().ToString("N");
+        _statsTimer = new Timer(_ => ReportMinute(), null, TimeSpan.FromMinutes(1), TimeSpan.FromMinutes(1));
         new Thread(AcceptLoop) { IsBackground = true, Name = "Owner pipe" }.Start();
+    }
+
+    /// <summary>Раз в минуту, если ядро спрашивало: сколько ответов «наш» (по меткам приложений), «не наш», ошибок.</summary>
+    private void ReportMinute()
+    {
+        var foreign = Interlocked.Exchange(ref _minuteForeign, 0);
+        var errors = Interlocked.Exchange(ref _minuteErrors, 0);
+        var rejected = Interlocked.Exchange(ref _minuteRejected, 0);
+        var tags = _minuteTags.ToArray();
+        foreach (var (tag, _) in tags)
+            _minuteTags.TryRemove(tag, out _);
+        var ours = tags.Sum(t => t.Value);
+        if (ours + foreign + errors + rejected == 0)
+            return;
+        TechLog.Write(errors + rejected > 0 ? LogLevel.Warn : LogLevel.Info, LogAreas.Owner, LogCodes.OwnerStats,
+            $"Ядро спрашивало «чей процесс» за минуту: наших {ours}" +
+            (tags.Length > 0 ? " (" + string.Join(", ", tags.Select(t => t.Key + " " + t.Value)) + ")" : string.Empty) +
+            $", не наших {foreign}, ошибок {errors}" + (rejected > 0 ? $", отклонено подключений не от ядра {rejected}" : string.Empty));
     }
 
     /// <summary>Имя канала для службы (без \\.\pipe\).</summary>
@@ -82,6 +110,7 @@ public sealed class OwnerPipeServer : IDisposable
             if (!IsCore(pipe))
             {
                 Interlocked.Increment(ref _rejected);
+                Interlocked.Increment(ref _minuteRejected);
                 return;
             }
 
@@ -99,13 +128,22 @@ public sealed class OwnerPipeServer : IDisposable
                     {
                         tag = _resolve(pid);
                     }
-                    catch (Exception)
+                    catch (Exception ex)
                     {
                         // Не знаем — не отвечаем «не наш»: иначе соединение приложения ушло бы напрямую. Без ответа ядро
                         // оставит процесс с приложением, о котором лаунчер уже говорил (ядро помнит ответы).
+                        Interlocked.Increment(ref _minuteErrors);
+                        TechLog.Warn(LogAreas.Owner, LogCodes.OwnerError, $"Не удалось ответить ядру про PID {pid}: {ex.Message}");
                         return;
                     }
 
+                    if (tag is null)
+                        Interlocked.Increment(ref _minuteForeign);
+                    else
+                        _minuteTags.AddOrUpdate(tag, 1, (_, n) => n + 1);
+                    if (!Answers.ContainsKey(pid))
+                        TechLog.Debug(LogAreas.Owner, tag is null ? LogCodes.OwnerUnknown : LogCodes.OwnerStats,
+                            $"PID {pid}: {(tag is null ? "не наш (напрямую)" : tag)}");
                     Answers[pid] = tag ?? string.Empty;
                     var bytes = tag is null ? Array.Empty<byte>() : Encoding.UTF8.GetBytes(tag);
                     var answer = new byte[2 + bytes.Length];
@@ -130,7 +168,12 @@ public sealed class OwnerPipeServer : IDisposable
         return corePid == 0 || GetNamedPipeClientProcessId(pipe.SafePipeHandle, out var clientPid) && clientPid == corePid;
     }
 
-    public void Dispose() => _stop.Cancel();
+    public void Dispose()
+    {
+        _stop.Cancel();
+        _statsTimer.Dispose();
+        ReportMinute();
+    }
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern bool GetNamedPipeClientProcessId(SafePipeHandle pipe, out int clientProcessId);

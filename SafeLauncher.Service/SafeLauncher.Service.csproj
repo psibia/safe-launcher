@@ -23,4 +23,8 @@
     <InternalsVisibleTo Include="KillSwitchLauncher.Tests" />
   </ItemGroup>
 
+  <ItemGroup>
+    <ProjectReference Include="..\SafeLauncher.Logging\SafeLauncher.Logging.csproj" />
+  </ItemGroup>
+
 </Project>

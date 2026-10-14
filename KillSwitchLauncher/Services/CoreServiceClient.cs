@@ -86,6 +86,64 @@ public sealed class CoreAppRoute
     public List<string> DirectDomains { get; set; } = new();
 }
 
+/// <summary>Запрос к журналам службы (SafeLauncher.Service/Protocol.cs, LogRequest).</summary>
+public sealed class ServiceLogRequest
+{
+    public string? Storage { get; set; }
+
+    public int? RetentionDays { get; set; }
+
+    public bool? HideAddresses { get; set; }
+
+    public DateTime? DetailedUntilUtc { get; set; }
+
+    public DateTime? FromUtc { get; set; }
+
+    public DateTime? ToUtc { get; set; }
+
+    public List<string>? Sources { get; set; }
+
+    public string? Cursor { get; set; }
+
+    public int? MaxBytes { get; set; }
+
+    public string? Text { get; set; }
+}
+
+/// <summary>Ответ журналов службы (SafeLauncher.Service/Protocol.cs, LogReply).</summary>
+public sealed class ServiceLogReply
+{
+    public string? MaskKey { get; set; }
+
+    public long? ServiceBytes { get; set; }
+
+    public long? CoreBytes { get; set; }
+
+    public long? Dropped { get; set; }
+
+    public bool? Detailed { get; set; }
+
+    public string? Storage { get; set; }
+
+    public List<string>? Lines { get; set; }
+
+    public string? Cursor { get; set; }
+
+    public List<ServiceLogFile>? Files { get; set; }
+
+    public long? Freed { get; set; }
+}
+
+/// <summary>Файл рядом с журналами службы: очищенный конфиг ядра или описание падения службы.</summary>
+public sealed class ServiceLogFile
+{
+    public string Name { get; set; } = string.Empty;
+
+    public DateTime Utc { get; set; }
+
+    public string Content { get; set; } = string.Empty;
+}
+
 /// <summary>Ядро запущено: его PID и управление на 127.0.0.1 (порт и ключ, свои на каждый запуск).</summary>
 public sealed record CoreStarted(int Pid, int? ApiPort, string? ApiSecret);
 
@@ -237,6 +295,16 @@ public sealed class CoreServiceClient : IDisposable
         return new GuardReply(reply.Warning, reply.Unguarded ?? new List<string>());
     }
 
+    /// <summary>
+    /// Команда журналов службы (logConfig, logRead, logMark, logClear, logFiles; служба Revision 5).
+    /// Старая служба отвечает «неизвестная команда» — <see cref="CoreServiceException"/>.
+    /// </summary>
+    public async Task<ServiceLogReply> LogsAsync(string op, ServiceLogRequest? request, CancellationToken cancellation = default, string? cid = null)
+    {
+        var reply = await SendAsync(new Message { Op = op, Logs = request, Cid = cid }, CommandTimeout, cancellation).ConfigureAwait(false);
+        return reply.Logs ?? new ServiceLogReply();
+    }
+
     public async Task<CoreStatus> StatusAsync(CancellationToken cancellation = default)
     {
         var reply = await SendAsync(new Message { Op = "status" }, CommandTimeout, cancellation).ConfigureAwait(false);
@@ -249,6 +317,7 @@ public sealed class CoreServiceClient : IDisposable
             throw new CoreServiceException("Нет связи со службой «Безопасный лаунчер — сеть».");
 
         message.Id = Interlocked.Increment(ref _nextId);
+        message.Cid ??= TechLog.CurrentCid;
         var waiter = new TaskCompletionSource<Reply>(TaskCreationOptions.RunContinuationsAsynchronously);
         _pending[message.Id] = waiter;
         try
@@ -389,6 +458,11 @@ public sealed class CoreServiceClient : IDisposable
         public CoreStartRequest? Request { get; set; }
 
         public GuardRequest? Guard { get; set; }
+
+        /// <summary>Id операции лаунчера: служба пишет его в свои строки журнала по этой команде.</summary>
+        public string? Cid { get; set; }
+
+        public ServiceLogRequest? Logs { get; set; }
     }
 
     internal sealed class Reply
@@ -422,6 +496,8 @@ public sealed class CoreServiceClient : IDisposable
         public string? Warning { get; set; }
 
         public List<string>? Unguarded { get; set; }
+
+        public ServiceLogReply? Logs { get; set; }
     }
 
     // ---- Windows

@@ -12,10 +12,11 @@ using System.Threading.Tasks;
 using System.Windows.Threading;
 using KillSwitchLauncher.Models;
 using KillSwitchLauncher.Services;
+using SafeLauncher.Logging;
 
 namespace KillSwitchLauncher.ViewModels;
 
-public sealed class MainViewModel : ObservableObject, IConnectionActions, IDisposable
+public sealed partial class MainViewModel : ObservableObject, IConnectionActions, ILogActions, IDisposable
 {
     private const int ErrorCancelled = 1223; // пользователь отменил запрос UAC
 
@@ -33,6 +34,9 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
 
     // Обновления: результат последней проверки и состояние кнопок в настройках.
     private UpdateCheckResult? _updateCheck;
+    private Dictionary<string, string> _settingsSnapshot = new();
+    private bool? _lastIpv6;
+    private DispatcherTimer? _logTimer;
     private bool _isUpdateBusy;
     private string _updateStatusText = "Ещё не проверялось";
     private bool _closingForUpdate;
@@ -140,6 +144,7 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
         _dialogs = dialogs;
         _dispatcher = dispatcher;
         _settings = storage.Load();
+        ApplyLogSettings();
         _network = new LauncherNetwork(_tracker, coreBackend ?? (() => new ServiceCoreBackend(ResolveCoreTag)));
         _guard = new VpnGuard(guardBackend ?? (() => new ServiceGuardBackend()));
         _proxy = new SystemProxyWatcher(systemProxy);
@@ -170,7 +175,8 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
         ToggleSummaryCommand = new RelayCommand(() => IsSummaryOpen = !IsSummaryOpen);
         UpdateActionCommand = new RelayCommand(OnUpdateAction);
         ShowChangelogCommand = new RelayCommand(ShowChangelog);
-        ShowLogCommand = new RelayCommand(() => _dialogs.ShowActivityLog(_log));
+        ShowLogCommand = new RelayCommand(() => _dialogs.ShowActivityLog(_log, this));
+        CreateLogCommands();
         ShowHideDnsInfoCommand = new RelayCommand(() => _dialogs.ShowInfo(HideDnsExplanation, "Скрытие DNS-запросов"));
 
         foreach (var entry in _settings.Apps)
@@ -232,6 +238,9 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
         _log.Add(LogKind.Info, $"Лаунчер {UpdateService.Format(UpdateService.CurrentVersion)} запущен · " +
                                     (_monitor.Current.IsConnected ? $"VPN подключён ({DescribeActive(_monitor.Current)})" : "VPN не подключён") +
                                     (_settings.KillSwitchEnabled ? string.Empty : " · Kill-Switch выключен"));
+        if (TechLog.Previous is { } previous)
+            _log.Add(LogKind.Failed, $"Прошлый сеанс лаунчера завершился аварийно ({(previous.CrashUtc ?? previous.StartUtc).ToLocalTime():HH:mm}): " +
+                                     (previous.CrashType ?? "лаунчер закрыли принудительно или выключилось питание"));
 
         // Когда окно уже показано: сообщить итог прошлого обновления и проверить, нет ли нового.
         _dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, new Action(OnStartupIdle));
@@ -397,6 +406,8 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
             if (!SetField(ref _section, value)) return;
             if (value == SettingsSection.Connections)
                 AddConnection.OfferClipboard();
+            if (value == SettingsSection.Log)
+                _ = RefreshLogUsageAsync();
         }
     }
 
@@ -500,7 +511,8 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
         _draftBlockBypass != _settings.BlockBypass ||
         _draftHideDns != _settings.HideDns ||
         _draftStartWithWindows != _settings.StartWithWindows ||
-        !new HashSet<string>(_draftSelected, StringComparer.OrdinalIgnoreCase).SetEquals(_settings.SelectedAdapters);
+        !new HashSet<string>(_draftSelected, StringComparer.OrdinalIgnoreCase).SetEquals(_settings.SelectedAdapters) ||
+        HasLogDraftChanges;
 
     /// <summary>«Не запускать без VPN» для приложений «как в общих» (черновик).</summary>
     public bool RequireVpn
@@ -734,11 +746,17 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
             RememberAdapters(_monitor.Current);
             SyncAdapters(_monitor.Current);
             OnPropertyChanged(nameof(ShowOtherGroup));
+            OnPropertyChanged(nameof(AllAdaptersToggleText));
         }
     }
 
     /// <summary>Группа «Другие адаптеры» видна только при «Показывать все адаптеры».</summary>
     public bool ShowOtherGroup => ShowAllAdapters && OtherAdapters.Count > 0;
+
+    /// <summary>Кнопка под списком: «Развернуть: все адаптеры (ещё 5)» / «Свернуть».</summary>
+    public string AllAdaptersToggleText => ShowAllAdapters
+        ? "Свернуть"
+        : OtherAdapters.Count > 0 ? $"Развернуть: все адаптеры (ещё {OtherAdapters.Count})" : "Развернуть: все адаптеры";
 
     public bool HasRemovedAdapters => RemovedAdapters.Count > 0;
 
@@ -779,6 +797,7 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
         _draftHideBehavior = _settings.HideBehavior;
         _draftSelected.Clear();
         _draftSelected.AddRange(_settings.SelectedAdapters);
+        ResetLogDraft();
 
         OnPropertyChanged(nameof(KillSwitchEnabled));
         OnPropertyChanged(nameof(RequireVpn));
@@ -813,6 +832,9 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
             return false;
         }
 
+        if (!ConfirmLogDraft())
+            return false;
+
         var killSwitchChanged = _draftKillSwitch != _settings.KillSwitchEnabled;
         var ruleChanged = _draftRuleMode != _settings.RuleMode ||
                           !new HashSet<string>(_draftSelected, StringComparer.OrdinalIgnoreCase).SetEquals(_settings.SelectedAdapters);
@@ -842,6 +864,7 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
         _settings.RuleMode = _draftRuleMode;
         _settings.HideBehavior = _draftHideBehavior;
         _settings.SelectedAdapters = new List<string>(_draftSelected);
+        ApplyLogDraft();
         ApplyNetworkSettings();
         if (!_settings.KillSwitchEnabled)
             _tracker.StopBlocking();
@@ -999,7 +1022,7 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
             ? "Закрыты: " + string.Join(", ", report.Killed)
             : "Запущенных приложений не было";
         StatusMessage = $"{DateTime.Now:HH:mm:ss} — {reason} {subtitle}";
-        Toast("Подключение лаунчера выключилось", subtitle, GlyphUnlock, ToastKind.Danger);
+        Toast("Подключение лаунчера выключилось", subtitle, GlyphUnlock, ToastKind.Danger, "Выгрузить журналы", () => ShowExport(ExportPeriods.Last15));
         _log.Add(LogKind.VpnDown, reason);
         if (report.Killed.Count > 0)
             _log.Add(LogKind.Closed, $"Закрыты без подключения: {string.Join(", ", report.Killed)}");
@@ -1013,9 +1036,8 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
     /// </summary>
     private async Task OnProbeFailedAsync(ProbeFailure failure)
     {
+        // Строки ядра пишет технический журнал (LauncherNetwork), в Журнале событий только понятный итог.
         _log.Add(LogKind.Failed, failure.Summary);
-        foreach (var line in failure.CoreLog)
-            _log.Add(LogKind.Info, "Ядро: " + line);
 
         if (_settings.Connections.FirstOrDefault(c => c.Id == failure.ConnectionId) is not { } connection)
             return;
@@ -1036,7 +1058,7 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
         var subtitle = parts.Count > 0 ? string.Join(" · ", parts) : "Запущенных приложений не было";
 
         StatusMessage = $"{DateTime.Now:HH:mm:ss} — сервер «{info.ConnectionName}» не отвечает. {subtitle}";
-        Toast($"Сервер «{info.ConnectionName}» не отвечает", subtitle, GlyphUnlock, ToastKind.Danger);
+        Toast($"Сервер «{info.ConnectionName}» не отвечает", subtitle, GlyphUnlock, ToastKind.Danger, "Выгрузить журналы", () => ShowExport(ExportPeriods.Last15));
         _log.Add(LogKind.VpnDown, $"Сервер подключения «{info.ConnectionName}» не отвечает · {subtitle}");
         ShowFailedKills(info.Closed);
         RefreshRunningCounts();
@@ -1075,7 +1097,13 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
         }
 
         _adapterApps = adapterApps;
-        _network.Update(CorePlan.Build(_settings, CorePlan.DetectIpv6()));
+        var ipv6 = CorePlan.DetectIpv6();
+        if (ipv6 != _lastIpv6)
+        {
+            _lastIpv6 = ipv6;
+            TechLog.Info(LogAreas.Network, LogCodes.Ipv6Detect, ipv6 ? "IPv6 в Windows есть: ядро получит адрес IPv6" : "IPv6 в Windows нет");
+        }
+        _network.Update(CorePlan.Build(_settings, ipv6));
         SubmitGuard();
     }
 
@@ -1306,10 +1334,16 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
     {
         try
         {
+            var selectedBefore = connection.SelectedServer;
             var content = await Subscriptions.FetchAsync(connection.SubscriptionUrl ?? string.Empty);
             if (!_settings.Connections.Contains(connection))
                 return; // пока качали, подключение удалили
             var changed = SubscriptionUpdater.Apply(connection, content, DateTimeOffset.Now);
+            // Смена выбранного сервера меняет настройки ядра: ядро перезапустится при следующем запуске приложения.
+            TechLog.Info(LogAreas.Subs, LogCodes.SubsUpdate,
+                $"Подписка «{connection.Name}» [{CorePlan.ConnectionTag(connection.Id)}] загружена{(userInitiated ? " перед запуском" : string.Empty)}: " +
+                $"серверов {content.Links.Count}, пропущено {content.Skipped}, список {(changed ? "изменился" : "тот же")}, " +
+                $"выбранный сервер {(connection.SelectedServer == selectedBefore ? "тот же" : "сменился")}");
             SaveSettings();
             if (changed)
             {
@@ -1320,6 +1354,7 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
         }
         catch (ConnectionParseException ex)
         {
+            TechLog.Warn(LogAreas.Subs, LogCodes.SubsFail, $"Подписка «{connection.Name}» не загрузилась: {ex.Message}");
             _log.Add(LogKind.Failed, $"Не удалось обновить подписку «{connection.Name}»: {ex.Message}");
             if (userInitiated)
                 _dialogs.ShowWarning(ex.Message, $"Подписка «{connection.Name}» не загрузилась");
@@ -1334,8 +1369,8 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
         _log.Add(LogKind.Blocked, $"«{name}» запустилось без VPN и сразу закрыто");
     }
 
-    private void Toast(string title, string subtitle, string glyph, ToastKind kind) =>
-        ToastRequested?.Invoke(this, new ToastInfo(title, subtitle, glyph, kind));
+    private void Toast(string title, string subtitle, string glyph, ToastKind kind, string? actionText = null, Action? action = null) =>
+        ToastRequested?.Invoke(this, new ToastInfo(title, subtitle, glyph, kind, actionText, action));
 
     /// <summary>Понятные названия активных VPN, например «OpenVPN (TAP)».</summary>
     private static string DescribeActive(VpnSnapshot snapshot)
@@ -1430,6 +1465,7 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
         SyncList(RemovedAdapters, removed, isPresent: false);
 
         OnPropertyChanged(nameof(ShowOtherGroup));
+        OnPropertyChanged(nameof(AllAdaptersToggleText));
         OnPropertyChanged(nameof(HasRemovedAdapters));
         OnPropertyChanged(nameof(RemovedToggleText));
     }
@@ -1697,8 +1733,15 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
     private async void Launch(AppTileViewModel tile, bool dnsReady = false)
     {
         var entry = tile.Entry;
-        if (!_launching.Add(entry.Id))
+        if (_launching.Contains(entry.Id))
             return;
+
+        // Все строки этого запуска (лаунчер, служба, ядро) с одним id операции. Второй заход после журнала DNS продолжает тот же.
+        using var operation = dnsReady && TechLog.CurrentCid is not null ? null : TechLog.Begin(out _);
+        var started = Stopwatch.StartNew();
+        if (!dnsReady)
+            TechLog.Info(LogAreas.App, LogCodes.AppLaunch, $"Запуск «{entry.Name}»: {DescribeLaunch(entry)}");
+        _launching.Add(entry.Id);
 
         try
         {
@@ -1726,6 +1769,7 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
 
         if (!entry.IsPackaged && !File.Exists(entry.ExePath) && !TryRelocate(entry))
         {
+            TechLog.Warn(LogAreas.App, LogCodes.AppReject, $"«{entry.Name}» не запущено: файл программы не найден ({entry.ExePath})");
             _dialogs.ShowError($"Файл программы не найден:\n{entry.ExePath}");
             return;
         }
@@ -1802,11 +1846,13 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
         catch (Win32Exception ex) when (ex.NativeErrorCode == ErrorCancelled)
         {
             StatusMessage = $"Запуск «{entry.Name}» отменён";
+            TechLog.Info(LogAreas.App, LogCodes.AppReject, $"Запуск «{entry.Name}» отменен в окне UAC");
             return;
         }
         catch (Exception ex)
         {
             _log.Add(LogKind.Failed, $"Не удалось запустить «{entry.Name}»: {ex.Message}");
+            TechLog.Error(LogAreas.App, LogCodes.AppReject, $"«{entry.Name}» не запущено: {ex.GetType().Name}: {ex.Message}");
             _dialogs.ShowError($"Не удалось запустить «{entry.Name}»:\n{ex.Message}");
             return;
         }
@@ -1817,6 +1863,9 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
                 SubmitGuard();
         }
 
+        TechLog.Info(LogAreas.App, LogCodes.AppStarted,
+            $"«{entry.Name}» запущено за {started.ElapsedMilliseconds} мс: PID {result.ProcessId}, в задании {(result.Contained ? "да" : "нет")}, " +
+            $"права администратора {(result.Elevated ? "да" : "нет")}, взято под контроль уже работавших {result.Adopted}");
         if (result.ProcessId == 0)
         {
             _log.Add(LogKind.Failed, $"«{entry.Name}» запущена, но без контроля: Windows не вернула её процесс");
@@ -1939,7 +1988,8 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
         if (error is not null)
         {
             _log.Add(LogKind.Blocked, $"Запуск «{entry.Name}» отклонён: {error}");
-            _dialogs.ShowWarning(error, "Не удалось подключиться");
+            if (_dialogs.ShowWarningWithLogs(error, "Не удалось подключиться"))
+                ShowExport(ExportPeriods.Last15);
             return false;
         }
 
@@ -2344,9 +2394,7 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
         item.SetResult(result);
         _log.Add(result.Ok ? LogKind.Info : LogKind.Failed,
             $"Проверка подключения «{item.Name}»: {(result.Ok ? item.CheckText : result.Error)}");
-        // Через что ушли соединения проверки: по этим строкам видно, например, что WireGuard не используется.
-        foreach (var line in ConnectionTester.RouteLines(result.Log))
-            _log.Add(LogKind.Info, "Ядро проверки: " + line);
+        // Строки ядра проверки (через что ушли соединения) пишет технический журнал (ConnectionTester).
     }
 
     void IConnectionActions.Rename(ConnectionItemViewModel item, string name)
@@ -2659,6 +2707,7 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
         catch (Exception ex)
         {
             _log.Add(LogKind.Failed, $"Не удалось запустить журнал DNS: {ex.Message}");
+            TechLog.Warn(LogAreas.Dns, LogCodes.DnsJournal, $"Помощник журнала DNS не запустился: {ex.GetType().Name}: {ex.Message}");
             _dialogs.ShowError($"Не удалось запустить журнал DNS:\n{ex.Message}");
             return false;
         }
@@ -2708,6 +2757,7 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
 
         StatusMessage = "Журнал DNS остановлен";
         _log.Add(LogKind.Failed, "Журнал DNS остановлен: помощник записи закрылся. Запись продолжится при следующем запуске приложения");
+        TechLog.Warn(LogAreas.Dns, LogCodes.DnsJournal, "Помощник журнала DNS закрылся");
         Toast("Журнал DNS остановлен", "Запись продолжится при следующем запуске приложения", GlyphGlobe, ToastKind.Danger);
     }
 
@@ -2715,6 +2765,8 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
 
     private async void OnStartupIdle()
     {
+        OnStartupLogs();
+
         // Итог обновления, запущенного в прошлый раз (лаунчер перезапустился после установщика).
         var outcome = _updates.TakePendingOutcome();
         if (outcome is not null)
@@ -2753,6 +2805,9 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
         try
         {
             _updateCheck = await _updates.CheckAsync(CancellationToken.None);
+            TechLog.Info(LogAreas.Update, LogCodes.UpdateCheck,
+                $"Проверка обновлений{(userInitiated ? " (вручную)" : string.Empty)}: установлена {UpdateService.Format(_updateCheck.Current)}, " +
+                $"последняя {(_updateCheck.Latest is { } latest ? UpdateService.Format(latest.Version) : "не найдена")}");
             OnPropertyChanged(nameof(IsUpdateAvailable));
             OnPropertyChanged(nameof(IsUpdateNotAvailable));
 
@@ -2774,6 +2829,7 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
         }
         catch (Exception ex)
         {
+            TechLog.Warn(LogAreas.Update, LogCodes.UpdateFail, "Не удалось проверить обновления: " + ex.Message);
             UpdateStatusText = "Не удалось проверить";
             if (userInitiated)
                 Toast("Не удалось проверить обновления", ShortReason(ex), GlyphInfo, ToastKind.Danger);
@@ -2971,6 +3027,7 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
 
     private void SaveSettings()
     {
+        LogSettingsChanges();
         try
         {
             _storage.Save(_settings);
@@ -2984,6 +3041,7 @@ public sealed class MainViewModel : ObservableObject, IConnectionActions, IDispo
     public void Dispose()
     {
         _log.Add(LogKind.Info, "Лаунчер закрыт");
+        _logTimer?.Stop();
         _monitor.StatusChanged -= OnVpnStatusChanged;
         _monitor.Dispose();
         _subscriptionTimer.Stop();

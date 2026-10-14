@@ -606,6 +606,7 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
     public IDisposable Freeze(IReadOnlyCollection<Guid> appIds)
     {
         var frozen = new List<SafeKernelHandle>();
+        var failed = 0;
         lock (_gate)
         {
             if (!_disposed)
@@ -620,19 +621,27 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
                     {
                         var handle = OpenProcess(ProcessSuspendResume, false, (uint)pid);
                         if (!handle.IsInvalid && NtSuspendProcess(handle) == 0)
+                        {
                             frozen.Add(handle);
+                        }
                         else
+                        {
+                            failed++;
                             handle.Dispose();
+                        }
                     }
                 }
             }
         }
 
+        TechLog.Info(SafeLauncher.Logging.LogAreas.App, SafeLauncher.Logging.LogCodes.CoreFreeze,
+            $"Приостановлено процессов: {frozen.Count}" + (failed > 0 ? $", не удалось приостановить: {failed}" : string.Empty) + " (перезапуск ядра)");
         return new Frozen(frozen);
     }
 
     private sealed class Frozen : IDisposable
     {
+        private readonly System.Diagnostics.Stopwatch _watch = System.Diagnostics.Stopwatch.StartNew();
         private List<SafeKernelHandle>? _handles;
 
         public Frozen(List<SafeKernelHandle> handles) => _handles = handles;
@@ -647,6 +656,8 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
                 NtResumeProcess(handle);
                 handle.Dispose();
             }
+            TechLog.Info(SafeLauncher.Logging.LogAreas.App, SafeLauncher.Logging.LogCodes.CoreFreeze,
+                $"Процессы продолжили работу: {handles.Count}, были приостановлены {_watch.ElapsedMilliseconds} мс");
         }
     }
 
@@ -937,7 +948,9 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
             }
             else
             {
-                AdoptLocked(hit);
+                var adopted = AdoptLocked(hit);
+                TechLog.Info(SafeLauncher.Logging.LogAreas.App, SafeLauncher.Logging.LogCodes.AppAdopt,
+                    $"«{hit.Slot.Name}»: процесс PID {hit.Pid}, запущенный мимо лаунчера, {(adopted ? "взят под контроль" : "взять под контроль не удалось")}");
             }
         }
 
@@ -953,6 +966,8 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
 
             var count = CountLocked(slot);
             if (count == slot.LastCount) continue;
+            TechLog.Debug(SafeLauncher.Logging.LogAreas.App, SafeLauncher.Logging.LogCodes.AppProcesses,
+                $"«{slot.Name}»: процессов {slot.LastCount} → {count}" + (copies > 0 ? $", копий мимо лаунчера {copies}" : string.Empty));
             slot.LastCount = count;
             changed = true;
         }

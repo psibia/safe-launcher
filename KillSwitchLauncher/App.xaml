@@ -337,6 +337,14 @@
                                 <Setter TargetName="Mark" Property="Opacity" Value="1" />
                                 <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
                             </Trigger>
+                            <!-- Недоступная галочка серая целиком: и квадрат, и подпись, и курсор без «руки» -->
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter TargetName="Box" Property="Background" Value="{StaticResource SubtleBg}" />
+                                <Setter TargetName="Box" Property="BorderBrush" Value="#E2E2E8" />
+                                <Setter TargetName="BoxOn" Property="Background" Value="#C4C4CE" />
+                                <Setter Property="Foreground" Value="{StaticResource TextMuted}" />
+                                <Setter Property="Cursor" Value="Arrow" />
+                            </Trigger>
                         </ControlTemplate.Triggers>
                     </ControlTemplate>
                 </Setter.Value>
@@ -652,6 +660,7 @@
         <BooleanToVisibilityConverter x:Key="BoolToVis" />
         <conv:InverseBooleanToVisibilityConverter x:Key="InverseBoolToVis" />
         <conv:EnumToBooleanConverter x:Key="EnumToBool" />
+        <conv:EqualsToBooleanConverter x:Key="EqualsToBool" />
         <conv:EnumToVisibilityConverter x:Key="EnumToVis" />
         <conv:NullToCollapsedConverter x:Key="NullToCollapsed" />
         <conv:AllTrueToVisibilityConverter x:Key="AllTrueToVis" />
@@ -686,6 +695,40 @@
             <Setter Property="Background" Value="{StaticResource RowBg}" />
             <Setter Property="CornerRadius" Value="16" />
             <Setter Property="Padding" Value="14,12" />
+        </Style>
+        <!-- Строка настроек, которая целиком кнопка (открыть окно): та же подложка, при наведении темнее, стрелка справа -->
+        <Style x:Key="SettingLinkRow" TargetType="Button">
+            <Setter Property="Foreground" Value="{StaticResource TextPrimary}" />
+            <Setter Property="Padding" Value="14,10" />
+            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="FocusVisualStyle" Value="{x:Null}" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="Bd" Background="{StaticResource RowBg}" CornerRadius="16" Padding="{TemplateBinding Padding}">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <ContentPresenter Grid.Column="0" VerticalAlignment="Center" />
+                                <TextBlock x:Name="Chevron" Grid.Column="1" Text="&#xE76C;" FontFamily="{StaticResource IconFont}" FontSize="12"
+                                           Foreground="{StaticResource TextMuted}" VerticalAlignment="Center" Margin="12,0,4,0" />
+                            </Grid>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#EDEDF2" />
+                                <Setter TargetName="Chevron" Property="Foreground" Value="{StaticResource Accent}" />
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter TargetName="Bd" Property="Background" Value="#E6E6EC" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
         </Style>
         <!-- Белая карточка раздела на странице -->
         <Style x:Key="PageCard" TargetType="Border">
