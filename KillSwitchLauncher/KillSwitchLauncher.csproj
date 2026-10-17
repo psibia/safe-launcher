@@ -12,7 +12,7 @@
     <ApplicationIcon>Assets\logo.ico</ApplicationIcon>
     <Product>Безопасный лаунчер</Product>
     <AssemblyTitle>Безопасный лаунчер</AssemblyTitle>
-    <Version>2.1.0</Version>
+    <Version>2.3.7</Version>
   </PropertyGroup>
 
   <ItemGroup>
@@ -24,6 +24,14 @@
     <!-- Технический журнал: формат, хранение, скрытие адресов (общая библиотека с службой) -->
     <ProjectReference Include="..\SafeLauncher.Logging\SafeLauncher.Logging.csproj" />
   </ItemGroup>
+
+  <!-- Хеши ключей лицензии (Services\License.cs). Файла нет в GitHub: без него лаунчер не примет ни один ключ. -->
+  <ItemGroup Condition="Exists('..\installer\license-hashes.txt')">
+    <EmbeddedResource Include="..\installer\license-hashes.txt" LogicalName="license-hashes.txt" Visible="false" />
+  </ItemGroup>
+  <Target Name="WarnNoLicenseHashes" BeforeTargets="Build" Condition="!Exists('..\installer\license-hashes.txt')">
+    <Warning Text="Нет installer\license-hashes.txt: в лаунчер не встроены хеши ключей лицензии, и он не примет ни один ключ." />
+  </Target>
 
   <ItemGroup>
     <Resource Include="Assets\logo.png" />

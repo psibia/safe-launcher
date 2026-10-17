@@ -3,12 +3,14 @@ using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Threading;
 using KillSwitchLauncher.Services;
+using KillSwitchLauncher.Views;
 
 namespace KillSwitchLauncher;
 
 public partial class App : Application
 {
     private SingleInstance? _instance;
+    private UpdateWaitWindow? _updateWait;
 
     protected override void OnStartup(StartupEventArgs e)
     {
@@ -18,6 +20,29 @@ public partial class App : Application
         if (e.Args.Length > 0 && e.Args[0] == DnsCollector.Argument)
         {
             Shutdown(DnsCollector.Run(e.Args));
+            return;
+        }
+
+        // Установщик сохраняет ключ лицензии для всех пользователей: та же программа с правами администратора, без окон.
+        if (e.Args.Length > 0 && e.Args[0] == License.StoreArgument)
+        {
+            Shutdown(License.Store(e.Args));
+            return;
+        }
+
+        // Окно ожидания обновления: копия лаунчера показывает ход установки и запускает новую версию.
+        // До проверки единственного экземпляра: закрывающийся лаунчер ещё держит его.
+        if (e.Args.Length > 0 && e.Args[0] == UpdateService.WaiterArgument)
+        {
+            _updateWait = UpdateWaitWindow.FromArguments(e.Args);
+            if (_updateWait is null)
+            {
+                Shutdown(2);
+                return;
+            }
+
+            MainWindow = _updateWait;
+            _updateWait.Show();
             return;
         }
 
@@ -44,6 +69,13 @@ public partial class App : Application
         // закрыться сами, пока подключение ещё работает.
         NativeMethods.SetProcessShutdownParameters(0x100, 0);
 
+        // Без ключа лицензии лаунчер не работает. Проверка без сети, ключ спрашивается один раз (см. License).
+        if (!License.IsActivated() && !AskLicenseKey())
+        {
+            Shutdown();
+            return;
+        }
+
         var window = new MainWindow();
         MainWindow = window;
         _instance.ListenForActivation(() => Dispatcher.BeginInvoke(window.ShowFromTray));
@@ -55,8 +87,30 @@ public partial class App : Application
             window.Show();
     }
 
+    // Окно ключа открывается раньше главного окна. Пока оно открыто, приложение не должно считать его главным
+    // и закрываться вместе с ним.
+    private bool AskLicenseKey()
+    {
+        ShutdownMode = ShutdownMode.OnExplicitShutdown;
+        var key = AlertWindow.AskLicenseKey(License.IsValid, License.HasKnownKeys);
+        ShutdownMode = ShutdownMode.OnMainWindowClose;
+        if (key is null)
+            return false;
+
+        License.SaveForUser(key);
+        TechLog.Info(SafeLauncher.Logging.LogAreas.Settings, SafeLauncher.Logging.LogCodes.SettingsChange, "Ключ лицензии принят");
+        return true;
+    }
+
     protected override void OnSessionEnding(SessionEndingCancelEventArgs e)
     {
+        if (_updateWait is not null)
+        {
+            _updateWait.AllowClose();
+            base.OnSessionEnding(e);
+            return;
+        }
+
         // Выход из Windows или установщик закрывает программы: закрываемся, а не уходим в трей.
         (MainWindow as MainWindow)?.PrepareForExit();
         TechLog.Info(SafeLauncher.Logging.LogAreas.Session, SafeLauncher.Logging.LogCodes.SessionEnd, $"Windows завершает сеанс ({e.ReasonSessionEnding})");

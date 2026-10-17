@@ -13,7 +13,13 @@ public enum AppNetworkMode
     OwnAdapters,
 
     /// <summary>«Своё подключение»: трафик приложения ведёт ядро лаунчера через выбранное подключение.</summary>
-    OwnConnection
+    OwnConnection,
+
+    /// <summary>
+    /// «Без сети»: фильтр Windows не пускает программы приложения никуда, кроме связи внутри компьютера (127.0.0.1).
+    /// VPN для запуска не нужен.
+    /// </summary>
+    Offline
 }
 
 /// <summary>Общие настройки VPN: как лаунчер понимает, что VPN есть.</summary>
@@ -51,14 +57,14 @@ public sealed class AppNetwork
     /// <summary>Своё подключение (<see cref="AppNetworkMode.OwnConnection"/>): Id из списка подключений.</summary>
     public Guid? ConnectionId { get; set; }
 
-    /// <summary>
-    /// «Не запускать без VPN». С подключением лаунчера выключенная защита значит «не ждать проверки сервера»:
-    /// трафик приложения всё равно идёт только через ядро.
-    /// </summary>
-    public ProtectionOverride RequireVpn { get; set; } = ProtectionOverride.Inherit;
-
     /// <summary>«Закрывать при обрыве» (Kill-Switch). Выключено — при обрыве подключения лаунчера приложение ждёт его возвращения без сети.</summary>
     public ProtectionOverride CloseOnDrop { get; set; } = ProtectionOverride.Inherit;
+
+    /// <summary>
+    /// «Если открыто не из лаунчера»: что делать с программой приложения, открытой не из лаунчера. Действует, только когда
+    /// трафик ведёт ядро лаунчера.
+    /// </summary>
+    public OutsideCopiesOverride OutsideCopies { get; set; } = OutsideCopiesOverride.Inherit;
 
     /// <summary>
     /// Исключения: домены, к которым приложение ходит напрямую, мимо подключения лаунчера (вместе с поддоменами).

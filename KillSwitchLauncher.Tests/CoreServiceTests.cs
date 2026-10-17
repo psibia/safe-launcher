@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using KillSwitchLauncher.Services;
 using Xunit;
 using Svc = SafeLauncher.Service;
@@ -188,6 +189,60 @@ public class CoreConfigBuilderTests
     }
 
     [Fact]
+    public void HideDns_RareQueries_GoThroughChosenConnection()
+    {
+        var request = Request();
+        request.HideDns = true;
+        var rules = Svc.CoreConfigBuilder.Build(request)["dns"]!["rules"]!.AsArray();
+        // без подключения для DNS последнее правило — подменные адреса, остальное уходит к DNS компьютера (final)
+        Assert.Equal(Svc.CoreConfigBuilder.FakeIpDnsTag, (string)rules.Last()!["server"]!);
+
+        request.Outbounds.Add(Socks("main"));
+        request.DnsOutbound = "main";
+        var dns = Svc.CoreConfigBuilder.Build(request)["dns"]!;
+
+        // DNS-сервер подключения есть, хотя ни одно приложение через него не ходит
+        var server = dns["servers"]!.AsArray().Single(s => (string)s!["tag"]! == "dns-main")!;
+        Assert.Equal(("tcp", Svc.CoreConfigBuilder.RemoteDnsServer, "main"),
+            ((string)server["type"]!, (string)server["server"]!, (string)server["detour"]!));
+        // после подмены адресов, пустых HTTPS и служебных имён: все остальные запросы программ, но не поиск адресов самим ядром
+        rules = dns["rules"]!.AsArray();
+        var rare = rules.Last()!;
+        Assert.Equal("dns-main", (string)rare["server"]!);
+        Assert.Equal("dns", (string)rare["protocol"]![0]!);
+        Assert.Null(rare["query_type"]);
+        Assert.Null(rare["domain_suffix"]);
+        Assert.True(rules.IndexOf(rules.Single(r => (string?)r!["server"] == Svc.CoreConfigBuilder.FakeIpDnsTag)) < rules.IndexOf(rare));
+        Assert.Equal(Svc.CoreConfigBuilder.LocalDnsTag, (string)dns["final"]!);
+    }
+
+    [Fact]
+    public void HideDns_RareQueries_ShareAppConnectionDns()
+    {
+        var request = Request();
+        request.HideDns = true;
+        request.DnsOutbound = "vpn";
+        request.OutboundDns = new Dictionary<string, string> { ["vpn"] = "10.0.0.53" };
+
+        var dns = Svc.CoreConfigBuilder.Build(request)["dns"]!;
+
+        var server = Assert.Single(dns["servers"]!.AsArray(), s => ((string)s!["tag"]!).StartsWith("dns-"))!;
+        Assert.Equal(("udp", "10.0.0.53"), ((string)server["type"]!, (string)server["server"]!));
+        Assert.Equal("dns-vpn", (string)dns["rules"]!.AsArray().Last()!["server"]!);
+    }
+
+    [Fact]
+    public void DnsConnection_WithoutHideDns_ChangesNothing()
+    {
+        var request = Request();
+        var before = Svc.CoreConfigBuilder.Build(request).ToJsonString();
+
+        request.DnsOutbound = "vpn";
+
+        Assert.Equal(before, Svc.CoreConfigBuilder.Build(request).ToJsonString());
+    }
+
+    [Fact]
     public void WireGuard_IsEndpoint()
     {
         var request = Request();
@@ -227,6 +282,8 @@ public class CoreConfigBuilderTests
         var detour = Socks();
         detour["detour"] = "direct";
         yield return new object[] { new Svc.CoreRequest { Outbounds = { detour } } };
+        // DNS-запросы — только через подключение из этого же запроса
+        yield return new object[] { new Svc.CoreRequest { Outbounds = { Socks() }, HideDns = true, DnsOutbound = "direct" } };
         // приложение: подключения нет, метка с недопустимыми символами, повтор, плохой домен
         yield return new object[] { new Svc.CoreRequest { Outbounds = { Socks() }, Apps = { new Svc.CoreAppRoute { Tag = "a", Outbound = "other" } } } };
         yield return new object[] { new Svc.CoreRequest { Outbounds = { Socks() }, Apps = { new Svc.CoreAppRoute { Tag = "a.*", Outbound = "vpn" } } } };
@@ -259,6 +316,142 @@ public class CoreConfigBuilderTests
             request.Apps.Add(new Svc.CoreAppRoute { Tag = "app" + i, Outbound = "vpn" });
 
         Assert.Throws<Svc.CoreConfigException>(() => Svc.CoreConfigBuilder.Build(request));
+    }
+
+    // ---- процессы программ приложения без метки (копии, запущенные мимо лаунчера) ----
+
+    private const string Tagged = @"^launcher:discord\|";
+    private const string DiscordPattern = @"(?i)^C:\\Apps\\Discord\\(?:[^\\]+\\)*Discord\.exe$";
+    private const string ToolPattern = @"(?i)^D:\\Tools \(x86\)\\tool\+1\.exe$";
+
+    private static Svc.CoreProgram Program(string folder, string name, bool subfolders = false) =>
+        new() { Folder = folder, Name = name, Subfolders = subfolders };
+
+    private static Svc.CoreRequest WithPrograms(bool block, params Svc.CoreProgram[] programs)
+    {
+        var request = Request("example.com");
+        request.Apps[0].Programs = programs.ToList();
+        request.Apps[0].BlockOutside = block;
+        return request;
+    }
+
+    private static string[] Patterns(JsonNode rule) => rule["process_path_regex"]!.AsArray().Select(p => (string)p!).ToArray();
+
+    [Fact]
+    public void OutsideCopies_GoLikeTheApp()
+    {
+        var config = Svc.CoreConfigBuilder.Build(WithPrograms(false,
+            Program(@"C:\Apps\Discord", "Discord.exe", subfolders: true), Program(@"D:\Tools (x86)\", "tool+1.exe")));
+
+        var rules = Rules(config);
+        // имя сайта распознаётся и у копий: без него для них не сработали бы исключения доменов
+        Assert.Equal(new[] { "^launcher:", DiscordPattern, ToolPattern }, Patterns(rules[0]!));
+        var exceptions = rules.Single(r => r!["domain_suffix"] is not null)!;
+        Assert.Equal("direct", (string)exceptions["outbound"]!);
+        Assert.Equal(new[] { Tagged, DiscordPattern, ToolPattern }, Patterns(exceptions));
+        var route = rules.Last()!;
+        Assert.Equal("vpn", (string)route["outbound"]!);
+        Assert.Equal(new[] { Tagged, DiscordPattern, ToolPattern }, Patterns(route));
+        Assert.DoesNotContain(rules, r => (string)r!["action"]! == "reject");
+
+        var dns = config["dns"]!["rules"]!.AsArray().Last()!;
+        Assert.Equal("dns-vpn", (string)dns["server"]!);
+        Assert.Equal(new[] { Tagged, DiscordPattern, ToolPattern }, Patterns(dns));
+    }
+
+    [Fact]
+    public void OutsideCopies_Blocked_RightAfterTheApp()
+    {
+        var config = Svc.CoreConfigBuilder.Build(WithPrograms(true, Program(@"C:\Apps\Discord", "Discord.exe", subfolders: true)));
+
+        var rules = Rules(config);
+        Assert.Equal(new[] { "^launcher:" }, Patterns(rules[0]!));
+        var route = rules.Single(r => (string?)r!["outbound"] == "vpn")!;
+        Assert.Equal(new[] { Tagged }, Patterns(route));
+        var reject = rules.Last()!;
+        Assert.Equal("reject", (string)reject["action"]!);
+        Assert.Equal(new[] { DiscordPattern }, Patterns(reject));
+        Assert.Equal(rules.IndexOf(route) + 1, rules.IndexOf(reject));
+        Assert.All(config["dns"]!["rules"]!.AsArray().Where(r => r!["process_path_regex"] is not null),
+            r => Assert.Equal(new[] { Tagged }, Patterns(r!)));
+    }
+
+    [Fact]
+    public void OutsideCopies_SystemProgramsAndWholeDrive_NotTouched()
+    {
+        var services = new[] { @"C:\Program Files\Vendor\bin\agent.exe" };
+        var request = WithPrograms(false,
+            Program(@"C:\Windows\System32", "notepad.exe"),
+            Program(@"C:\Tools", "svchost.exe"),
+            Program(@"C:\", "app.exe", subfolders: true), // весь диск: так «копией» оказалась бы любая программа с этим именем
+            Program(@"C:\Program Files\Vendor", "agent.exe", subfolders: true), // программа службы
+            Program(@"D:\", "tool.exe"));
+
+        Assert.Equal(new[] { Tagged, @"(?i)^D:\\tool\.exe$" }, Patterns(Rules(Svc.CoreConfigBuilder.Build(request, null, services)).Last()!));
+
+        // не осталось ни одной программы — как без программ, и блокировать нечего
+        request.Apps[0].Programs!.RemoveAt(4);
+        request.Apps[0].BlockOutside = true;
+        var rules = Rules(Svc.CoreConfigBuilder.Build(request, null, services));
+        Assert.Equal(new[] { Tagged }, Patterns(rules.Last()!));
+        Assert.DoesNotContain(rules, r => (string)r!["action"]! == "reject");
+    }
+
+    [Theory]
+    [InlineData(@"C:\Apps\Discord\Discord.exe", true)]
+    [InlineData(@"c:\apps\discord\app-1.0.9\DISCORD.EXE", true)]
+    [InlineData(@"C:\Apps\Discord2\Discord.exe", false)]
+    [InlineData(@"C:\Apps\Discord\Discord.exe.old", false)]
+    [InlineData(@"C:\Apps\Discord\Update.exe", false)]
+    [InlineData(@"launcher:a1|C:\Apps\Discord\Discord.exe", false)]
+    [InlineData(@"D:\Tools (x86)\tool+1.exe", true)]
+    [InlineData(@"D:\Tools (x86)\sub\tool+1.exe", false)]
+    [InlineData(@"D:\Tools (x86)\toolx1.exe", false)]
+    public void OutsidePatterns_MatchOnlyAppPrograms(string path, bool expected)
+    {
+        var route = Rules(Svc.CoreConfigBuilder.Build(WithPrograms(false,
+            Program(@"C:\Apps\Discord", "Discord.exe", subfolders: true), Program(@"D:\Tools (x86)", "tool+1.exe")))).Last()!;
+
+        // Выражения ядра (Go RE2): эти конструкции .NET понимает так же.
+        Assert.Equal(expected, Patterns(route).Skip(1).Any(p => Regex.IsMatch(path, p, RegexOptions.CultureInvariant)));
+    }
+
+    public static IEnumerable<object[]> BadPrograms()
+    {
+        yield return new object[] { @"Apps\Discord", "Discord.exe" }; // не полный путь
+        yield return new object[] { @"\\server\share", "Discord.exe" }; // сетевая папка
+        yield return new object[] { @"C:\Apps\..\Windows", "Discord.exe" };
+        yield return new object[] { @"C:\Apps\Dis*", "Discord.exe" };
+        yield return new object[] { "C:\\Apps\\Discord\n", "Discord.exe" };
+        yield return new object[] { @"C:\Apps\Discord", "Discord" }; // не exe
+        yield return new object[] { @"C:\Apps\Discord", ".exe" };
+        yield return new object[] { @"C:\Apps\Discord", @"app\Discord.exe" }; // путь вместо имени
+    }
+
+    [Theory]
+    [MemberData(nameof(BadPrograms))]
+    public void OutsideCopies_BadProgram_IsRefused(string folder, string name)
+    {
+        Assert.Throws<Svc.CoreConfigException>(() => Svc.CoreConfigBuilder.Build(WithPrograms(false, Program(folder, name))));
+    }
+
+    [Fact]
+    public void OutsideCopies_TooManyPrograms_IsRefused()
+    {
+        var programs = Enumerable.Range(0, 40).Select(i => Program($@"C:\Apps\App{i}", "app.exe")).ToArray();
+
+        Assert.Throws<Svc.CoreConfigException>(() => Svc.CoreConfigBuilder.Build(WithPrograms(false, programs)));
+    }
+
+    [Theory]
+    [InlineData("FATAL[0000] start service: start clash-server: external controller listen error: listen tcp 127.0.0.1:45678: bind: Only one usage of each socket address (protocol/network address/port) is normally permitted.", true)]
+    [InlineData("FATAL[0000] start service: start inbound/mixed[check-in]: listen tcp 127.0.0.1:45679: bind: address already in use", true)]
+    [InlineData("FATAL[0000] start service: start inbound/mixed[check-in]: listen tcp 127.0.0.1:4567: bind: address already in use", false)]
+    [InlineData("FATAL[0000] start service: start inbound/tun[tun-in]: configure tun interface: Access is denied.", false)]
+    [InlineData("ERROR outbound/socks[vpn]: dial tcp 127.0.0.1:45678: connectex: No connection could be made", false)]
+    public void PortTaken_OnlyCoreOwnPorts(string line, bool expected)
+    {
+        Assert.Equal(expected, Svc.ControlServer.PortTaken(new[] { "INFO network: updated default interface", line }, new Svc.CoreApi(45678, "ключ", 45679)));
     }
 }
 
@@ -316,11 +509,11 @@ public class CoreServiceProtocolTests
     [Fact]
     public void Protocol_ReachesLauncher_AndMatchesRequirement()
     {
-        var reply = new Svc.ControlReply { Id = 1, Ok = true, Protocol = Svc.ControlProtocol.Revision, ApiPort = 9090, ApiSecret = "ключ" };
+        var reply = new Svc.ControlReply { Id = 1, Ok = true, Protocol = Svc.ControlProtocol.Revision, ApiPort = 9090, ApiSecret = "ключ", CheckPort = 9091 };
         var received = JsonSerializer.Deserialize<CoreServiceClient.Reply>(JsonSerializer.Serialize(reply, Svc.ControlProtocol.JsonOptions), CoreServiceClient.JsonOptions)!;
 
         Assert.Equal(Svc.ControlProtocol.Revision, received.Protocol);
-        Assert.Equal((9090, "ключ"), (received.ApiPort!.Value, received.ApiSecret));
+        Assert.Equal((9090, "ключ", 9091), (received.ApiPort!.Value, received.ApiSecret, received.CheckPort!.Value));
         // лаунчер требует не больше, чем умеет служба из этого же репозитория
         Assert.True(CoreServiceClient.RequiredProtocol <= Svc.ControlProtocol.Revision);
     }
@@ -341,7 +534,7 @@ public class CoreServiceProtocolTests
         var message = new CoreServiceClient.Message
         {
             Op = Svc.ControlProtocol.OpStart,
-            Request = new CoreStartRequest { HideDns = true, OutboundDns = new Dictionary<string, string> { ["vpn"] = "10.0.0.1" } }
+            Request = new CoreStartRequest { HideDns = true, OutboundDns = new Dictionary<string, string> { ["vpn"] = "10.0.0.1" }, DnsOutbound = "vpn" }
         };
 
         var received = JsonSerializer.Deserialize<Svc.ControlMessage>(JsonSerializer.Serialize(message, CoreServiceClient.JsonOptions),
@@ -349,6 +542,47 @@ public class CoreServiceProtocolTests
 
         Assert.True(received.Request!.HideDns);
         Assert.Equal("10.0.0.1", received.Request.OutboundDns!["vpn"]);
+        Assert.Equal("vpn", received.Request.DnsOutbound);
+        // без подключения для DNS поля в сообщении нет: служба до ревизии 6 его и не ждёт
+        Assert.DoesNotContain("dnsOutbound", JsonSerializer.Serialize(new CoreStartRequest { HideDns = true }, CoreServiceClient.JsonOptions));
+    }
+
+    [Fact]
+    public void StartCommand_CarriesAppPrograms()
+    {
+        var message = new CoreServiceClient.Message
+        {
+            Op = Svc.ControlProtocol.OpStart,
+            Request = new CoreStartRequest
+            {
+                Outbounds = { new JsonObject { ["type"] = "socks", ["tag"] = "vpn", ["server"] = "127.0.0.1", ["server_port"] = 1080 } },
+                Apps =
+                {
+                    new CoreAppRoute
+                    {
+                        Tag = "discord",
+                        Outbound = "vpn",
+                        Programs = new List<CoreProgram> { new() { Folder = @"C:\Users\u\AppData\Local\Discord", Name = "Discord.exe", Subfolders = true } },
+                        BlockOutside = true
+                    },
+                    new CoreAppRoute { Tag = "chat", Outbound = "vpn" }
+                }
+            }
+        };
+
+        var json = JsonSerializer.Serialize(message, CoreServiceClient.JsonOptions);
+        var received = JsonSerializer.Deserialize<Svc.ControlMessage>(json, Svc.ControlProtocol.JsonOptions)!;
+
+        var app = received.Request!.Apps.Single(a => a.Tag == "discord");
+        Assert.True(app.BlockOutside);
+        var program = Assert.Single(app.Programs!);
+        Assert.Equal((@"C:\Users\u\AppData\Local\Discord", "Discord.exe", true), (program.Folder, program.Name, program.Subfolders));
+        Assert.Null(received.Request.Apps.Single(a => a.Tag == "chat").Programs);
+        // у приложения без программ поля в сообщении нет
+        Assert.Single(Regex.Matches(json, "\"programs\""));
+
+        // и служба соглашается собрать из него настройки
+        Assert.Contains(Svc.CoreConfigBuilder.Build(received.Request)["route"]!["rules"]!.AsArray(), r => (string)r!["action"]! == "reject");
     }
 
     [Fact]

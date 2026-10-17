@@ -12,7 +12,7 @@
     <RootNamespace>SafeLauncher.Service</RootNamespace>
     <Product>Безопасный лаунчер</Product>
     <AssemblyTitle>Безопасный лаунчер — сеть</AssemblyTitle>
-    <Version>2.1.0</Version>
+    <Version>2.3.7</Version>
   </PropertyGroup>
 
   <ItemGroup>

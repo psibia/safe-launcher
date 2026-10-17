@@ -237,6 +237,56 @@
             </Setter>
         </Style>
 
+        <!-- Тонкая полоса хода: с процентами или бегущая (IsIndeterminate). Бегущая часть — треть ширины полосы при любой ширине -->
+        <Style x:Key="SlimProgress" TargetType="ProgressBar">
+            <Setter Property="Height" Value="6" />
+            <Setter Property="Minimum" Value="0" />
+            <Setter Property="Maximum" Value="100" />
+            <Setter Property="Foreground" Value="{StaticResource AccentGradient}" />
+            <Setter Property="Background" Value="{StaticResource SubtleBg}" />
+            <Setter Property="IsHitTestVisible" Value="False" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="ProgressBar">
+                        <Grid>
+                            <Grid.OpacityMask>
+                                <VisualBrush Visual="{Binding ElementName=Mask}" />
+                            </Grid.OpacityMask>
+                            <Border x:Name="Mask" Background="White" CornerRadius="3" />
+                            <Border x:Name="PART_Track" Background="{TemplateBinding Background}" CornerRadius="3" />
+                            <Border x:Name="PART_Indicator" HorizontalAlignment="Left" Background="{TemplateBinding Foreground}" CornerRadius="3" />
+                            <Viewbox x:Name="Runner" Stretch="Fill" Visibility="Collapsed">
+                                <Canvas Width="100" Height="1" ClipToBounds="True">
+                                    <Rectangle x:Name="RunnerBar" Width="35" Height="1" Canvas.Left="-35" Fill="{TemplateBinding Foreground}" />
+                                </Canvas>
+                            </Viewbox>
+                        </Grid>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsIndeterminate" Value="True">
+                                <Setter TargetName="PART_Indicator" Property="Visibility" Value="Collapsed" />
+                                <Setter TargetName="Runner" Property="Visibility" Value="Visible" />
+                                <Trigger.EnterActions>
+                                    <BeginStoryboard x:Name="Run">
+                                        <Storyboard RepeatBehavior="Forever">
+                                            <DoubleAnimation Storyboard.TargetName="RunnerBar" Storyboard.TargetProperty="(Canvas.Left)"
+                                                             From="-35" To="100" Duration="0:0:1.6">
+                                                <DoubleAnimation.EasingFunction>
+                                                    <SineEase EasingMode="EaseInOut" />
+                                                </DoubleAnimation.EasingFunction>
+                                            </DoubleAnimation>
+                                        </Storyboard>
+                                    </BeginStoryboard>
+                                </Trigger.EnterActions>
+                                <Trigger.ExitActions>
+                                    <StopStoryboard BeginStoryboardName="Run" />
+                                </Trigger.ExitActions>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+
         <!-- ============ Переключатель: «таблетка», во включённом состоянии — градиент ============
              Текст слева (растягивается), переключатель справа. -->
         <Style x:Key="ToggleSwitch" TargetType="CheckBox">

@@ -1,0 +1,157 @@
+diff --git a/device/awg_tunnel_test.go b/device/awg_tunnel_test.go
+index 191ecfc..3b48f8f 100644
+--- a/device/awg_tunnel_test.go
++++ b/device/awg_tunnel_test.go
+@@ -261,10 +261,14 @@ func TestAWGPaddedKeepalive(t *testing.T) {
+ 		}
+ 	}
+ 	shared := "s4=13\nh4=700-800\nrandom_trailers=1"
+-	startAWGDeviceWithLog(t, "server", serverPrivate+"\nlisten_port="+fmt.Sprint(serverPort), shared,
++	server := startAWGDeviceWithLog(t, "server", serverPrivate+"\nlisten_port="+fmt.Sprint(serverPort), shared,
+ 		"public_key="+clientPublic+"\nallowed_ip=10.0.0.2/32", logf)
+-	startAWGDevice(t, "client", clientPrivate, shared+"\ncontent_padding_addition=16-64",
++	client := startAWGDevice(t, "client", clientPrivate, shared+"\ncontent_padding_addition=16-64",
+ 		"public_key="+serverPublic+"\nendpoint=127.0.0.1:"+fmt.Sprint(serverPort)+"\nallowed_ip=10.0.0.1/32\npersistent_keepalive_interval=1")
++	// Keepalives start with the first packet through the tunnel.
++	request := testIPv4Packet("10.0.0.2", "10.0.0.1", []byte("start"))
++	client.tun.inbound <- request
++	expectPacket(t, server.tun, request)
+ 	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+ 		access.Lock()
+ 		done := keepalives >= 3
+diff --git a/device/device.go b/device/device.go
+index 7ecf10a..1a2f6c9 100644
+--- a/device/device.go
++++ b/device/device.go
+@@ -213,7 +213,7 @@ func (device *Device) upLocked() error {
+ 	device.peers.RUnlock()
+ 	for _, peer := range peers {
+ 		peer.Start()
+-		if !peer.persistentKeepaliveInterval.Load().IsZero() {
++		if !peer.persistentKeepaliveInterval.Load().IsZero() && peer.hadHandshake() {
+ 			peer.SendKeepalive()
+ 		}
+ 	}
+diff --git a/device/keepalive_use_test.go b/device/keepalive_use_test.go
+new file mode 100644
+index 0000000..b9ad39d
+--- /dev/null
++++ b/device/keepalive_use_test.go
+@@ -0,0 +1,82 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
++ */
++
++package device_test
++
++import (
++	"fmt"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++)
++
++// TestKeepaliveWaitsForUse checks that a peer with a persistent keepalive sends nothing until something is sent
++// through it, also when the device goes down and up; that its keepalives go from then on; and that after going down
++// and up a peer in use connects again at once.
++func TestKeepaliveWaitsForUse(t *testing.T) {
++	serverPrivate, serverPublic := generateTestKeyPair(t)
++	clientPrivate, clientPublic := generateTestKeyPair(t)
++	serverPort := freeUDPPort(t)
++	var access sync.Mutex
++	var initiations, keepalives int
++	logf := func(line string) {
++		access.Lock()
++		defer access.Unlock()
++		if strings.Contains(line, "Received handshake initiation") {
++			initiations++
++		}
++		if strings.Contains(line, "Receiving keepalive packet") {
++			keepalives++
++		}
++	}
++	count := func() (int, int) {
++		access.Lock()
++		defer access.Unlock()
++		return initiations, keepalives
++	}
++	waitFor := func(done func(initiations, keepalives int) bool, timeout time.Duration) {
++		for deadline := time.Now().Add(timeout); time.Now().Before(deadline) && !done(count()); {
++			time.Sleep(50 * time.Millisecond)
++		}
++	}
++
++	server := startAWGDeviceWithLog(t, "server", serverPrivate+"\nlisten_port="+fmt.Sprint(serverPort), "",
++		"public_key="+clientPublic+"\nallowed_ip=10.0.0.2/32", logf)
++	client := startAWGDevice(t, "client", clientPrivate, "",
++		"public_key="+serverPublic+"\nendpoint=127.0.0.1:"+fmt.Sprint(serverPort)+"\nallowed_ip=10.0.0.1/32\npersistent_keepalive_interval=1")
++
++	time.Sleep(2500 * time.Millisecond)
++	if err := client.Down(); err != nil {
++		t.Fatal(err)
++	}
++	if err := client.Up(); err != nil {
++		t.Fatal(err)
++	}
++	time.Sleep(1500 * time.Millisecond)
++	if i, k := count(); i != 0 || k != 0 {
++		t.Fatalf("unused peer: %d handshake initiations, %d keepalives", i, k)
++	}
++
++	request := testIPv4Packet("10.0.0.2", "10.0.0.1", []byte("first"))
++	client.tun.inbound <- request
++	expectPacket(t, server.tun, request)
++	waitFor(func(_, k int) bool { return k >= 3 }, 10*time.Second)
++	used, k := count()
++	if used == 0 || k < 3 {
++		t.Fatalf("peer in use: %d handshake initiations, %d keepalives", used, k)
++	}
++
++	if err := client.Down(); err != nil {
++		t.Fatal(err)
++	}
++	if err := client.Up(); err != nil {
++		t.Fatal(err)
++	}
++	waitFor(func(i, _ int) bool { return i > used }, 3*time.Second)
++	if i, _ := count(); i <= used {
++		t.Fatal("peer in use did not connect again after going down and up")
++	}
++}
+diff --git a/device/peer.go b/device/peer.go
+index f0b6931..0d4a965 100644
+--- a/device/peer.go
++++ b/device/peer.go
+@@ -224,6 +224,17 @@ func (peer *Peer) String() string {
+ 	return string(b)
+ }
+ 
++// hadHandshake reports whether a handshake with the peer has ever completed.
++//
++// Safe Launcher: the persistent keepalive is sent at once only to a peer that has been in use. The launcher's core
++// holds the connections of every application in its settings, running or not, and an immediate keepalive of an
++// unused one would start a handshake that takes the session away from another client with the same key (such as
++// the WireGuard or AmneziaVPN application). Such a peer stays silent until something is sent through it; from then
++// on its keepalives go as usual.
++func (peer *Peer) hadHandshake() bool {
++	return peer.lastHandshakeNano.Load() != 0
++}
++
+ func (peer *Peer) Start() {
+ 	// should never start a peer on a closed device
+ 	if peer.device.isClosed() {
+diff --git a/device/uapi.go b/device/uapi.go
+index f041745..7953c38 100644
+--- a/device/uapi.go
++++ b/device/uapi.go
+@@ -281,7 +281,7 @@ func (peer *ipcSetPeer) handlePostConfig() {
+ 	}
+ 	if peer.device.isUp() {
+ 		peer.Start()
+-		if peer.pkaOn {
++		if peer.pkaOn && peer.hadHandshake() {
+ 			peer.SendKeepalive()
+ 		}
+ 		peer.SendStagedPackets()

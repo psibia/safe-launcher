@@ -15,7 +15,11 @@ public sealed class CoreConfigException : Exception
 }
 
 /// <summary>Управление ядром на 127.0.0.1: через него лаунчер проверяет серверы и видит соединения. Без ключа не пускает.</summary>
-public sealed record CoreApi(int Port, string Secret);
+/// <param name="CheckPort">
+/// Прокси на 127.0.0.1 для проверки подключений через работающее ядро (имя пользователя — tag подключения, пароль — ключ
+/// управления) или null — без него.
+/// </param>
+public sealed record CoreApi(int Port, string Secret, int? CheckPort = null);
 
 /// <summary>
 /// Собирает настройки ядра из запроса лаунчера. Служба работает от имени системы, поэтому всё, что приходит
@@ -28,6 +32,7 @@ public static class CoreConfigBuilder
     public const string DirectTag = "direct";
     public const string TagPrefix = "launcher:";
     public const string LocalDnsTag = "local";
+    public const string CheckInboundTag = "check-in";
 
     /// <summary>DNS-сервер, к которому приложения обращаются через своё подключение (по TCP, внутри туннеля).</summary>
     public const string RemoteDnsServer = "1.1.1.1";
@@ -52,6 +57,8 @@ public static class CoreConfigBuilder
     private const int MaxOutbounds = 64;
     private const int MaxApps = 256;
     private const int MaxDomainsPerApp = 1000;
+    private const int MaxProgramsPerApp = 32;
+    private const int MaxPathLength = 1024;
 
     /// <summary>Типы подключений, которые служба согласна запустить. WireGuard в ядре — endpoint, а не outbound.</summary>
     private static readonly HashSet<string> OutboundTypes = new(StringComparer.Ordinal)
@@ -63,7 +70,7 @@ public static class CoreConfigBuilder
 
     private static readonly HashSet<string> ReservedTags = new(StringComparer.OrdinalIgnoreCase)
     {
-        DirectTag, "tun-in", "dns", "block"
+        DirectTag, "tun-in", CheckInboundTag, "dns", "block"
     };
 
     private static readonly Regex TagPattern = new("^[A-Za-z0-9_-]{1,64}$", RegexOptions.CultureInvariant);
@@ -73,7 +80,11 @@ public static class CoreConfigBuilder
         RegexOptions.CultureInvariant);
 
     /// <param name="api">Адрес и ключ управления ядром для лаунчера (проверка серверов, список соединений); null — без него.</param>
-    public static JsonObject Build(CoreRequest request, CoreApi? api = null)
+    /// <param name="servicePrograms">
+    /// Программы служб Windows (пути): их процессы не трогаем, даже если они подходят под программы приложения
+    /// (<see cref="CoreAppRoute.Programs"/>). null — не проверять.
+    /// </param>
+    public static JsonObject Build(CoreRequest request, CoreApi? api = null, IReadOnlyCollection<string>? servicePrograms = null)
     {
         var outbounds = request.Outbounds ?? new List<JsonObject>();
         var apps = request.Apps ?? new List<CoreAppRoute>();
@@ -109,22 +120,45 @@ public static class CoreConfigBuilder
                 throw new CoreConfigException($"Подключение «{node["tag"]}» ссылается на неизвестное подключение.");
         }
 
+        if (request.DnsOutbound is not null && !tags.Contains(request.DnsOutbound))
+            throw new CoreConfigException($"Не найдено подключение «{request.DnsOutbound}» для DNS-запросов.");
+
         var rules = new JsonArray();
+        JsonObject? checkInbound = null;
+        if (api?.CheckPort is { } checkPort && tags.Count > 0)
+        {
+            // Проверка подключения через работающее ядро: вторая копия ядра с тем же ключом WireGuard отбила бы у этой
+            // связь с сервером. Прокси пускает только с ключом управления, имя пользователя выбирает подключение.
+            var checkTags = outboundList.Skip(1).Concat(endpointList).Select(o => (string)o!["tag"]!).ToList();
+            var secret = api.Secret;
+            checkInbound = new JsonObject
+            {
+                ["type"] = "mixed",
+                ["tag"] = CheckInboundTag,
+                ["listen"] = "127.0.0.1",
+                ["listen_port"] = checkPort,
+                ["users"] = new JsonArray(checkTags.Select(t => (JsonNode?)new JsonObject { ["username"] = t, ["password"] = secret }).ToArray())
+            };
+            foreach (var tag in checkTags)
+            {
+                rules.Add(new JsonObject
+                {
+                    ["inbound"] = new JsonArray(CheckInboundTag),
+                    ["auth_user"] = new JsonArray(tag),
+                    ["action"] = "route",
+                    ["outbound"] = tag
+                });
+            }
+
+            rules.Add(new JsonObject { ["inbound"] = new JsonArray(CheckInboundTag), ["action"] = "reject" });
+        }
+
         var dnsServers = new JsonArray(new JsonObject { ["type"] = "local", ["tag"] = LocalDnsTag });
         var dnsRules = new JsonArray();
         var dnsByOutbound = new Dictionary<string, string>(StringComparer.Ordinal);
-        if (apps.Count > 0)
-        {
-            // Имя сайта из TLS, HTTP и QUIC нужно для исключений по доменам. И соединение идёт к сайту по имени,
-            // а не по адресу, который вернул системный DNS: адрес ищет сервер подключения, подменённый ответ
-            // провайдера ничего не испортит. Чужой трафик не трогаем.
-            rules.Add(new JsonObject
-            {
-                ["process_path_regex"] = new JsonArray("^" + TagPrefix),
-                ["action"] = "sniff",
-                ["override_destination"] = true
-            });
-        }
+        // Правило распознавания имён сайтов встаёт сюда, когда известны программы приложений (ниже).
+        var sniffAt = rules.Count;
+        var sniffed = new List<string> { "^" + TagPrefix };
 
         if (request.HideDns)
         {
@@ -167,27 +201,22 @@ public static class CoreConfigBuilder
 
             var match = "^" + Regex.Escape(TagPrefix + app.Tag) + @"\|";
 
+            // Процессы программ приложения без метки (копия, запущенная мимо лаунчера, или процесс, о котором лаунчер
+            // не успел ответить ядру) идут так же, как приложение, или блокируются; без программ — напрямую.
+            var outside = OutsidePatterns(app, servicePrograms);
+            var same = app.BlockOutside ? new List<string>() : outside;
+            sniffed.AddRange(same.Where(p => !sniffed.Contains(p)));
+            JsonArray Matches() => new(new[] { match }.Concat(same).Select(p => (JsonNode?)JsonValue.Create(p)).ToArray());
+
             // Свои DNS-запросы приложения идут через его подключение: к DNS из файла подключения (корпоративный
             // WireGuard знает внутренние имена) или к 1.1.1.1. Провайдер их не видит.
-            if (!dnsByOutbound.TryGetValue(app.Outbound!, out var dnsTag))
-            {
-                dnsTag = "dns-" + app.Outbound;
-                dnsByOutbound[app.Outbound!] = dnsTag;
-                var own = OwnDnsServer(request, app.Outbound!);
-                dnsServers.Add(new JsonObject
-                {
-                    ["type"] = own is null ? "tcp" : "udp",
-                    ["tag"] = dnsTag,
-                    ["server"] = own ?? RemoteDnsServer,
-                    ["detour"] = app.Outbound
-                });
-            }
+            var dnsTag = DnsServer(app.Outbound!);
 
             if (domains.Count > 0)
             {
                 dnsRules.Add(new JsonObject
                 {
-                    ["process_path_regex"] = new JsonArray(match),
+                    ["process_path_regex"] = Matches(),
                     ["domain_suffix"] = new JsonArray(domains.Select(d => (JsonNode?)JsonValue.Create(d)).ToArray()),
                     ["action"] = "route",
                     ["server"] = LocalDnsTag
@@ -196,7 +225,7 @@ public static class CoreConfigBuilder
 
             dnsRules.Add(new JsonObject
             {
-                ["process_path_regex"] = new JsonArray(match),
+                ["process_path_regex"] = Matches(),
                 ["action"] = "route",
                 ["server"] = dnsTag
             });
@@ -205,7 +234,7 @@ public static class CoreConfigBuilder
             {
                 rules.Add(new JsonObject
                 {
-                    ["process_path_regex"] = new JsonArray(match),
+                    ["process_path_regex"] = Matches(),
                     ["domain_suffix"] = new JsonArray(domains.Select(d => (JsonNode?)JsonValue.Create(d)).ToArray()),
                     ["action"] = "route",
                     ["outbound"] = DirectTag
@@ -214,9 +243,31 @@ public static class CoreConfigBuilder
 
             rules.Add(new JsonObject
             {
-                ["process_path_regex"] = new JsonArray(match),
+                ["process_path_regex"] = Matches(),
                 ["action"] = "route",
                 ["outbound"] = app.Outbound
+            });
+
+            if (app.BlockOutside && outside.Count > 0)
+            {
+                rules.Add(new JsonObject
+                {
+                    ["process_path_regex"] = new JsonArray(outside.Select(p => (JsonNode?)JsonValue.Create(p)).ToArray()),
+                    ["action"] = "reject"
+                });
+            }
+        }
+
+        if (apps.Count > 0)
+        {
+            // Имя сайта из TLS, HTTP и QUIC нужно для исключений по доменам. И соединение идёт к сайту по имени,
+            // а не по адресу, который вернул системный DNS: адрес ищет сервер подключения, подменённый ответ
+            // провайдера ничего не испортит. Чужой трафик не трогаем.
+            rules.Insert(sniffAt, new JsonObject
+            {
+                ["process_path_regex"] = new JsonArray(sniffed.Select(p => (JsonNode?)JsonValue.Create(p)).ToArray()),
+                ["action"] = "sniff",
+                ["override_destination"] = true
             });
         }
 
@@ -260,6 +311,17 @@ public static class CoreConfigBuilder
                 // Короткая жизнь ответа: после выключения ядра программы быстро забудут подменные адреса.
                 ["rewrite_ttl"] = 1
             });
+            if (request.DnsOutbound is { } dnsOutbound)
+            {
+                // Остальные запросы (редкие типы записей: TXT, SRV, MX…) — к DNS-серверу подключения, которое выбрал
+                // лаунчер, через него, а не к DNS компьютера: так провайдер не видит и их.
+                dnsRules.Add(new JsonObject
+                {
+                    ["protocol"] = new JsonArray("dns"),
+                    ["action"] = "route",
+                    ["server"] = DnsServer(dnsOutbound)
+                });
+            }
         }
 
         var addresses = new JsonArray("172.31.250.1/30");
@@ -299,6 +361,8 @@ public static class CoreConfigBuilder
         };
         if (endpointList.Count > 0)
             config["endpoints"] = endpointList;
+        if (checkInbound is not null)
+            config["inbounds"]!.AsArray().Add(checkInbound);
         if (api is not null)
         {
             config["experimental"] = new JsonObject
@@ -312,6 +376,97 @@ public static class CoreConfigBuilder
         }
 
         return config;
+
+        // DNS-сервер внутри подключения, один на подключение: из файла подключения (по UDP) или 1.1.1.1 по TCP.
+        string DnsServer(string outbound)
+        {
+            if (dnsByOutbound.TryGetValue(outbound, out var tag))
+                return tag;
+            tag = "dns-" + outbound;
+            dnsByOutbound[outbound] = tag;
+            var own = OwnDnsServer(request, outbound);
+            dnsServers.Add(new JsonObject
+            {
+                ["type"] = own is null ? "tcp" : "udp",
+                ["tag"] = tag,
+                ["server"] = own ?? RemoteDnsServer,
+                ["detour"] = outbound
+            });
+            return tag;
+        }
+    }
+
+    /// <summary>
+    /// Шаблоны ядра (регулярные выражения Go, без учёта регистра) для путей процессов программ приложения без метки.
+    /// Программы Windows, её защитника и служб пропускаются: ядро ведёт трафик всего компьютера, а такие процессы —
+    /// не копии приложения, и закрывать или уводить в VPN их нельзя.
+    /// </summary>
+    private static List<string> OutsidePatterns(CoreAppRoute app, IReadOnlyCollection<string>? servicePrograms)
+    {
+        var result = new List<string>();
+        var programs = app.Programs ?? new List<CoreProgram>();
+        if (programs.Count > MaxProgramsPerApp)
+            throw new CoreConfigException($"Слишком много программ у приложения «{app.Tag}»: {programs.Count}.");
+        foreach (var program in programs)
+        {
+            var folder = program?.Folder?.TrimEnd('\\');
+            if (program is null || !IsFolder(folder) || !IsExeName(program.Name))
+                throw new CoreConfigException($"Недопустимая программа приложения «{app.Tag}»: «{program?.Folder}», «{program?.Name}».");
+            // Весь диск — слишком широко: так оказалась бы «копией» любая программа с тем же именем.
+            if (program.Subfolders && folder!.Length == 2 || IsSystemProgram(folder!, program.Name))
+                continue;
+
+            var pattern = "(?i)^" + GoQuote(folder + "\\") + (program.Subfolders ? @"(?:[^\\]+\\)*" : string.Empty) + GoQuote(program.Name) + "$";
+            if (result.Contains(pattern) ||
+                servicePrograms is not null && servicePrograms.Any(s => Regex.IsMatch(s, pattern, RegexOptions.CultureInvariant)))
+                continue;
+            result.Add(pattern);
+        }
+
+        return result;
+    }
+
+    /// <summary>Полный путь к папке на диске: «C:» или «C:\Папка\…», без «.», «..» и недопустимых знаков.</summary>
+    private static bool IsFolder(string? folder)
+    {
+        if (folder is null || folder.Length < 2 || folder.Length > MaxPathLength || !char.IsAsciiLetter(folder[0]) || folder[1] != ':')
+            return false;
+        if (folder.Length == 2)
+            return true;
+        if (folder[2] != '\\')
+            return false;
+        return folder[3..].Split('\\').All(IsFileName);
+    }
+
+    private static bool IsExeName(string? name) =>
+        IsFileName(name) && name!.Length > 4 && name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase);
+
+    private static bool IsFileName(string? name) =>
+        name is { Length: > 0 and <= 255 } && name != "." && name != ".." &&
+        name.All(c => c >= ' ' && c is not ('<' or '>' or ':' or '"' or '/' or '\\' or '|' or '?' or '*'));
+
+    /// <summary>Программа Windows или её защитника: в папке Windows, в общих папках (как у фильтров) или системная по имени.</summary>
+    private static bool IsSystemProgram(string folder, string name)
+    {
+        var windows = Environment.GetFolderPath(Environment.SpecialFolder.Windows) is { Length: > 0 } w ? w : @"C:\Windows";
+        return NetworkGuard.ProtectedNames.Contains(name) || Under(windows) || NetworkGuard.SharedFolders.Any(Under);
+
+        bool Under(string parent) =>
+            (folder + "\\").StartsWith(parent.TrimEnd('\\') + "\\", StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>Как regexp.QuoteMeta в Go: знаки синтаксиса выражений — с «\».</summary>
+    private static string GoQuote(string text)
+    {
+        var result = new System.Text.StringBuilder(text.Length + 8);
+        foreach (var c in text)
+        {
+            if (@"\.+*?()|[]{}^$".Contains(c))
+                result.Append('\\');
+            result.Append(c);
+        }
+
+        return result.ToString();
     }
 
     /// <summary>DNS-сервер внутри подключения, если лаунчер его передал (только IP-адрес, без порта и имён), иначе null.</summary>

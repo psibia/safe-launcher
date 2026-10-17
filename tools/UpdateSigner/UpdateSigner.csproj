@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- Подпись выпусков для обновления через службу (SafeLauncher.Logging\Updates\UpdatePackage.cs).
+       Его запускает installer\build-installer.cmd: создаёт ключ при первой сборке и подписывает готовый установщик. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\SafeLauncher.Logging\SafeLauncher.Logging.csproj" />
+  </ItemGroup>
+
+</Project>

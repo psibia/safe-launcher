@@ -4,6 +4,8 @@ using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Text;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -32,22 +34,26 @@ public static class Subscriptions
             throw new ConnectionParseException("Адрес подписки должен начинаться с https://.");
 
         using var client = handler is null ? new HttpClient() : new HttpClient(handler, disposeHandler: false);
-        client.Timeout = Timeout;
+        client.Timeout = System.Threading.Timeout.InfiniteTimeSpan;
         client.DefaultRequestHeaders.UserAgent.ParseAdd("SafeLauncher/2.1");
+        // Срок на всё скачивание: HttpClient.Timeout не касается чтения тела, и медленный сервер держал бы обновление вечно.
+        using var deadline = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+        deadline.CancelAfter(Timeout);
+        var token = deadline.Token;
         string body;
         try
         {
-            using var response = await client.GetAsync(url.Trim(), HttpCompletionOption.ResponseHeadersRead, cancellation).ConfigureAwait(false);
+            using var response = await client.GetAsync(url.Trim(), HttpCompletionOption.ResponseHeadersRead, token).ConfigureAwait(false);
             if (!response.IsSuccessStatusCode)
                 throw new ConnectionParseException($"Сервер подписки ответил ошибкой {(int)response.StatusCode}. Проверьте адрес или срок подписки.");
             if (response.Content.Headers.ContentLength > MaxBytes)
                 throw new ConnectionParseException("Подписка слишком большая.");
 
-            await using var stream = await response.Content.ReadAsStreamAsync(cancellation).ConfigureAwait(false);
+            await using var stream = await response.Content.ReadAsStreamAsync(token).ConfigureAwait(false);
             using var buffer = new MemoryStream();
             var chunk = new byte[81920];
             int read;
-            while ((read = await stream.ReadAsync(chunk, cancellation).ConfigureAwait(false)) > 0)
+            while ((read = await stream.ReadAsync(chunk, token).ConfigureAwait(false)) > 0)
             {
                 if (buffer.Length + read > MaxBytes)
                     throw new ConnectionParseException("Подписка слишком большая.");
@@ -60,9 +66,13 @@ public static class Subscriptions
         {
             throw new ConnectionParseException("Не удалось скачать подписку: " + ex.Message);
         }
-        catch (TaskCanceledException) when (!cancellation.IsCancellationRequested)
+        catch (IOException ex)
         {
-            throw new ConnectionParseException("Сервер подписки не ответил за 30 секунд.");
+            throw new ConnectionParseException("Не удалось скачать подписку: связь с сервером оборвалась (" + ex.Message + ").");
+        }
+        catch (OperationCanceledException) when (!cancellation.IsCancellationRequested)
+        {
+            throw new ConnectionParseException("Сервер подписки не отдал её за 30 секунд.");
         }
 
         return Parse(body);
@@ -114,11 +124,29 @@ public static class Subscriptions
             : "В подписке не нашлось серверов.");
     }
 
-    /// <summary>Сервер без названия после «#»: по нему запоминается выбор, даже если провайдер переименовал сервер.</summary>
+    /// <summary>
+    /// Сервер без названия после «#»: по нему запоминается выбор, даже если провайдер переименовал сервер. У vmess в виде
+    /// base64 от JSON название внутри («ps»): ключ — поля JSON без него.
+    /// </summary>
     public static string ServerKey(string link)
     {
         var hash = link.IndexOf('#');
-        return (hash >= 0 ? link[..hash] : link).Trim();
+        var key = (hash >= 0 ? link[..hash] : link).Trim();
+        if (!key.StartsWith("vmess://", StringComparison.OrdinalIgnoreCase) || ConnectionLinks.TryBase64(key[8..]) is not { } json ||
+            !json.TrimStart().StartsWith('{'))
+            return key;
+        try
+        {
+            if (JsonNode.Parse(json) is not JsonObject fields)
+                return key;
+            fields.Remove("ps");
+            return "vmess://" + string.Join("&", fields.OrderBy(f => f.Key, StringComparer.Ordinal)
+                .Select(f => f.Key + "=" + (f.Value is JsonValue value && value.TryGetValue<string>(out var text) ? text : f.Value?.ToJsonString())));
+        }
+        catch (JsonException)
+        {
+            return key;
+        }
     }
 
     /// <summary>Выбранный сервер подписки: сохранённый, если он ещё есть в списке, иначе первый.</summary>

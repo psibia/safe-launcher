@@ -15,7 +15,10 @@ public enum NetworkPlanKind
     LauncherConnection,
 
     /// <summary>Подключение лаунчера не выбрано или удалено: приложение запускать нельзя, пока его не выберут.</summary>
-    MissingConnection
+    MissingConnection,
+
+    /// <summary>Без сети: фильтр Windows пускает программы приложения только внутри компьютера, VPN не нужен.</summary>
+    Offline
 }
 
 /// <summary>Откуда взята сетевая настройка приложения: из общих настроек или из его собственных.</summary>
@@ -32,14 +35,14 @@ public enum NetworkPlanSource
 public sealed class NetworkPlan
 {
     private NetworkPlan(NetworkPlanKind kind, NetworkPlanSource source, VpnRule? adapterRule, VpnConnection? connection,
-        bool requireVpn, bool closeOnDrop, IReadOnlyList<string> directDomains)
+        bool closeOnDrop, OutsideCopies outsideCopies, IReadOnlyList<string> directDomains)
     {
         Kind = kind;
         Source = source;
         AdapterRule = adapterRule;
         Connection = connection;
-        RequireVpn = requireVpn;
         CloseOnDrop = closeOnDrop;
+        OutsideCopies = outsideCopies;
         DirectDomains = directDomains;
     }
 
@@ -54,23 +57,31 @@ public sealed class NetworkPlan
     /// <summary>Подключение для <see cref="NetworkPlanKind.LauncherConnection"/>, иначе null.</summary>
     public VpnConnection? Connection { get; }
 
-    /// <summary>«Не запускать без VPN».</summary>
-    public bool RequireVpn { get; }
-
     /// <summary>«Закрывать при обрыве».</summary>
     public bool CloseOnDrop { get; }
+
+    /// <summary>
+    /// Копии приложения, запущенные мимо лаунчера. «Через лаунчер» действует для всех приложений, остальное — только когда
+    /// трафик ведёт ядро лаунчера.
+    /// </summary>
+    public OutsideCopies OutsideCopies { get; }
 
     /// <summary>Домены, которые идут мимо подключения лаунчера. Пусто, если трафик ведёт не лаунчер.</summary>
     public IReadOnlyList<string> DirectDomains { get; }
 
     /// <summary>Трафик приложения ведёт ядро лаунчера (или должно вести, но подключение не выбрано).</summary>
-    public bool UsesLauncherCore => Kind != NetworkPlanKind.SystemAdapters;
+    public bool UsesLauncherCore => Kind is NetworkPlanKind.LauncherConnection or NetworkPlanKind.MissingConnection;
 
-    public static NetworkPlan For(AppEntry app, AppSettings settings)
+    /// <param name="offlineRun">Приложение запущено разово без сети («Запустить без сети» в меню плитки).</param>
+    public static NetworkPlan For(AppEntry app, AppSettings settings, bool offlineRun = false)
     {
         var network = app.Network ?? new AppNetwork();
-        var requireVpn = Resolve(network.RequireVpn, settings.RequireVpn);
         var closeOnDrop = Resolve(network.CloseOnDrop, settings.KillSwitchEnabled);
+        var outsideCopies = Resolve(network.OutsideCopies, settings.OutsideCopies);
+
+        // Без сети обрывать нечего: Kill-Switch не нужен.
+        if (offlineRun || network.Mode == AppNetworkMode.Offline)
+            return new NetworkPlan(NetworkPlanKind.Offline, NetworkPlanSource.App, null, null, false, outsideCopies, Array.Empty<string>());
 
         switch (network.Mode)
         {
@@ -87,16 +98,16 @@ public sealed class NetworkPlan
         }
 
         NetworkPlan Adapters(NetworkPlanSource source, VpnRule rule) =>
-            new(NetworkPlanKind.SystemAdapters, source, rule, null, requireVpn, closeOnDrop, Array.Empty<string>());
+            new(NetworkPlanKind.SystemAdapters, source, rule, null, closeOnDrop, outsideCopies, Array.Empty<string>());
 
         NetworkPlan Launcher(NetworkPlanSource source, Guid? connectionId)
         {
             var connection = connectionId is { } id ? settings.Connections.FirstOrDefault(c => c.Id == id) : null;
             var domains = (network.DirectDomains ?? new List<string>()).ToArray();
-            // Своё подключение без ядра невозможно, поэтому без подключения запуск запрещён, что бы ни стояло в «Не запускать без VPN».
+            // Своё подключение без ядра невозможно, поэтому без подключения запуск запрещён.
             return connection is null
-                ? new NetworkPlan(NetworkPlanKind.MissingConnection, source, null, null, true, closeOnDrop, domains)
-                : new NetworkPlan(NetworkPlanKind.LauncherConnection, source, null, connection, requireVpn, closeOnDrop, domains);
+                ? new NetworkPlan(NetworkPlanKind.MissingConnection, source, null, null, closeOnDrop, outsideCopies, domains)
+                : new NetworkPlan(NetworkPlanKind.LauncherConnection, source, null, connection, closeOnDrop, outsideCopies, domains);
         }
     }
 
@@ -117,6 +128,16 @@ public sealed class NetworkPlan
     {
         ProtectionOverride.On => true,
         ProtectionOverride.Off => false,
+        _ => global
+    };
+
+    /// <summary>Значение «Если открыто не из лаунчера» у приложения: своё или из общих настроек.</summary>
+    public static OutsideCopies Resolve(OutsideCopiesOverride value, OutsideCopies global) => value switch
+    {
+        OutsideCopiesOverride.Vpn => OutsideCopies.Vpn,
+        OutsideCopiesOverride.Block => OutsideCopies.Block,
+        OutsideCopiesOverride.Allow => OutsideCopies.Allow,
+        OutsideCopiesOverride.Launcher => OutsideCopies.Launcher,
         _ => global
     };
 }

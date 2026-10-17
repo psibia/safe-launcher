@@ -25,6 +25,10 @@ namespace SafeLauncher.Service;
 internal sealed class ControlServer : IDisposable
 {
     private static readonly Regex OwnerPipePattern = new("^SafeLauncher-Owner-[0-9a-f]{32}$", RegexOptions.CultureInvariant);
+
+    /// <summary>Адрес «127.0.0.1:порт» в строке журнала ядра.</summary>
+    private static readonly Regex LoopbackPort = new(@"127\.0\.0\.1:(\d{1,5})(?!\d)", RegexOptions.CultureInvariant);
+
     private static readonly TimeSpan ReadyTimeout = TimeSpan.FromSeconds(30);
     private static readonly TimeSpan GracefulStop = TimeSpan.FromSeconds(8);
 
@@ -35,6 +39,9 @@ internal sealed class ControlServer : IDisposable
     private readonly object _ownerSync = new();
     private readonly HashSet<Session> _active = new();
     private Session? _owner;
+
+    /// <summary>Принято обновление лаунчера: работает помощник установки, ядро не запускается (<see cref="Update"/>).</summary>
+    private bool _updating;
 
     public ControlServer(CoreRunner core, NetworkGuard guard, Action<string> log)
     {
@@ -194,7 +201,7 @@ internal sealed class ControlServer : IDisposable
 
                 case ControlProtocol.OpGuard:
                 {
-                    var error = _guard.Set(session, message.Guard, out var notice, out var unguarded);
+                    var error = _guard.Set(session, session.Sid, message.Guard, out var notice, out var unguarded);
                     ServiceLog.Write(error is null ? LogLevel.Info : LogLevel.Error, LogAreas.Control, error is null ? LogCodes.CmdGuard : LogCodes.GuardFail, message.Cid,
                         $"guard от PID {session.ClientPid}: {DescribeGuard(message.Guard)}; {(error ?? "применено")}" +
                         (notice is null ? string.Empty : "; предупреждение: " + notice) +
@@ -203,6 +210,19 @@ internal sealed class ControlServer : IDisposable
                     return error is null
                         ? new ControlReply { Id = message.Id, Ok = true, Warning = notice, Unguarded = unguarded.Count > 0 ? unguarded : null }
                         : new ControlReply { Id = message.Id, Ok = false, Error = "Не удалось включить блокировку трафика мимо VPN: " + error + "." };
+                }
+
+                case ControlProtocol.OpUpdate:
+                    return Update(session, message);
+
+                case ControlProtocol.OpUpdateStarted:
+                {
+                    var error = UpdateRunner.ConfirmStarted(message.Update?.JobId, session.ClientPid);
+                    ServiceLog.Write(error is null ? LogLevel.Info : LogLevel.Warn, LogAreas.Update, error is null ? LogCodes.UpdateInstall : LogCodes.UpdateFail, message.Cid,
+                        $"updateStarted от PID {session.ClientPid}: {error ?? "новая версия лаунчера запустилась"}");
+                    return error is null
+                        ? new ControlReply { Id = message.Id, Ok = true }
+                        : new ControlReply { Id = message.Id, Ok = false, Error = error };
                 }
 
                 default:
@@ -275,10 +295,18 @@ internal sealed class ControlServer : IDisposable
         if (message.Request is null)
             return new ControlReply { Id = message.Id, Ok = false, Error = "Не переданы настройки ядра." };
 
-        var api = new CoreApi(FreeLoopbackPort(), Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant());
-        var config = CoreConfigBuilder.Build(message.Request, api).ToJsonString();
+        // Программы служб Windows нужны, только если лаунчер передал программы приложений (их процессы без метки).
+        var servicePrograms = message.Request.Apps?.Any(a => a?.Programs is { Count: > 0 }) == true ? NetworkGuard.ServicePrograms() : null;
+        var api = NewApi();
+        var config = CoreConfigBuilder.Build(message.Request, api, servicePrograms).ToJsonString();
         lock (_ownerSync)
         {
+            if (_updating)
+            {
+                ServiceLog.Warn(LogAreas.Control, LogCodes.CmdReject, message.Cid, $"start от PID {session.ClientPid}: устанавливается обновление");
+                return new ControlReply { Id = message.Id, Ok = false, Error = "Устанавливается обновление лаунчера: подключение запустится после него." };
+            }
+
             if (_owner is not null && !ReferenceEquals(_owner, session) && _core.IsRunning)
             {
                 ServiceLog.Warn(LogAreas.Control, LogCodes.CmdReject, message.Cid, $"start от PID {session.ClientPid}: ядро занято лаунчером PID {_owner.ClientPid}");
@@ -290,13 +318,27 @@ internal sealed class ControlServer : IDisposable
             StopCore("новые настройки от лаунчера, перезапуск", message.Cid);
             _owner = session;
             ServiceLog.CoreOwner(session.Sid, session.ClientPid, owns: true);
-            ServiceLog.CoreStarting(message.Request, config, api, message.Cid,
-                (restart ? "перезапуск" : "запуск") + $" по команде лаунчера PID {session.ClientPid}");
+            var reason = (restart ? "перезапуск" : "запуск") + $" по команде лаунчера PID {session.ClientPid}";
+            ServiceLog.CoreStarting(message.Request, config, api, message.Cid, reason);
             var watch = Stopwatch.StartNew();
             int pid;
             try
             {
-                pid = _core.Start(config, message.OwnerPipe, session.ClientPid, ReadyTimeout);
+                try
+                {
+                    pid = _core.Start(config, message.OwnerPipe, session.ClientPid, ReadyTimeout);
+                }
+                catch (CoreStartException ex) when (PortTaken(ex.Log, api))
+                {
+                    // Свободный порт выбран заранее, и до запуска ядра его успела занять другая программа: ещё раз с новыми.
+                    ServiceLog.Warn(LogAreas.Core, LogCodes.CoreFail, message.Cid,
+                        $"Порт управления ядром занят другой программой ({ex.Message}): повторный запуск с другими портами");
+                    api = NewApi();
+                    config = CoreConfigBuilder.Build(message.Request, api, servicePrograms).ToJsonString();
+                    ServiceLog.CoreStarting(message.Request, config, api, message.Cid, reason + ", повторно с другими портами");
+                    watch.Restart();
+                    pid = _core.Start(config, message.OwnerPipe, session.ClientPid, ReadyTimeout);
+                }
             }
             catch
             {
@@ -316,10 +358,73 @@ internal sealed class ControlServer : IDisposable
                 CorePid = pid,
                 ApiPort = api.Port,
                 ApiSecret = api.Secret,
+                CheckPort = api.CheckPort,
                 Protocol = ControlProtocol.Revision
             };
         }
     }
+
+    /// <summary>
+    /// Обновление лаунчера (<see cref="UpdateRunner"/>): только когда ядро остановлено. Служба проверяет и сохраняет всё нужное
+    /// и запускает помощника, который начнёт установку, когда лаунчер закроется. Пока помощник работает, ядро не запускается.
+    /// </summary>
+    private ControlReply Update(Session session, ControlMessage message)
+    {
+        if (message.Update is null)
+            return new ControlReply { Id = message.Id, Ok = false, Error = "Не переданы файлы обновления." };
+
+        lock (_ownerSync)
+        {
+            string? busy = _updating ? "Обновление уже устанавливается."
+                : _core.IsRunning ? "Ядро ещё работает: сначала остановите подключение лаунчера."
+                : null;
+            if (busy is not null)
+            {
+                ServiceLog.Warn(LogAreas.Update, LogCodes.UpdateFail, message.Cid, $"update от PID {session.ClientPid} отклонено: {busy}");
+                return new ControlReply { Id = message.Id, Ok = false, Error = busy };
+            }
+
+            _updating = true;
+        }
+
+        try
+        {
+            var version = UpdateRunner.Prepare(message.Update, session.ClientPid, message.Cid, out var helper);
+            // Помощник закончил (или отменил установку, не дождавшись лаунчера) — ядро снова можно запускать.
+            helper.EnableRaisingEvents = true;
+            helper.Exited += (_, _) =>
+            {
+                lock (_ownerSync)
+                    _updating = false;
+                helper.Dispose();
+            };
+            return new ControlReply { Id = message.Id, Ok = true, Version = version.ToString(3) };
+        }
+        catch (Exception ex)
+        {
+            lock (_ownerSync)
+                _updating = false;
+            var error = ex is UpdateRejectedException ? ex.Message : "Служба не смогла подготовить обновление: " + ex.Message;
+            ServiceLog.Warn(LogAreas.Update, LogCodes.UpdateFail, message.Cid, $"update от PID {session.ClientPid} отклонено: {error}");
+            return new ControlReply { Id = message.Id, Ok = false, Error = error };
+        }
+    }
+
+    /// <summary>Порт управления ядром и порт проверки подключений через ядро: свободные и разные; ключ — свой на каждый запуск.</summary>
+    private static CoreApi NewApi()
+    {
+        var apiPort = FreeLoopbackPort();
+        int checkPort;
+        do
+            checkPort = FreeLoopbackPort();
+        while (checkPort == apiPort);
+        return new CoreApi(apiPort, Convert.ToHexString(RandomNumberGenerator.GetBytes(32)).ToLowerInvariant(), checkPort);
+    }
+
+    /// <summary>Ядро не запустилось, потому что не смогло занять один из своих портов на 127.0.0.1 (строка «listen tcp … bind: …»).</summary>
+    internal static bool PortTaken(IReadOnlyList<string> log, CoreApi api) =>
+        log.Any(line => line.Contains("bind", StringComparison.OrdinalIgnoreCase) &&
+                        LoopbackPort.Matches(line).Any(m => int.TryParse(m.Groups[1].Value, out var port) && (port == api.Port || port == api.CheckPort)));
 
     private static int FreeLoopbackPort()
     {
@@ -330,7 +435,10 @@ internal sealed class ControlServer : IDisposable
         return port;
     }
 
-    /// <summary>Лаунчер отключился: его ядро останавливается, его фильтры снимаются.</summary>
+    /// <summary>
+    /// Лаунчер отключился: его ядро останавливается, фильтры снимаются. Остаётся только скрытие DNS для приложений,
+    /// которые работают и без лаунчера (<see cref="NetworkGuard.Release"/>).
+    /// </summary>
     private void Release(Session session)
     {
         bool last;
@@ -352,7 +460,7 @@ internal sealed class ControlServer : IDisposable
             last = _active.Remove(session) && _active.Count == 0;
         }
 
-        _guard.Remove(session);
+        _guard.Release(session);
         if (session.Active)
         {
             ServiceLog.Info(LogAreas.Control, LogCodes.ClientDisconnect, null, $"Лаунчер PID {session.ClientPid} отключился");
@@ -362,7 +470,7 @@ internal sealed class ControlServer : IDisposable
             ServiceLog.AllClientsGone();
     }
 
-    private void OnCoreExited(int exitCode, System.Collections.Generic.IReadOnlyList<string> log)
+    private void OnCoreExited(int exitCode, System.Collections.Generic.IReadOnlyList<string> log, int pid)
     {
         _log($"Ядро завершилось само, код {exitCode}");
         ServiceLog.CoreGone();
@@ -373,7 +481,11 @@ internal sealed class ControlServer : IDisposable
             owner = _owner;
         try
         {
-            owner?.Send(new ControlReply { Event = ControlProtocol.EventCoreExited, Ok = false, ExitCode = exitCode, Log = new(log) });
+            // PID: событие о прежнем ядре может прийти, когда лаунчер уже запустил новое.
+            owner?.Send(new ControlReply
+            {
+                Event = ControlProtocol.EventCoreExited, Ok = false, ExitCode = exitCode, Log = new(log), CorePid = pid > 0 ? pid : null
+            });
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException)
         {

@@ -16,7 +16,7 @@ public interface IGuardBackend : IDisposable
     /// <summary>Заменить набор фильтров. Возвращает замечание службы и непроверенные пути. Ошибка — <see cref="CoreServiceException"/>.</summary>
     Task<GuardReply> ApplyAsync(GuardRequest request, CancellationToken cancellation);
 
-    /// <summary>Связь со службой пропала: её фильтры сняты. Любой поток.</summary>
+    /// <summary>Связь со службой пропала (служба упала или перезапускается): набор нужно отправить заново. Любой поток.</summary>
     event Action? Lost;
 }
 
@@ -88,7 +88,7 @@ public sealed class ServiceGuardBackend : IGuardBackend
         lock (_sync)
         {
             _disposed = true;
-            _client?.Dispose(); // служба снимет фильтры этого соединения
+            _client?.Dispose(); // служба снимет фильтры этого соединения (кроме скрытия DNS, см. SafeLauncher.Service/GuardSets.cs)
             _client = null;
         }
     }
@@ -98,8 +98,9 @@ public sealed class ServiceGuardBackend : IGuardBackend
 /// Блокировка трафика мимо VPN: держит в службе актуальный набор фильтров Windows (какие программы пускать в сеть
 /// только через VPN). Набор собирает лаунчер (<see cref="Submit"/>) при запуске приложений, появлении их процессов
 /// и изменении VPN; отправляется он в фоне, последний побеждает. Перед запуском приложения набор ставится сразу
-/// (<see cref="ApplyNowAsync"/>), и без него приложение не запускается. Связь со службой пропала — фильтры служба
-/// уже сняла, набор отправляется заново. Лаунчер закрылся — служба снимает фильтры сама.
+/// (<see cref="ApplyNowAsync"/>), и без него приложение не запускается. Связь со службой пропала — набор отправляется
+/// заново (после сбоя служба до этого держит прежние фильтры). Лаунчер закрылся — служба снимает фильтры сама, оставляя
+/// только скрытие DNS для приложений, которые работают и без лаунчера.
 /// </summary>
 public sealed class VpnGuard : IDisposable
 {
@@ -369,12 +370,12 @@ public sealed class VpnGuard : IDisposable
 
     private void OnLost()
     {
-        TechLog.Warn(LogAreas.Guard, LogCodes.GuardFail, "Связь со службой для фильтров пропала: служба сняла фильтры, набор отправляется заново");
+        TechLog.Warn(LogAreas.Guard, LogCodes.GuardFail, "Связь со службой для фильтров пропала: набор отправляется заново");
         IGuardBackend? backend;
         lock (_state)
         {
             backend = _backend;
-            _appliedKey = null; // служба сняла фильтры этого соединения
+            _appliedKey = null; // что сейчас в службе — неизвестно: отправим снова
         }
 
         if (backend is not null)
@@ -411,7 +412,7 @@ public sealed class VpnGuard : IDisposable
         if (backend is not null)
         {
             backend.Lost -= OnLost;
-            backend.Dispose(); // служба снимает фильтры, как только закрывается связь
+            backend.Dispose(); // служба снимает фильтры, как только закрывается связь (кроме скрытия DNS, пока работают приложения)
         }
     }
 }

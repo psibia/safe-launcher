@@ -45,7 +45,6 @@ public class SettingsMigrationTests
 
             Assert.Equal(SettingsStorage.CurrentVersion, settings.SettingsVersion);
             Assert.False(settings.KillSwitchEnabled);
-            Assert.True(settings.RequireVpn);
             Assert.Equal(GlobalNetworkMode.SystemVpn, settings.NetworkMode);
             Assert.Equal(VpnRuleMode.AnyOfSelected, settings.RuleMode);
             Assert.Equal(new[] { "WireGuard" }, settings.SelectedAdapters);
@@ -57,8 +56,8 @@ public class SettingsMigrationTests
             foreach (var app in settings.Apps)
             {
                 Assert.Equal(AppNetworkMode.Inherit, app.Network.Mode);
-                Assert.Equal(ProtectionOverride.Inherit, app.Network.RequireVpn);
                 Assert.Equal(ProtectionOverride.Inherit, app.Network.CloseOnDrop);
+                Assert.Equal(OutsideCopiesOverride.Inherit, app.Network.OutsideCopies);
                 Assert.Empty(app.Network.DirectDomains);
             }
         }
@@ -80,7 +79,6 @@ public class SettingsMigrationTests
                 Assert.Equal(NetworkPlanSource.Global, plan.Source);
                 Assert.Equal(VpnRuleMode.AnyOfSelected, plan.AdapterRule!.Mode);
                 Assert.Contains("wireguard", plan.AdapterRule.SelectedAdapters, StringComparer.OrdinalIgnoreCase);
-                Assert.True(plan.RequireVpn);
                 Assert.False(plan.CloseOnDrop);
                 Assert.False(plan.UsesLauncherCore);
             }
@@ -112,8 +110,37 @@ public class SettingsMigrationTests
         var settings = new SettingsStorage(dir.File("settings.json")).Load();
 
         Assert.Equal(SettingsStorage.CurrentVersion, settings.SettingsVersion);
-        Assert.True(settings.RequireVpn);
         Assert.Equal(GlobalNetworkMode.SystemVpn, settings.NetworkMode);
+    }
+
+    [Fact]
+    public void RemovedOptions_IgnoredOnLoad_AndDroppedOnSave()
+    {
+        // До 2.3.1 «Не запускать без VPN», «Блокировать трафик мимо VPN» и «Если ядро VPN упало» можно было выключить.
+        // Теперь защита включена всегда: старые значения не мешают загрузке и при сохранении пропадают из файла.
+        using var dir = new TempDir();
+        var storage = new SettingsStorage(dir.File("settings.json"));
+        File.WriteAllText(storage.FilePath, """
+            {
+              "SettingsVersion": 1,
+              "KillSwitchEnabled": false,
+              "RequireVpn": false,
+              "BlockBypass": false,
+              "CoreCrash": "CloseApps",
+              "Apps": [ { "Name": "Discord", "ExePath": "C:\\Apps\\Discord.exe", "Network": { "RequireVpn": "Off", "CloseOnDrop": "On" } } ]
+            }
+            """);
+
+        var settings = storage.Load();
+        storage.Save(settings);
+        var json = File.ReadAllText(storage.FilePath);
+
+        Assert.False(settings.KillSwitchEnabled);
+        Assert.Equal(ProtectionOverride.On, Assert.Single(settings.Apps).Network.CloseOnDrop);
+        Assert.False(File.Exists(storage.FilePath + ".broken"));
+        Assert.DoesNotContain("RequireVpn", json);
+        Assert.DoesNotContain("BlockBypass", json);
+        Assert.DoesNotContain("CoreCrash", json);
     }
 
     [Fact]
@@ -139,6 +166,19 @@ public class SettingsMigrationTests
     }
 
     [Fact]
+    public void OfflineMode_SurvivesSaveAndLoad()
+    {
+        using var dir = new TempDir();
+        var storage = new SettingsStorage(dir.File("settings.json"));
+        storage.Save(new AppSettings
+        {
+            Apps = new List<AppEntry> { new() { Name = "Игра", ExePath = @"C:\Games\Game.exe", Network = new AppNetwork { Mode = AppNetworkMode.Offline } } }
+        });
+
+        Assert.Equal(AppNetworkMode.Offline, Assert.Single(storage.Load().Apps).Network.Mode);
+    }
+
+    [Fact]
     public void NetworkSettings_SurviveSaveAndLoad()
     {
         using var dir = new TempDir();
@@ -151,8 +191,8 @@ public class SettingsMigrationTests
             {
                 Mode = AppNetworkMode.OwnConnection,
                 ConnectionId = connection.Id,
-                RequireVpn = ProtectionOverride.Off,
                 CloseOnDrop = ProtectionOverride.On,
+                OutsideCopies = OutsideCopiesOverride.Block,
                 DirectDomains = new List<string> { "cdn.discordapp.com" }
             }
         };
@@ -165,7 +205,6 @@ public class SettingsMigrationTests
         {
             NetworkMode = GlobalNetworkMode.LauncherConnection,
             ConnectionId = connection.Id,
-            RequireVpn = false,
             Connections = new List<VpnConnection> { connection },
             Apps = new List<AppEntry> { app, other }
         });
@@ -174,7 +213,6 @@ public class SettingsMigrationTests
 
         Assert.Equal(GlobalNetworkMode.LauncherConnection, loaded.NetworkMode);
         Assert.Equal(connection.Id, loaded.ConnectionId);
-        Assert.False(loaded.RequireVpn);
         var savedConnection = Assert.Single(loaded.Connections);
         Assert.Equal("Мой прокси", savedConnection.Name);
         Assert.Equal(ConnectionKind.LocalProxy, savedConnection.Kind);
@@ -185,8 +223,8 @@ public class SettingsMigrationTests
         var network = loaded.Apps[0].Network;
         Assert.Equal(AppNetworkMode.OwnConnection, network.Mode);
         Assert.Equal(connection.Id, network.ConnectionId);
-        Assert.Equal(ProtectionOverride.Off, network.RequireVpn);
         Assert.Equal(ProtectionOverride.On, network.CloseOnDrop);
+        Assert.Equal(OutsideCopiesOverride.Block, network.OutsideCopies);
         Assert.Equal(new[] { "cdn.discordapp.com" }, network.DirectDomains);
 
         Assert.Equal(AppNetworkMode.OwnAdapters, loaded.Apps[1].Network.Mode);
@@ -222,6 +260,41 @@ public class NetworkPlanTests
         var app = new AppEntry { Name = "Discord" };
         setup?.Invoke(app.Network);
         return app;
+    }
+
+    [Fact]
+    public void Offline_NeedsNeitherVpnNorCore()
+    {
+        var settings = Settings(s =>
+        {
+            s.NetworkMode = GlobalNetworkMode.LauncherConnection;
+            s.ConnectionId = Shared.Id;
+            s.KillSwitchEnabled = true;
+        });
+
+        var plan = NetworkPlan.For(App(n => n.Mode = AppNetworkMode.Offline), settings);
+
+        Assert.Equal(NetworkPlanKind.Offline, plan.Kind);
+        Assert.False(plan.UsesLauncherCore);
+        Assert.False(plan.CloseOnDrop);
+        Assert.Null(plan.Connection);
+        Assert.Null(plan.AdapterRule);
+    }
+
+    [Fact]
+    public void OfflineRun_OverridesAnyCondition()
+    {
+        var settings = Settings(s =>
+        {
+            s.NetworkMode = GlobalNetworkMode.LauncherConnection;
+            s.ConnectionId = Shared.Id;
+        });
+        var app = App(n => n.Mode = AppNetworkMode.OwnAdapters);
+
+        Assert.Equal(NetworkPlanKind.SystemAdapters, NetworkPlan.For(app, settings).Kind);
+        Assert.Equal(NetworkPlanKind.Offline, NetworkPlan.For(app, settings, offlineRun: true).Kind);
+        Assert.Equal(NetworkPlanKind.LauncherConnection, NetworkPlan.For(App(), settings).Kind);
+        Assert.Equal(NetworkPlanKind.Offline, NetworkPlan.For(App(), settings, offlineRun: true).Kind);
     }
 
     [Fact]
@@ -285,17 +358,15 @@ public class NetworkPlanTests
     }
 
     [Fact]
-    public void DeletedConnection_BlocksLaunch_EvenWithRequireVpnOff()
+    public void DeletedConnection_BlocksLaunch()
     {
         var plan = NetworkPlan.For(App(n =>
         {
             n.Mode = AppNetworkMode.OwnConnection;
             n.ConnectionId = Guid.NewGuid();
-            n.RequireVpn = ProtectionOverride.Off;
         }), Settings());
 
         Assert.Equal(NetworkPlanKind.MissingConnection, plan.Kind);
-        Assert.True(plan.RequireVpn);
         Assert.True(plan.UsesLauncherCore);
     }
 
@@ -315,20 +386,29 @@ public class NetworkPlanTests
     [InlineData(ProtectionOverride.Off, true, false)]
     public void Protection_OverridesGlobal(ProtectionOverride value, bool global, bool expected)
     {
-        var settings = Settings(s =>
-        {
-            s.KillSwitchEnabled = global;
-            s.RequireVpn = global;
-        });
+        var settings = Settings(s => s.KillSwitchEnabled = global);
 
-        var plan = NetworkPlan.For(App(n =>
-        {
-            n.CloseOnDrop = value;
-            n.RequireVpn = value;
-        }), settings);
+        var plan = NetworkPlan.For(App(n => n.CloseOnDrop = value), settings);
 
         Assert.Equal(expected, plan.CloseOnDrop);
-        Assert.Equal(expected, plan.RequireVpn);
+    }
+
+    [Theory]
+    [InlineData(OutsideCopiesOverride.Inherit, OutsideCopies.Block, OutsideCopies.Block)]
+    [InlineData(OutsideCopiesOverride.Inherit, OutsideCopies.Allow, OutsideCopies.Allow)]
+    [InlineData(OutsideCopiesOverride.Vpn, OutsideCopies.Block, OutsideCopies.Vpn)]
+    [InlineData(OutsideCopiesOverride.Block, OutsideCopies.Vpn, OutsideCopies.Block)]
+    [InlineData(OutsideCopiesOverride.Allow, OutsideCopies.Vpn, OutsideCopies.Allow)]
+    [InlineData(OutsideCopiesOverride.Inherit, OutsideCopies.Launcher, OutsideCopies.Launcher)]
+    [InlineData(OutsideCopiesOverride.Launcher, OutsideCopies.Vpn, OutsideCopies.Launcher)]
+    [InlineData(OutsideCopiesOverride.Vpn, OutsideCopies.Launcher, OutsideCopies.Vpn)]
+    public void OutsideCopies_OverridesGlobal(OutsideCopiesOverride value, OutsideCopies global, OutsideCopies expected)
+    {
+        var settings = Settings(s => s.OutsideCopies = global);
+
+        var plan = NetworkPlan.For(App(n => n.OutsideCopies = value), settings);
+
+        Assert.Equal(expected, plan.OutsideCopies);
     }
 
     [Fact]

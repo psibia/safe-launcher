@@ -24,8 +24,7 @@ public static class SettingsSnapshot
         var d = new Dictionary<string, string>(StringComparer.Ordinal)
         {
             ["Kill-Switch"] = Yes(s.KillSwitchEnabled),
-            ["Не запускать без VPN"] = Yes(s.RequireVpn),
-            ["Блокировать трафик мимо VPN"] = Yes(s.BlockBypass),
+            ["Копии приложений мимо лаунчера"] = s.OutsideCopies.ToString(),
             ["Скрывать DNS-запросы"] = Yes(s.HideDns),
             ["Как понимать, что VPN есть"] = s.NetworkMode.ToString(),
             ["Общее подключение"] = Conn(s.ConnectionId),
@@ -45,10 +44,11 @@ public static class SettingsSnapshot
             {
                 AppNetworkMode.OwnAdapters => "свои адаптеры (" + n.RuleMode + ": " + string.Join(", ", n.SelectedAdapters) + ")",
                 AppNetworkMode.OwnConnection => "свое подключение " + Conn(n.ConnectionId),
+                AppNetworkMode.Offline => "без сети",
                 _ => "как в общих"
             };
-            d[p + "не запускать без VPN"] = n.RequireVpn.ToString();
             d[p + "закрывать при обрыве"] = n.CloseOnDrop.ToString();
+            d[p + "копии мимо лаунчера"] = n.OutsideCopies.ToString();
             d[p + "исключения доменов"] = n.DirectDomains.Count.ToString();
             d[p + "журнал DNS"] = Yes(app.TrackDns);
         }
@@ -112,8 +112,8 @@ public static class SettingsSnapshot
                 ["plan"] = plan.Kind.ToString(),
                 ["planSource"] = plan.Source.ToString(),
                 ["connection"] = plan.Connection is { } c ? CorePlan.ConnectionTag(c.Id) : null,
-                ["requireVpn"] = plan.RequireVpn,
                 ["closeOnDrop"] = plan.CloseOnDrop,
+                ["outsideCopies"] = app.Network.OutsideCopies.ToString(),
                 ["trackDns"] = app.TrackDns,
                 ["directDomains"] = new JsonArray(app.Network.DirectDomains.Select(x => (JsonNode)JsonValue.Create(x)!).ToArray()),
                 ["adapters"] = new JsonArray(app.Network.SelectedAdapters.Select(x => (JsonNode)JsonValue.Create(x)!).ToArray())
@@ -157,8 +157,7 @@ public static class SettingsSnapshot
         return new JsonObject
         {
             ["killSwitch"] = s.KillSwitchEnabled,
-            ["requireVpn"] = s.RequireVpn,
-            ["blockBypass"] = s.BlockBypass,
+            ["outsideCopies"] = s.OutsideCopies.ToString(),
             ["hideDns"] = s.HideDns,
             ["networkMode"] = s.NetworkMode.ToString(),
             ["connection"] = s.ConnectionId is { } id ? CorePlan.ConnectionTag(id) : null,

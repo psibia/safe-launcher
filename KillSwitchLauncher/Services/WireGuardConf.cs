@@ -8,18 +8,12 @@ using System.Text.Json.Nodes;
 namespace KillSwitchLauncher.Services;
 
 /// <summary>
-/// Файл .conf WireGuard (как его выдают провайдеры и программа WireGuard для Windows) → подключение ядра.
-/// Берётся один сервер ([Peer]). DNS из файла (первый адрес, который доступен через туннель) ядро использует для имён
+/// Файл .conf WireGuard или AmneziaWG (как его выдают провайдеры и программы WireGuard, AmneziaWG и AmneziaVPN) → подключение
+/// ядра. Берётся один сервер ([Peer]). DNS из файла (первый адрес, который доступен через туннель) ядро использует для имён
 /// приложения — через туннель: корпоративный сервер знает внутренние имена, а провайдер запросов не видит.
 /// </summary>
 public static class WireGuardConf
 {
-    /// <summary>Поля AmneziaWG: в обычном WireGuard их нет, и ядро такие серверы не поддерживает.</summary>
-    private static readonly HashSet<string> AmneziaKeys = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5"
-    };
-
     /// <summary>Похож ли текст на файл WireGuard.</summary>
     public static bool LooksLikeConf(string? text) =>
         text is not null && text.Contains("[Interface]", StringComparison.OrdinalIgnoreCase) && text.Contains("[Peer]", StringComparison.OrdinalIgnoreCase);
@@ -71,8 +65,9 @@ public static class WireGuardConf
             throw new ConnectionParseException("В файле WireGuard несколько серверов ([Peer]). Лаунчер поддерживает файл с одним сервером.");
         var peer = peers[0];
 
-        if (iface.Keys.Concat(peer.Keys).Any(AmneziaKeys.Contains))
-            throw new ConnectionParseException("Это файл AmneziaWG: ядро лаунчера его не поддерживает. Подойдёт обычный WireGuard или другой протокол.");
+        if (peer.Keys.FirstOrDefault(AmneziaConf.IsKey) is { } misplaced)
+            throw new ConnectionParseException($"В файле AmneziaWG параметр {misplaced} стоит в разделе [Peer], а должен быть в [Interface].");
+        var amnezia = AmneziaConf.Parse(iface);
 
         var privateKey = Key(iface, "PrivateKey", "закрытого ключа (PrivateKey)");
         var publicKey = Key(peer, "PublicKey", "открытого ключа сервера (PublicKey)");
@@ -97,8 +92,19 @@ public static class WireGuardConf
         };
         if (peer.TryGetValue("PresharedKey", out var psk) && psk.Length > 0)
             peerJson["pre_shared_key"] = Key(peer, "PresharedKey", "общего ключа (PresharedKey)");
-        if (peer.TryGetValue("PersistentKeepalive", out var keepalive) && int.TryParse(keepalive, out var seconds) && seconds is > 0 and <= 65535)
-            peerJson["persistent_keepalive_interval"] = seconds;
+        if (peer.TryGetValue("PersistentKeepalive", out var keepalive))
+        {
+            if (int.TryParse(keepalive, out var seconds) && seconds is > 0 and <= 65535)
+                peerJson["persistent_keepalive_interval"] = seconds;
+            // AmneziaWG: «20-30» — каждый раз случайный интервал из диапазона.
+            else if (AmneziaConf.Range(keepalive) is { Hi: > 0 and <= 65535 } range)
+            {
+                if (range.Lo == range.Hi)
+                    peerJson["persistent_keepalive_interval"] = (int)range.Lo;
+                else
+                    peerJson["persistent_keepalive_range"] = AmneziaConf.RangeText(range);
+            }
+        }
 
         var outbound = new JsonObject
         {
@@ -109,9 +115,28 @@ public static class WireGuardConf
         };
         if (iface.TryGetValue("MTU", out var mtuText) && int.TryParse(mtuText, NumberStyles.None, CultureInfo.InvariantCulture, out var mtu) && mtu is >= 576 and <= 9000)
             outbound["mtu"] = mtu;
+        if (amnezia is not null)
+            outbound["amnezia"] = amnezia;
 
         var title = !string.IsNullOrWhiteSpace(name) ? name : !string.IsNullOrWhiteSpace(fallbackName) ? fallbackName.Trim() : $"{host}:{port}";
-        return new ParsedServer("WireGuard", title, host, port, "", outbound, TunnelDns(iface, allowed));
+        return new ParsedServer(amnezia is null ? "WireGuard" : "AmneziaWG", title, host, port, "", outbound, TunnelDns(iface, allowed));
+    }
+
+    /// <summary>«AmneziaWG», если в тексте файла есть параметры AmneziaWG, иначе «WireGuard»: так подключение называется, даже если файл не читается.</summary>
+    public static string ProtocolName(string? text)
+    {
+        foreach (var rawLine in (text ?? string.Empty).Split('\n'))
+        {
+            var line = rawLine.Trim();
+            var hash = line.IndexOf('#');
+            if (hash >= 0)
+                line = line[..hash];
+            var eq = line.IndexOf('=');
+            if (eq > 0 && line[(eq + 1)..].Trim().Length > 0 && AmneziaConf.IsKey(line[..eq].Trim()))
+                return "AmneziaWG";
+        }
+
+        return "WireGuard";
     }
 
     /// <summary>

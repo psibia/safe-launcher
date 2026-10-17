@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Threading;
@@ -146,6 +147,98 @@ public class ProcessTrackerTests : IDisposable
         Assert.True(relaunched.WaitForExit(5000), "Без VPN приложение должно закрываться сразу после запуска");
         Assert.True(blocked.Wait(TimeSpan.FromSeconds(5)));
         Assert.Equal("Тестовое приложение", blockedName);
+    }
+
+    // ---------------------------------------------------------------- «Через лаунчер»
+
+    [Fact]
+    public void ViaLauncher_CopyOfIdleApp_BecomesItsLaunch()
+    {
+        // Приложение не запущено, его открыли с ярлыка: лаунчер берёт копию под контроль, как запуск с плитки.
+        using var tracker = new ProcessTracker { LaunchCheck = _ => null };
+        var entry = Entry();
+        var launched = new List<Guid>();
+        tracker.OutsideLaunched += (appId, _) =>
+        {
+            lock (launched)
+                launched.Add(appId);
+        };
+        tracker.SetPolicy(entry, viaCore: false, killOnClose: true, adoptOutside: true);
+        Assert.True(tracker.AdoptsCopies(entry.Id));
+
+        using var external = TestAppProcess.StartExternal();
+
+        Assert.True(Wait.Until(() => tracker.CountFor(entry.Id) == 1, Timeout), "Копию нужно взять под контроль");
+        Assert.True(Wait.Until(() =>
+        {
+            lock (launched)
+                return launched.Count == 1;
+        }, Timeout));
+        Assert.Equal(entry.Id, launched[0]);
+
+        var report = tracker.KillAll(blockRelaunch: false);
+
+        Assert.Single(report.Killed);
+        Assert.True(external.WaitForExit(5000), "Kill-Switch закрывает копию так же, как приложение, запущенное с плитки");
+    }
+
+    [Fact]
+    public void ViaLauncher_CopyWhenLaunchIsNotAllowed_IsClosedAndReported()
+    {
+        // Как запуск с плитки без VPN: копия сразу закрывается, а лаунчер сообщает почему.
+        using var tracker = new ProcessTracker { LaunchCheck = _ => "VPN не подключён", AdoptGrace = TimeSpan.Zero };
+        var entry = Entry();
+        using var rejected = new ManualResetEventSlim();
+        string? reason = null;
+        tracker.OutsideRejected += (_, why) =>
+        {
+            reason = why;
+            rejected.Set();
+        };
+        tracker.SetPolicy(entry, viaCore: false, killOnClose: true, adoptOutside: true);
+        Thread.Sleep(100);
+
+        using var external = TestAppProcess.StartExternal();
+
+        Assert.True(external.WaitForExit(5000), "Копию нужно закрыть сразу");
+        Assert.True(rejected.Wait(TimeSpan.FromSeconds(5)));
+        Assert.Equal("VPN не подключён", reason);
+        Assert.Equal(0, tracker.CountFor(entry.Id));
+    }
+
+    [Fact]
+    public void ViaLauncher_CopyOpenedBefore_WaitsForLaunchCondition()
+    {
+        // Копия открыта раньше, чем выбрали «Через лаунчер» (или до открытия лаунчера): её не закрывают, а берут под контроль,
+        // когда приложение можно будет запустить.
+        string? refusal = "VPN не подключён";
+        using var external = TestAppProcess.StartExternal();
+        Thread.Sleep(100);
+        using var tracker = new ProcessTracker { LaunchCheck = _ => Volatile.Read(ref refusal), AdoptGrace = TimeSpan.Zero };
+        var entry = Entry();
+        tracker.SetPolicy(entry, viaCore: false, killOnClose: true, adoptOutside: true);
+
+        Assert.False(external.WaitForExit(3000), "Копию, открытую раньше, закрывать нельзя");
+        Assert.Equal(0, tracker.CountFor(entry.Id));
+
+        Volatile.Write(ref refusal, null);
+
+        Assert.True(Wait.Until(() => tracker.CountFor(entry.Id) == 1, Timeout), "Когда условие выполнено, копию нужно взять под контроль");
+    }
+
+    [Fact]
+    public void ViaLauncher_AppViaLauncherConnection_CopyIsTakenNotCounted()
+    {
+        // Через подключение лаунчера копия без «Через лаунчер» только считается, а с ним берётся под контроль.
+        using var tracker = new ProcessTracker { LaunchCheck = _ => null };
+        var entry = Entry();
+        tracker.SetPolicy(entry, viaCore: true, killOnClose: true, adoptOutside: true);
+
+        using var external = TestAppProcess.StartExternal();
+
+        Assert.True(Wait.Until(() => tracker.CountFor(entry.Id) == 1, Timeout));
+        Thread.Sleep(2500); // копия мимо лаунчера считается, когда работает дольше 2 секунд
+        Assert.Equal(0, tracker.OutsideFor(entry.Id));
     }
 
     [Fact]

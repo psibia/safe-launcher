@@ -214,7 +214,7 @@ public class VpnGuardTests
         });
 
         Assert.Null(await guard.ApplyNowAsync(Request()));
-        backends[0].RaiseLost(); // служба перезапустилась: её фильтры сняты
+        backends[0].RaiseLost(); // служба перезапустилась: набор нужно отправить заново
 
         await Until(() =>
         {

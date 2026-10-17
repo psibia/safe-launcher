@@ -9,7 +9,6 @@ namespace SafeLauncher.Service;
 /// </summary>
 internal static class Wfp
 {
-    public const uint SessionFlagDynamic = 0x1;
     public const uint RpcAuthnDefault = 0xFFFFFFFF;
 
     public const uint MatchEqual = 0;
@@ -130,6 +129,20 @@ internal static class Wfp
 
     [DllImport("fwpuclnt.dll")]
     public static extern uint FwpmFilterDeleteById0(IntPtr engineHandle, ulong id);
+
+    [DllImport("fwpuclnt.dll")]
+    public static extern uint FwpmSubLayerDeleteByKey0(IntPtr engineHandle, ref Guid key);
+
+    /// <summary>Перебор фильтров; шаблон IntPtr.Zero — все фильтры всех уровней.</summary>
+    [DllImport("fwpuclnt.dll")]
+    public static extern uint FwpmFilterCreateEnumHandle0(IntPtr engineHandle, IntPtr enumTemplate, out IntPtr enumHandle);
+
+    /// <summary>Следующая порция: массив указателей на FWPM_FILTER0, освобождается FwpmFreeMemory0.</summary>
+    [DllImport("fwpuclnt.dll")]
+    public static extern uint FwpmFilterEnum0(IntPtr engineHandle, IntPtr enumHandle, uint numEntriesRequested, out IntPtr entries, out uint numEntriesReturned);
+
+    [DllImport("fwpuclnt.dll")]
+    public static extern uint FwpmFilterDestroyEnumHandle0(IntPtr engineHandle, IntPtr enumHandle);
 
     [DllImport("fwpuclnt.dll")]
     public static extern uint FwpmTransactionBegin0(IntPtr engineHandle, uint flags);

@@ -6,6 +6,7 @@ using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using System.Text.Unicode;
+using System.Threading;
 using KillSwitchLauncher.Models;
 
 namespace KillSwitchLauncher.Services;
@@ -22,7 +23,7 @@ public sealed class SettingsStorage
     {
         WriteIndented = true,
         Encoder = JavaScriptEncoder.Create(UnicodeRanges.All), // русские названия в файле читаются как есть, а не \u0420…
-        Converters = { new JsonStringEnumConverter() }
+        Converters = { new TolerantEnumConverter() }
     };
 
     public SettingsStorage()
@@ -35,14 +36,30 @@ public sealed class SettingsStorage
 
     public string FilePath { get; }
 
+    /// <summary>
+    /// Почему файл настроек не прочитан (занят другой программой, нет доступа); null — прочитан или его не было. Тогда
+    /// лаунчер работает с чистыми настройками и не сохраняет их, чтобы не затереть настоящие.
+    /// </summary>
+    public string? LoadProblem { get; private set; }
+
     public AppSettings Load()
     {
+        LoadProblem = null;
+        string json;
         try
         {
             if (!File.Exists(FilePath))
                 return Migrate(new AppSettings());
+            json = ReadWithRetry();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            LoadProblem = ex.Message;
+            return Migrate(new AppSettings());
+        }
 
-            var json = File.ReadAllText(FilePath);
+        try
+        {
             var settings = JsonSerializer.Deserialize<AppSettings>(json, JsonOptions) ?? new AppSettings();
             if (settings.SettingsVersion < CurrentVersion)
             {
@@ -61,6 +78,8 @@ public sealed class SettingsStorage
 
     public void Save(AppSettings settings)
     {
+        if (LoadProblem is not null)
+            return; // настоящие настройки не прочитаны: чистые не должны их затереть
         Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
 
         // Пишем во временный файл и подменяем, чтобы при сбое не остался обрезанный JSON.
@@ -104,6 +123,51 @@ public sealed class SettingsStorage
 
         settings.SettingsVersion = Math.Max(settings.SettingsVersion, CurrentVersion);
         return settings;
+    }
+
+    /// <summary>Файл бывает ненадолго занят антивирусом или синхронизацией: несколько попыток.</summary>
+    private string ReadWithRetry()
+    {
+        for (var attempt = 1; ; attempt++)
+        {
+            try
+            {
+                return File.ReadAllText(FilePath);
+            }
+            catch (IOException) when (attempt < 10 && File.Exists(FilePath))
+            {
+                Thread.Sleep(300);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Значения перечислений по имени. Незнакомое имя (файл от более новой версии лаунчера или правленный вручную) даёт
+    /// значение по умолчанию, а не считает повреждённым весь файл.
+    /// </summary>
+    private sealed class TolerantEnumConverter : JsonConverterFactory
+    {
+        public override bool CanConvert(Type typeToConvert) => typeToConvert.IsEnum;
+
+        public override JsonConverter CreateConverter(Type typeToConvert, JsonSerializerOptions options) =>
+            (JsonConverter)Activator.CreateInstance(typeof(Converter<>).MakeGenericType(typeToConvert))!;
+
+        private sealed class Converter<T> : JsonConverter<T> where T : struct, Enum
+        {
+            public override T Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
+            {
+                if (reader.TokenType == JsonTokenType.String && Enum.TryParse<T>(reader.GetString(), ignoreCase: true, out var named) &&
+                    Enum.IsDefined(named))
+                    return named;
+                if (reader.TokenType == JsonTokenType.Number && reader.TryGetInt32(out var number) && Enum.IsDefined(typeof(T), number))
+                    return (T)Enum.ToObject(typeof(T), number);
+                reader.Skip();
+                return default;
+            }
+
+            public override void Write(Utf8JsonWriter writer, T value, JsonSerializerOptions options) =>
+                writer.WriteStringValue(value.ToString());
+        }
     }
 
     private void TryBackup(string suffix)

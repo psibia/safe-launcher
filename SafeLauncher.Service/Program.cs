@@ -41,6 +41,10 @@ internal static class Program
                     return 0;
                 case "--console":
                     return RunInConsole();
+                case UpdateRunner.ApplyArgument:
+                    // Помощник обновления (копия службы SafeLauncher.Updater.exe, его запускает служба): Ctrl+C не для него.
+                    _ignoreCtrlC = PosixSignalRegistration.Create(PosixSignal.SIGINT, context => context.Cancel = true);
+                    return UpdateRunner.Apply(args.Length > 1 ? args[1] : string.Empty);
             }
         }
         catch (Exception ex)

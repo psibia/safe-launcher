@@ -284,10 +284,24 @@ internal static class ServiceLog
         var types = request.Outbounds
             .Select(o => (o["type"]?.GetValue<string>() ?? "?") + " " + (o["tag"]?.GetValue<string>() ?? "?"))
             .ToList();
-        var apps = request.Apps.Select(a => a.Tag + "→" + a.Outbound + (a.DirectDomains.Count > 0 ? $" (исключений {a.DirectDomains.Count})" : string.Empty));
+        var apps = request.Apps.Select(a => a.Tag + "→" + a.Outbound + Details(a));
         return $"подключений {request.Outbounds.Count} [{string.Join(", ", types)}], приложений {request.Apps.Count} [{string.Join(", ", apps)}], " +
                $"IPv6 {(request.Ipv6 ? "да" : "нет")}, скрывать DNS {(request.HideDns ? "да" : "нет")}" +
-               (request.OutboundDns is { Count: > 0 } dns ? $", DNS в подключениях {dns.Count}" : string.Empty);
+               (request.OutboundDns is { Count: > 0 } dns ? $", DNS в подключениях {dns.Count}" : string.Empty) +
+               (request.HideDns && request.DnsOutbound is { } via ? $", редкие DNS-запросы через {via}" : string.Empty) +
+               (request.Apps.Any(a => a.Programs is { Count: > 0 })
+                   ? ", процессы программ без метки " + (request.Apps.Any(a => a.BlockOutside) ? "блокируются" : "через подключение приложения")
+                   : string.Empty);
+
+        static string Details(CoreAppRoute app)
+        {
+            var parts = new List<string>();
+            if (app.DirectDomains.Count > 0)
+                parts.Add($"исключений {app.DirectDomains.Count}");
+            if (app.Programs is { Count: > 0 } programs)
+                parts.Add($"программ {programs.Count}");
+            return parts.Count > 0 ? " (" + string.Join(", ", parts) + ")" : string.Empty;
+        }
     }
 
     // ---- сеансы (кто какие периоды может читать) ----

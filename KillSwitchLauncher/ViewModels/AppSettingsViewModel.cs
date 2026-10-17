@@ -60,8 +60,8 @@ public sealed class AppSettingsViewModel : ObservableObject
     private VpnRuleMode _ruleMode;
     private Guid? _connectionId;
     private bool _isAddTab;
-    private ProtectionOverride _requireVpn;
     private ProtectionOverride _closeOnDrop;
+    private OutsideCopiesOverride _outsideCopies;
     private string _domainsText;
     private bool _trackDns;
     private string _arguments;
@@ -87,8 +87,8 @@ public sealed class AppSettingsViewModel : ObservableObject
         _mode = network.Mode;
         _ruleMode = network.RuleMode;
         _connectionId = network.ConnectionId;
-        _requireVpn = network.RequireVpn;
         _closeOnDrop = network.CloseOnDrop;
+        _outsideCopies = network.OutsideCopies;
         _domainsText = string.Join(Environment.NewLine, network.DirectDomains ?? new List<string>());
         _trackDns = entry.TrackDns;
         _arguments = entry.Arguments ?? string.Empty;
@@ -157,9 +157,10 @@ public sealed class AppSettingsViewModel : ObservableObject
             OnPropertyChanged(nameof(IsInherit));
             OnPropertyChanged(nameof(IsOwnAdapters));
             OnPropertyChanged(nameof(IsOwnConnection));
+            OnPropertyChanged(nameof(IsOffline));
             OnPropertyChanged(nameof(UsesLauncherCore));
             OnPropertyChanged(nameof(CloseOnDropHint));
-            OnPropertyChanged(nameof(RequireVpnHint));
+            OnPropertyChanged(nameof(OutsideCopiesHint));
             OnPropertyChanged(nameof(DomainsHint));
             OnChanged();
         }
@@ -168,6 +169,9 @@ public sealed class AppSettingsViewModel : ObservableObject
     public bool IsInherit => Mode == AppNetworkMode.Inherit;
     public bool IsOwnAdapters => Mode == AppNetworkMode.OwnAdapters;
     public bool IsOwnConnection => Mode == AppNetworkMode.OwnConnection;
+
+    /// <summary>«Без сети»: защита и исключения не нужны, на странице скрыты.</summary>
+    public bool IsOffline => Mode == AppNetworkMode.Offline;
 
     /// <summary>Что сейчас выбрано в общих настройках: подпись под «Как в общих».</summary>
     public string InheritText => _settings.NetworkMode == GlobalNetworkMode.LauncherConnection
@@ -235,16 +239,6 @@ public sealed class AppSettingsViewModel : ObservableObject
 
     // ---------------------------------------------------------------- защита
 
-    public ProtectionOverride RequireVpn
-    {
-        get => _requireVpn;
-        set
-        {
-            if (SetField(ref _requireVpn, value))
-                OnChanged();
-        }
-    }
-
     public ProtectionOverride CloseOnDrop
     {
         get => _closeOnDrop;
@@ -252,10 +246,11 @@ public sealed class AppSettingsViewModel : ObservableObject
         {
             if (_closeOnDrop == value) return;
 
-            // Под системным VPN выключенный Kill-Switch оставляет приложение в сети без VPN: только с подтверждением.
+            // Под системным VPN выключенный Kill-Switch оставляет приложение открытым без сети: только с подтверждением.
             if (value == ProtectionOverride.Off && !UsesLauncherCore && !_dialogs.Confirm(
                     $"Выключить Kill-Switch для «{Name}»?",
-                    "При обрыве VPN приложение продолжит работать без защиты. Это может привести к утечке данных.",
+                    "При обрыве VPN приложение не закроется: пока VPN не вернётся, оно останется без сети. Запросы, которые " +
+                    "за него делает Windows (имена сайтов, фоновые загрузки), в это время могут идти мимо VPN.",
                     "Выключить", destructive: true))
             {
                 // Вернуть переключатель (асинхронно, чтобы привязка успела завершить запись).
@@ -269,17 +264,45 @@ public sealed class AppSettingsViewModel : ObservableObject
         }
     }
 
-    public string RequireVpnInheritText => $"Как в общих ({(_settings.RequireVpn ? "вкл" : "выкл")})";
-
     public string CloseOnDropInheritText => $"Как в общих ({(_settings.KillSwitchEnabled ? "вкл" : "выкл")})";
 
-    public string RequireVpnHint => UsesLauncherCore
-        ? "Перед запуском лаунчер проверит, что сервер подключения отвечает. Трафик приложения в любом случае идёт только через подключение."
-        : "Приложение не запустится, пока VPN не подключён.";
-
     public string CloseOnDropHint => UsesLauncherCore
-        ? "Если сервер перестал отвечать: закрыть приложение или оставить его без сети до возвращения связи. Мимо подключения трафик не уйдёт в обоих случаях."
-        : "Если VPN отключился, приложение закроется. Без этого оно продолжит работать без VPN.";
+        ? "Закрыть приложение, если сервер подключения перестал отвечать. Иначе оно останется без интернета, пока связь не вернётся."
+        : "Закрыть приложение, если VPN отключился. Иначе оно останется без интернета, пока VPN не вернётся.";
+
+    /// <summary>
+    /// «Если открыто не из лаунчера»: с ярлыка, из автозагрузки, из другой программы. «Через лаунчер» — для всех приложений,
+    /// остальное только для подключения лаунчера.
+    /// </summary>
+    public OutsideCopiesOverride OutsideCopies
+    {
+        get => _outsideCopies;
+        set
+        {
+            if (!SetField(ref _outsideCopies, value)) return;
+            OnPropertyChanged(nameof(OutsideCopiesHint));
+            OnChanged();
+        }
+    }
+
+    public string OutsideCopiesInheritText => _settings.OutsideCopies switch
+    {
+        Models.OutsideCopies.Block => "Как в общих (без интернета)",
+        Models.OutsideCopies.Allow => "Как в общих (напрямую)",
+        Models.OutsideCopies.Launcher => "Как в общих (через лаунчер)",
+        _ => "Как в общих (через VPN)"
+    };
+
+    public string OutsideCopiesHint => NetworkPlan.Resolve(OutsideCopies, _settings.OutsideCopies) switch
+    {
+        Models.OutsideCopies.Launcher => "Лаунчер берёт его под контроль так же, как при запуске с плитки: с теми же условиями и защитой. " +
+                                         "Если запускать приложение сейчас нельзя, например без VPN, оно сразу закроется. Действует, пока открыт лаунчер.",
+        _ when !UsesLauncherCore => "«Через VPN», «Без интернета» и «Напрямую» действуют только для подключения лаунчера: у этого приложения " +
+                                    "такая копия работает как обычная программа.",
+        Models.OutsideCopies.Block => "У него нет интернета, пока открыт лаунчер.",
+        Models.OutsideCopies.Allow => "Его трафик идёт мимо VPN. Изредка так же может уйти и соединение приложения, открытого из лаунчера.",
+        _ => "Его трафик идёт через подключение приложения, пока открыт лаунчер."
+    };
 
     // ---------------------------------------------------------------- исключения, DNS, запуск
 
@@ -351,8 +374,8 @@ public sealed class AppSettingsViewModel : ObservableObject
         network.RuleMode = RuleMode;
         network.SelectedAdapters = Adapters.Where(a => a.IsSelected).Select(a => a.Name).ToList();
         network.ConnectionId = ConnectionId;
-        network.RequireVpn = RequireVpn;
         network.CloseOnDrop = CloseOnDrop;
+        network.OutsideCopies = OutsideCopies;
         network.DirectDomains = DomainList.Normalize(SplitLines(DomainsText));
     }
 
@@ -418,7 +441,7 @@ public sealed class AppSettingsViewModel : ObservableObject
 
     private string Signature() => string.Join("|",
         Name.Trim(), Mode, RuleMode, string.Join(",", Adapters.Where(a => a.IsSelected).Select(a => a.Name)),
-        ConnectionId, RequireVpn, CloseOnDrop, string.Join(",", SplitLines(DomainsText)), TrackDns, Arguments.Trim());
+        ConnectionId, CloseOnDrop, OutsideCopies, string.Join(",", SplitLines(DomainsText)), TrackDns, Arguments.Trim());
 
     private static IEnumerable<string> SplitLines(string text) =>
         text.Split(new[] { '\n', '\r', ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);

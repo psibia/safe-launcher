@@ -122,6 +122,10 @@ internal sealed class CollectorDnsSource : IDnsEventSource
 
         var security = new PipeSecurity();
         security.AddAccessRule(new PipeAccessRule(WindowsIdentity.GetCurrent().User!, PipeAccessRights.FullControl, AccessControlType.Allow));
+        // Если в окне UAC ввели пароль другой учётной записи администратора, помощник работает от её имени. Кто подключился,
+        // проверяется по PID помощника.
+        security.AddAccessRule(new PipeAccessRule(new SecurityIdentifier(WellKnownSidType.BuiltinAdministratorsSid, null),
+            PipeAccessRights.ReadWrite, AccessControlType.Allow));
         var pipe = NamedPipeServerStreamAcl.Create(pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
             PipeOptions.Asynchronous, 0, 0, security);
 

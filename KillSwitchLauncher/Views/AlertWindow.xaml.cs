@@ -115,6 +115,51 @@ public partial class AlertWindow : Window
         return choice;
     }
 
+    /// <summary>
+    /// Окно ключа лицензии при запуске лаунчера (см. License). Возвращает подошедший ключ или null, если нажали «Выйти».
+    /// Пока ключ не подошёл, окно не закрывается и показывает, что не так.
+    /// </summary>
+    public static string? AskLicenseKey(System.Func<string, bool> isValid, bool hasKnownKeys)
+    {
+        var alert = new AlertWindow(AlertKind.Info, "Ключ лицензии",
+            "Лаунчер работает по ключу лицензии. Введите ключ, который вам выдали. На этом компьютере его спрашивают один раз.");
+        alert.IconGlyph.Glyph = "\uE8D7";
+        alert.ShowInTaskbar = true;
+        alert.InputHost.Visibility = Visibility.Visible;
+        alert.InputText.Tag = "XXXXX-XXXXX-XXXXX-XXXXX-XXXXX";
+        alert.InputText.TextChanged += (_, _) => alert.InputError.Visibility = Visibility.Collapsed;
+
+        string? accepted = null;
+        alert.AddButton("Выйти", "SecondaryButton", result: false, isDefault: false, isCancel: true);
+        var next = alert.CreateButton("Продолжить", "PrimaryButton", isDefault: true, isCancel: false);
+        next.Click += (_, _) =>
+        {
+            var key = alert.InputText.Text;
+            if (isValid(key))
+            {
+                accepted = key;
+                alert.DialogResult = true;
+                return;
+            }
+
+            alert.InputError.Text = hasKnownKeys
+                ? "Ключ не подошёл. Проверьте, что он введён полностью и латинскими буквами: пять групп по пять знаков через дефис."
+                : "В эту сборку лаунчера не встроены ключи лицензии: при сборке не было файла installer\\license-hashes.txt.";
+            alert.InputError.Visibility = Visibility.Visible;
+            alert.InputText.Focus();
+            alert.InputText.SelectAll();
+        };
+        alert.ButtonsHost.Children.Add(next);
+        alert.Loaded += (_, _) =>
+        {
+            alert.Activate();
+            alert.InputText.Focus();
+        };
+
+        alert.ShowWithOwner(null);
+        return accepted;
+    }
+
     private void AddChoice(string text, string styleKey, bool isDefault, System.Action onClick)
     {
         AddButton(text, styleKey, result: true, isDefault, isCancel: false);
@@ -176,19 +221,21 @@ public partial class AlertWindow : Window
 
     private void AddButton(string text, string styleKey, bool result, bool isDefault, bool isCancel)
     {
-        var button = new Button
-        {
-            Content = text,
-            Padding = new Thickness(20, 9, 20, 9),
-            Margin = new Thickness(10, 0, 0, 0),
-            MinWidth = 104,
-            IsDefault = isDefault,
-            IsCancel = isCancel,
-            Style = (Style)FindResource(styleKey)
-        };
+        var button = CreateButton(text, styleKey, isDefault, isCancel);
         button.Click += (_, _) => DialogResult = result;
         ButtonsHost.Children.Add(button);
     }
+
+    private Button CreateButton(string text, string styleKey, bool isDefault, bool isCancel) => new()
+    {
+        Content = text,
+        Padding = new Thickness(20, 9, 20, 9),
+        Margin = new Thickness(10, 0, 0, 0),
+        MinWidth = 104,
+        IsDefault = isDefault,
+        IsCancel = isCancel,
+        Style = (Style)FindResource(styleKey)
+    };
 
     private bool? ShowWithOwner(Window? owner)
     {

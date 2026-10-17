@@ -22,10 +22,36 @@ namespace KillSwitchLauncher.Services;
 /// </summary>
 public sealed record ConnectionCheck(bool Ok, int? LatencyMs, string? Ip, string? CountryCode, string? Country, string? Error, IReadOnlyList<string> Log);
 
+/// <summary>Прокси работающего ядра для проверки подключений: порт на 127.0.0.1 и ключ, свои на каждый запуск ядра.</summary>
+public sealed record CoreCheckProxy(int Port, string Secret);
+
+/// <summary>Проверка через работающее ядро: его прокси и метка подключения в ядре (имя пользователя прокси).</summary>
+public sealed record CoreCheckRoute(CoreCheckProxy Proxy, string Tag);
+
+/// <summary>Прокси через подключение лаунчера (<see cref="ConnectionTester.OpenProxyAsync"/>). Dispose закрывает копию ядра, если она своя.</summary>
+public sealed class ConnectionProxy : IDisposable
+{
+    private readonly WebProxy _proxy;
+    private Action? _stop;
+
+    internal ConnectionProxy(WebProxy proxy, Action? stop)
+    {
+        _proxy = proxy;
+        _stop = stop;
+    }
+
+    /// <summary>Обработчик запросов через этот прокси (освобождает вызывающий).</summary>
+    public HttpMessageHandler CreateHandler() => new HttpClientHandler { Proxy = _proxy, UseProxy = true };
+
+    public void Dispose() => Interlocked.Exchange(ref _stop, null)?.Invoke();
+}
+
 /// <summary>
 /// Проверка подключения без влияния на работу компьютера: отдельная копия ядра (launcher-core.exe) с правами пользователя,
 /// без адаптера, только прокси на 127.0.0.1, за которым стоит проверяемый сервер. Через этот прокси лаунчер открывает
 /// маленькую страницу (задержка) и узнаёт свой внешний адрес и страну.
+/// WireGuard, который уже работает в ядре службы, проверяется через само ядро (<see cref="CoreCheckRoute"/>): второй
+/// туннель с тем же ключом отбил бы у ядра связь с сервером.
 /// </summary>
 public sealed class ConnectionTester
 {
@@ -54,13 +80,17 @@ public sealed class ConnectionTester
         _traceUrl = traceUrl;
     }
 
-    public async Task<ConnectionCheck> CheckAsync(JsonObject server, CancellationToken cancellation = default)
+    /// <param name="viaCore">Проверять через работающее ядро (см. <see cref="LauncherNetwork.CheckRouteFor"/>); null — отдельной копией.</param>
+    public async Task<ConnectionCheck> CheckAsync(JsonObject server, CoreCheckRoute? viaCore = null, CancellationToken cancellation = default)
     {
         using var operation = TechLog.CurrentCid is null ? TechLog.Begin(out _) : null;
         var watch = Stopwatch.StartNew();
         TechLog.Info(LogAreas.Check, LogCodes.CheckStart,
-            $"Проверка подключения: {(string?)server["type"] ?? "?"}, сервер {(string?)server["server"] ?? FirstPeer(server) ?? "?"}");
-        var result = await CheckCoreAsync(server, cancellation).ConfigureAwait(false);
+            $"Проверка подключения: {(string?)server["type"] ?? "?"}, сервер {(string?)server["server"] ?? FirstPeer(server) ?? "?"}" +
+            (viaCore is null ? string.Empty : $", через работающее ядро ({viaCore.Tag}): оно уже держит туннель с этим ключом"));
+        var result = viaCore is null
+            ? await CheckCoreAsync(server, cancellation).ConfigureAwait(false)
+            : await CheckViaCoreAsync(server, viaCore, cancellation).ConfigureAwait(false);
         if (result.Ok)
             TechLog.Info(LogAreas.Check, LogCodes.CheckResult,
                 $"Проверка прошла за {watch.ElapsedMilliseconds} мс: задержка {result.LatencyMs} мс, внешний адрес {result.Ip ?? "?"}, страна {result.CountryCode ?? "?"}");
@@ -88,51 +118,124 @@ public sealed class ConnectionTester
             if (!await WaitListening(process, port, cancellation).ConfigureAwait(false))
                 return Fail("Ядро не смогло открыть подключение: " + (LastError(log) ?? "причина неизвестна") + ".", Snapshot(log));
 
-            using var handler = new HttpClientHandler
-            {
-                Proxy = new WebProxy($"http://127.0.0.1:{port}"),
-                UseProxy = true,
-                AllowAutoRedirect = false
-            };
-            using var client = new HttpClient(handler) { Timeout = RequestTimeout };
-            client.DefaultRequestHeaders.UserAgent.ParseAdd("SafeLauncher/2.1");
-
-            // Первый запрос включает подключение к серверу, второй показывает обычную задержку. WireGuard сначала
-            // договаривается с сервером о ключах (повтор каждые 5 с), поэтому ему даётся ещё одна попытка.
             var wireGuard = (string?)server["type"] == "wireguard";
-            var first = await Measure(client, cancellation).ConfigureAwait(false);
-            if (first is null && wireGuard)
-                first = await Measure(client, cancellation).ConfigureAwait(false);
-            if (first is null)
-                return Fail(Explain(log, wireGuard), Snapshot(log));
-
-            var second = await Measure(client, cancellation).ConfigureAwait(false);
-            var latency = second is null ? first.Value : Math.Min(first.Value, second.Value);
-
-            var (ip, code) = await Trace(client, cancellation).ConfigureAwait(false);
-            return new ConnectionCheck(true, latency, ip, code, CountryName(code), null, Snapshot(log));
+            var (latency, ip, code) = await RequestsAsync(new WebProxy($"http://127.0.0.1:{port}"), wireGuard, cancellation).ConfigureAwait(false);
+            return latency is null
+                ? Fail(Explain(log, wireGuard, amnezia: server["amnezia"] is not null), Snapshot(log))
+                : new ConnectionCheck(true, latency, ip, code, CountryName(code), null, Snapshot(log));
         }
         finally
         {
-            try
-            {
-                if (!process.HasExited)
-                    process.Kill();
-                process.WaitForExit(3000);
-            }
-            catch (InvalidOperationException)
-            {
-            }
-
-            try
-            {
-                Directory.Delete(work, recursive: true);
-            }
-            catch (Exception)
-            {
-                // временная папка, не страшно
-            }
+            StopCore(process, work);
         }
+    }
+
+    private static void StopCore(Process process, string work)
+    {
+        try
+        {
+            if (!process.HasExited)
+                process.Kill();
+            process.WaitForExit(3000);
+        }
+        catch (InvalidOperationException)
+        {
+        }
+
+        try
+        {
+            Directory.Delete(work, recursive: true);
+        }
+        catch (Exception)
+        {
+            // временная папка, не страшно
+        }
+    }
+
+    /// <summary>
+    /// Прокси через подключение на время загрузки (обновления лаунчера через подключение лаунчера): через работающее ядро,
+    /// если подключение в нём уже есть (<paramref name="viaCore"/>), иначе отдельной копией ядра, как при проверке.
+    /// Не вышло — <see cref="InvalidOperationException"/> с объяснением.
+    /// </summary>
+    public async Task<ConnectionProxy> OpenProxyAsync(JsonObject server, CoreCheckRoute? viaCore, CancellationToken cancellation)
+    {
+        if (viaCore is not null)
+            return new ConnectionProxy(new WebProxy($"http://127.0.0.1:{viaCore.Proxy.Port}")
+            {
+                Credentials = new NetworkCredential(viaCore.Tag, viaCore.Proxy.Secret)
+            }, null);
+
+        if (!File.Exists(_coreExe))
+            throw new InvalidOperationException("Не найдено ядро VPN. Переустановите лаунчер.");
+        var port = FreePort();
+        var work = Path.Combine(Path.GetTempPath(), "SafeLauncher-proxy-" + Guid.NewGuid().ToString("N")[..8]);
+        Directory.CreateDirectory(work);
+        var log = new List<string>();
+        var process = StartCore(Config(server, port), work, log);
+        var job = OperatingSystem.IsWindows() ? KillOnCloseJob(process) : null;
+        void Stop()
+        {
+            StopCore(process, work);
+            job?.Dispose();
+            process.Dispose();
+        }
+
+        try
+        {
+            if (!await WaitListening(process, port, cancellation).ConfigureAwait(false))
+                throw new InvalidOperationException("Ядро не смогло открыть подключение: " + (LastError(log) ?? "причина неизвестна") + ".");
+        }
+        catch
+        {
+            Stop();
+            throw;
+        }
+
+        return new ConnectionProxy(new WebProxy($"http://127.0.0.1:{port}"), Stop);
+    }
+
+    /// <summary>
+    /// Через прокси работающего ядра: туннель к серверу уже есть, и приложения через него не теряют связь. Журнала ядра
+    /// здесь нет (он у службы), поэтому причина неудачи общая.
+    /// </summary>
+    private async Task<ConnectionCheck> CheckViaCoreAsync(JsonObject server, CoreCheckRoute route, CancellationToken cancellation)
+    {
+        var proxy = new WebProxy($"http://127.0.0.1:{route.Proxy.Port}")
+        {
+            Credentials = new NetworkCredential(route.Tag, route.Proxy.Secret)
+        };
+        var wireGuard = (string?)server["type"] == "wireguard";
+        var (latency, ip, code) = await RequestsAsync(proxy, wireGuard, cancellation).ConfigureAwait(false);
+        return latency is null
+            ? Fail(ExplainViaCore(amnezia: server["amnezia"] is not null), Array.Empty<string>())
+            : new ConnectionCheck(true, latency, ip, code, CountryName(code), null, Array.Empty<string>());
+    }
+
+    /// <summary>Задержка, внешний адрес и код страны через прокси; задержка null — сайт через сервер не открылся.</summary>
+    private async Task<(int? Latency, string? Ip, string? Code)> RequestsAsync(WebProxy proxy, bool wireGuard, CancellationToken cancellation)
+    {
+        using var handler = new HttpClientHandler
+        {
+            Proxy = proxy,
+            UseProxy = true,
+            AllowAutoRedirect = false
+        };
+        using var client = new HttpClient(handler) { Timeout = RequestTimeout };
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("SafeLauncher/2.1");
+
+        // Первый запрос включает подключение к серверу, второй показывает обычную задержку. WireGuard сначала
+        // договаривается с сервером о ключах (повтор каждые 5 с), поэтому ему даётся ещё одна попытка.
+        var first = await Measure(client, cancellation).ConfigureAwait(false);
+        if (first is null && wireGuard)
+            first = await Measure(client, cancellation).ConfigureAwait(false);
+        if (first is null)
+            return (null, null, null);
+
+        var second = await Measure(client, cancellation).ConfigureAwait(false);
+        var latency = second is null ? first.Value : Math.Min(first.Value, second.Value);
+
+        var (ip, code) = await Trace(client, cancellation).ConfigureAwait(false);
+        return (latency, ip, code);
     }
 
     /// <summary>Настройки проверочного ядра: прокси на 127.0.0.1 → проверяемый сервер, больше ничего.</summary>
@@ -276,7 +379,8 @@ public sealed class ConnectionTester
 
     /// <summary>Понятная причина по журналу ядра.</summary>
     /// <param name="wireGuard">Проверялся файл WireGuard: у него нет ключа в ссылке и подписки, причины другие.</param>
-    internal static string Explain(IReadOnlyList<string> log, bool wireGuard = false)
+    /// <param name="amnezia">Это файл AmneziaWG: сервер молчит ещё и на чужие параметры AmneziaWG.</param>
+    internal static string Explain(IReadOnlyList<string> log, bool wireGuard = false, bool amnezia = false)
     {
         string[] lines;
         lock (log)
@@ -299,11 +403,21 @@ public sealed class ConnectionTester
         if (LastError(lines) is { } error)
             return "Через сервер не удалось открыть сайт: " + error + ".";
         // Сервер WireGuard молча не отвечает на чужой ключ и на ключ, который уже подключён в другом месте.
+        if (wireGuard && amnezia)
+            return "Сервер AmneziaWG не ответил. Если этот же файл сейчас подключён в AmneziaVPN, AmneziaWG или на другом " +
+                   "устройстве, отключите его там: один ключ работает только в одном месте. Иначе проверьте, что файл выдан " +
+                   "этим сервером и не устарел: ключи, адрес и параметры AmneziaWG должны совпадать с сервером.";
         return wireGuard
             ? "Сервер WireGuard не ответил. Если этот же файл сейчас подключён в приложении WireGuard или на другом " +
               "устройстве, отключите его там: один ключ работает только в одном месте. Иначе проверьте ключи и адрес сервера в файле."
             : "Сервер не пропустил запрос. Чаще всего это неверный ключ доступа в ссылке или закончившаяся подписка.";
     }
+
+    /// <summary>Причина неудачи проверки через работающее ядро: тот же туннель у приложений, значит, и у них сети нет.</summary>
+    internal static string ExplainViaCore(bool amnezia) =>
+        $"Сервер {(amnezia ? "AmneziaWG" : "WireGuard")} не ответил. Это подключение сейчас работает в лаунчере, и проверка шла " +
+        "через него же: у приложений через него интернета, скорее всего, тоже нет. Если этот же файл подключён ещё где-то " +
+        "(в другой программе или на другом устройстве), отключите его там: один ключ работает только в одном месте.";
 
     /// <summary>Строки журнала проверочного ядра о том, куда и через что ушли соединения проверки (для журнала событий).</summary>
     internal static IReadOnlyList<string> RouteLines(IReadOnlyList<string> log)

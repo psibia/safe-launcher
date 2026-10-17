@@ -1,6 +1,7 @@
 # Ядро VPN
 
-Встроенный VPN лаунчера работает на [sing-box](https://github.com/SagerNet/sing-box) с тремя небольшими правками.
+Встроенный VPN лаунчера работает на [sing-box](https://github.com/SagerNet/sing-box) с небольшими правками: четырьмя в самом sing-box
+и тремя в его модулях wireguard-go и sing-tun.
 Лаунчер не связан с авторами sing-box и не представляет их проект; ядро поставляется отдельной программой `launcher-core.exe`.
 
 ## Что изменено
@@ -40,9 +41,38 @@
 Windows не даёт привязать сокет IPv6, и без правки WireGuard не открывал и сокет IPv4: подключение молчало («Timeout»).
 С правкой WireGuard в таком случае работает только по IPv4.
 
+Четвёртая правка ([patches/0004-amneziawg.patch](patches/0004-amneziawg.patch)) вместе с правкой модуля wireguard-go
+([patches/wireguard-go/0001-amneziawg.patch](patches/wireguard-go/0001-amneziawg.patch)) добавляет AmneziaWG — WireGuard,
+который провайдеру труднее распознать: перед рукопожатием идут пакеты-помехи, к сообщениям добавляются случайные байты,
+а заголовки у них свои. Поддерживаются все версии AmneziaWG: 1.0, 1.5, 2.0, 3 и 3.1; связь проверена с серверами amneziawg-go
+от v0.2.12 до v3.1.20260828. Код AmneziaWG перенесён из [amneziawg-go](https://github.com/amnezia-vpn/amneziawg-go).
+
+- У подключения `wireguard` появился объект `amnezia` с параметрами из раздела `[Interface]` файла AmneziaWG: `jc`, `jmin`, `jmax`,
+  `s1`–`s4`, `h1`–`h4` (число или диапазон `от-до`), `i1`–`i5`, `j1`–`j3`, `itime`, `header_protection_key`, `content_padding_addition`,
+  `rekey_after_time`, `rekey_timeout`, `reject_after_time`, `keepalive_timeout`, `max_handshake_attempts`, `random_trailers`,
+  `disable_cookies`. Без этого объекта подключение — обычный WireGuard, как без правки.
+- У сервера в `peers` появился `persistent_keepalive_range`: интервал keepalive каждый раз выбирается случайно из диапазона
+  (в файле AmneziaWG — `PersistentKeepalive = 20-30`).
+- Файл `.conf` в эти параметры переводит лаунчер (`KillSwitchLauncher/Services/AmneziaConf.cs`) и проверяет их не мягче ядра:
+  ядро одно на все приложения, и настройки, которые оно не примет, остановили бы их всех.
+- При ошибке настройки WireGuard ядро больше не пишет в журнал настройки целиком: в них был закрытый ключ.
+
+Правка модуля sing-tun ([patches/sing-tun/0001-ports-with-same-address.patch](patches/sing-tun/0001-ports-with-same-address.patch))
+исправляет ошибку sing-box 1.14. Серверы WireGuard обычно дают всем клиентам один и тот же адрес в туннеле. Когда у двух
+приложений разные подключения WireGuard или AmneziaWG с одинаковым адресом, ответ одного сервера мог достаться приложению
+другого подключения. Теперь ответ, пришедший через подключение, получают только соединения этого подключения.
+
+Вторая правка модуля wireguard-go ([patches/wireguard-go/0002-lazy-keepalive.patch](patches/wireguard-go/0002-lazy-keepalive.patch))
+касается `PersistentKeepalive`. Без неё подключение WireGuard или AmneziaWG с этим параметром связывается с сервером сразу при запуске ядра.
+Ядро держит подключения всех приложений из настроек лаунчера, а не только запущенных, и запуск любого приложения отбирал бы связь у программы
+WireGuard или AmneziaVPN, в которой подключён тот же ключ. С правкой подключение молчит, пока через него ничего не отправлено,
+дальше keepalive идут как обычно.
+
 ## Сборка
 
-Нужны Git и Go. Скрипт скачает исходники sing-box версии v1.14.3, применит правки и соберёт `launcher-core.exe` версии `1.14.3-safelauncher.6`:
+Нужны Git и Go. Скрипт скачает исходники sing-box версии v1.14.3 и применит к ним правки. Модули wireguard-go и sing-tun
+он возьмёт той версии, что записана в go.mod sing-box, поправит их копию в `%TEMP%\safe-launcher-core-modules`
+и соберёт с ней `launcher-core.exe` версии `1.14.3-safelauncher.8`:
 
 ```powershell
 .\core\build.ps1
@@ -54,3 +84,6 @@ sing-box распространяется по GNU GPL версии 3 или н�
 Исходный код ядра — это исходники sing-box v1.14.3 (https://github.com/SagerNet/sing-box/tree/v1.14.3) с правками из папки `patches`;
 скрипт `build.ps1` воспроизводит сборку. Сам лаунчер — отдельная программа под лицензией Apache 2.0 (см. LICENSE в корне),
 с ядром он общается через командную строку и именованный канал.
+
+Модуль sing-tun, как и sing-box, распространяется по GPL-3.0-or-later. wireguard-go и amneziawg-go, из которого перенесён
+код AmneziaWG, — по лицензии MIT, её текст в NOTICE.txt.

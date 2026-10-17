@@ -119,13 +119,14 @@ public sealed partial class MainViewModel
     /// <summary>Строка о запуске приложения: условия и что уже работает (порядок запусков важен для разбора).</summary>
     private string DescribeLaunch(AppEntry entry)
     {
-        var plan = NetworkPlan.For(entry, _settings);
+        var plan = PlanFor(entry);
         var running = Apps.Where(a => a.IsRunning && a.Entry.Id != entry.Id)
             .Select(a => $"«{a.Name}» ({ProcessTracker.ProcessesText(a.RunningCount)}{(_network.IsViaCore(a.Entry.Id) ? ", через ядро" : string.Empty)})")
             .ToList();
         return $"{DescribeApp(entry)}; план {plan.Kind} ({plan.Source})" +
                (plan.Connection is { } c ? $", подключение «{c.Name}» [{CorePlan.ConnectionTag(c.Id)}]" : string.Empty) +
-               $", тег {CorePlan.AppTag(entry.Id)}, не запускать без VPN {(plan.RequireVpn ? "да" : "нет")}, закрывать при обрыве {(plan.CloseOnDrop ? "да" : "нет")}" +
+               $", тег {CorePlan.AppTag(entry.Id)}, закрывать при обрыве {(plan.CloseOnDrop ? "да" : "нет")}" +
+               (plan.UsesLauncherCore || plan.OutsideCopies == OutsideCopies.Launcher ? $", копии мимо лаунчера {plan.OutsideCopies}" : string.Empty) +
                $"; уже работают: {(running.Count == 0 ? "ничего" : string.Join(", ", running))}";
     }
 
@@ -544,6 +545,7 @@ public sealed partial class MainViewModel
                 ["tag"] = CorePlan.AppTag(tile.Entry.Id),
                 ["processes"] = tile.RunningCount,
                 ["viaCore"] = _network.IsViaCore(tile.Entry.Id),
+                ["offline"] = tile.IsOffline,
                 ["state"] = _network.StateOf(tile.Entry.Id).ToString()
             });
         }

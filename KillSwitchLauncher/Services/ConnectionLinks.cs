@@ -446,9 +446,19 @@ public static class ConnectionLinks
             var publicKey = Get(q, "pbk");
             if (string.IsNullOrEmpty(publicKey))
                 throw new ConnectionParseException("В ссылке Reality нет открытого ключа сервера (pbk).");
-            var reality = new JsonObject { ["enabled"] = true, ["public_key"] = publicKey };
+            // Неверный ключ или идентификатор не даёт запуститься всему ядру, а с ним и остальным приложениям.
+            var reality = new JsonObject
+            {
+                ["enabled"] = true,
+                ["public_key"] = RealityPublicKey(publicKey)
+                                 ?? throw new ConnectionParseException("Открытый ключ сервера Reality (pbk) в ссылке повреждён: ключ должен быть длиной 43 символа.")
+            };
             if (Get(q, "sid") is { Length: > 0 } shortId)
-                reality["short_id"] = shortId;
+            {
+                if (shortId.Length > 16 || shortId.Length % 2 != 0 || !shortId.All(Uri.IsHexDigit))
+                    throw new ConnectionParseException("Короткий идентификатор Reality (sid) в ссылке повреждён: нужно чётное число шестнадцатеричных цифр, не больше 16.");
+                reality["short_id"] = shortId.ToLowerInvariant();
+            }
             tls["reality"] = reality;
             fingerprint ??= "chrome"; // Reality в ядре работает только с отпечатком браузера
         }
@@ -456,6 +466,22 @@ public static class ConnectionLinks
         if (!string.IsNullOrEmpty(fingerprint))
             tls["utls"] = new JsonObject { ["enabled"] = true, ["fingerprint"] = UtlsFingerprints.Contains(fingerprint) ? fingerprint.ToLowerInvariant() : "chrome" };
         return (tls, security == "reality" ? "Reality" : "TLS");
+    }
+
+    /// <summary>Открытый ключ Reality так, как его ждёт ядро: base64url без «=», 32 байта. null — ключ повреждён.</summary>
+    internal static string? RealityPublicKey(string value)
+    {
+        var key = value.Trim().TrimEnd('=').Replace('+', '-').Replace('/', '_');
+        if (key.Length != 43)
+            return null;
+        try
+        {
+            return Convert.FromBase64String(key.Replace('-', '+').Replace('_', '/') + "=").Length == 32 ? key : null;
+        }
+        catch (FormatException)
+        {
+            return null;
+        }
     }
 
     private static (JsonObject? Transport, string Name) Transport(Dictionary<string, string> q)

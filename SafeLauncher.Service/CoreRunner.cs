@@ -45,7 +45,7 @@ internal sealed class CoreRunner : IDisposable
     }
 
     /// <summary>Ядро завершилось само, не по команде: код выхода и последние строки журнала.</summary>
-    public event Action<int, IReadOnlyList<string>>? Exited;
+    public event Action<int, IReadOnlyList<string>, int>? Exited;
 
     public bool IsRunning
     {
@@ -231,6 +231,7 @@ internal sealed class CoreRunner : IDisposable
     {
         bool unexpected;
         int code;
+        var pid = 0;
         lock (_sync)
         {
             // Сбой при запуске сообщается ответом на команду start, а не событием.
@@ -238,6 +239,7 @@ internal sealed class CoreRunner : IDisposable
             try
             {
                 code = process.ExitCode;
+                pid = process.Id;
             }
             catch (InvalidOperationException)
             {
@@ -249,7 +251,7 @@ internal sealed class CoreRunner : IDisposable
         if (unexpected)
         {
             Thread.Sleep(100); // дочитать последние строки журнала
-            Exited?.Invoke(code, LogTail);
+            Exited?.Invoke(code, LogTail, pid);
         }
     }
 

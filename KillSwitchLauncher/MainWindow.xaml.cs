@@ -11,6 +11,7 @@ using System.Windows.Media.Animation;
 using System.Windows.Threading;
 using KillSwitchLauncher.Services;
 using KillSwitchLauncher.ViewModels;
+using KillSwitchLauncher.Views;
 
 namespace KillSwitchLauncher;
 
@@ -22,6 +23,7 @@ public partial class MainWindow : Window
     private readonly MainViewModel _viewModel;
     private readonly DispatcherTimer _toastTimer;
     private readonly TrayIcon _tray;
+    private readonly TileDragController _drag;
 
     // Закрытие окна по-настоящему (меню трея, обновление, выход из Windows), а не уход в трей.
     private bool _exitRequested;
@@ -44,8 +46,19 @@ public partial class MainWindow : Window
 
         _viewModel = new MainViewModel(new SettingsStorage(), new DialogService(), Dispatcher);
         _viewModel.ToastRequested += (_, toast) => ShowToast(toast);
-        _viewModel.ShutdownRequested += (_, _) => ExitApp(); // обновление: установщик уже запущен
+        _viewModel.ShutdownRequested += (_, _) =>
+        {
+            // Обновление: установка уже начата. Новая версия откроется на том же месте, того же размера и на той же странице.
+            RememberWindowForUpdate();
+            ExitApp();
+        };
         DataContext = _viewModel;
+        if (_viewModel.TakeWindowAfterUpdate() is { } resume)
+            RestoreWindow(resume);
+
+        // Перетаскивание плиток мышью; порядок хранит _viewModel.Home.
+        _drag = new TileDragController(this, HomeArea, HomeScroll, HomeTiles, () => _viewModel.Home);
+
         SourceInitialized += (_, _) => RoundCorners();
 
         _tray = new TrayIcon(BuildTrayToolTip());
@@ -128,7 +141,7 @@ public partial class MainWindow : Window
 
     // ---------------------------------------------------------------- окно
 
-    /// <summary>Esc: закрыть сводку, а на странице настроек или приложения — вернуться к плиткам.</summary>
+    /// <summary>Esc: закрыть сводку, а на странице настроек, приложения или добавления — вернуться к плиткам.</summary>
     protected override void OnKeyDown(KeyEventArgs e)
     {
         base.OnKeyDown(e);
@@ -137,7 +150,7 @@ public partial class MainWindow : Window
 
         if (_viewModel.IsSummaryOpen)
             _viewModel.IsSummaryOpen = false;
-        else if (_viewModel.IsSettingsOpen || _viewModel.IsAppPage)
+        else if (_viewModel.IsSettingsOpen || _viewModel.IsAppPage || _viewModel.IsAddAppsPage)
             _viewModel.GoBack();
         else
             return;
@@ -148,14 +161,14 @@ public partial class MainWindow : Window
 
     private void OnDragOver(object sender, DragEventArgs e)
     {
-        e.Effects = _viewModel.IsAppsPage && DroppedFiles(e) is { Length: > 0 } ? DragDropEffects.Copy : DragDropEffects.None;
+        e.Effects = (_viewModel.IsAppsPage || _viewModel.IsAddAppsPage) && DroppedFiles(e) is { Length: > 0 } ? DragDropEffects.Copy : DragDropEffects.None;
         e.Handled = true;
     }
 
     /// <summary>Перетащили .exe или ярлыки: одну программу — на её страницу, несколько — сразу в список.</summary>
     private void OnDrop(object sender, DragEventArgs e)
     {
-        if (!_viewModel.IsAppsPage || DroppedFiles(e) is not { Length: > 0 } files)
+        if (!(_viewModel.IsAppsPage || _viewModel.IsAddAppsPage) || DroppedFiles(e) is not { Length: > 0 } files)
             return;
         e.Handled = true;
         Activate();
@@ -232,6 +245,36 @@ public partial class MainWindow : Window
 
         _exitRequested = true;
         Close();
+    }
+
+    private void RememberWindowForUpdate()
+    {
+        if (!IsVisible)
+            return; // окно в трее: новая версия откроется как обычно
+        var bounds = WindowState == WindowState.Normal ? new Rect(Left, Top, ActualWidth, ActualHeight) : RestoreBounds;
+        if (bounds.IsEmpty)
+            return;
+        var maximized = WindowState == WindowState.Maximized || WindowState == WindowState.Minimized && _restoreState == WindowState.Maximized;
+        _viewModel.SaveWindowForUpdate(bounds.Left, bounds.Top, bounds.Width, bounds.Height, maximized);
+    }
+
+    /// <summary>Окно как перед обновлением. Если тот монитор отключён и заголовок окна не виден, место остаётся обычным.</summary>
+    private void RestoreWindow(WindowResume resume)
+    {
+        var bounds = new Rect(resume.Left, resume.Top, Math.Max(resume.Width, MinWidth), Math.Max(resume.Height, MinHeight));
+        var screen = new Rect(SystemParameters.VirtualScreenLeft, SystemParameters.VirtualScreenTop,
+            SystemParameters.VirtualScreenWidth, SystemParameters.VirtualScreenHeight);
+        var caption = Rect.Intersect(new Rect(bounds.Left, bounds.Top, bounds.Width, 36), screen);
+        if (caption.IsEmpty || caption.Width < 120)
+            return;
+
+        WindowStartupLocation = WindowStartupLocation.Manual;
+        Left = bounds.Left;
+        Top = bounds.Top;
+        Width = bounds.Width;
+        Height = bounds.Height;
+        if (resume.Maximized)
+            WindowState = WindowState.Maximized;
     }
 
     /// <summary>Выход из Windows или закрытие установщиком: закрываемся без вопросов и без трея.</summary>

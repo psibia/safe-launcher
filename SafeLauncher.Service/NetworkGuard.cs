@@ -16,8 +16,11 @@ namespace SafeLauncher.Service;
 /// (адаптер ядра или адаптеры системного VPN) и внутри компьютера; всё остальное для его exe блокируется, даже если
 /// программа сама выберет обычный адаптер (WebRTC в браузерах, привязка к адресу сетевой карты).
 ///
-/// Фильтры добавляются в динамическом сеансе: Windows удаляет их сама, когда служба закрывает сеанс или падает,
-/// поэтому после выхода лаунчера или сбоя службы ничего не остаётся. Набор каждого лаунчера живёт, пока он подключён.
+/// Фильтры обычные, не динамические: падение службы их не снимает, и до её перезапуска приложения остаются под
+/// блокировкой. Windows удаляет их сама при перезагрузке. При обычной остановке их снимает служба, а при запуске после
+/// падения заменяет оставшиеся одной транзакцией, без перерыва (<see cref="Restore"/>, наборы из файла состояния).
+/// Фильтры, которые сохраняются после перезагрузки, не используются: ошибка оставила бы программу без сети навсегда.
+/// Набор каждого лаунчера живёт, пока он подключён; что остаётся после его отключения, см. <see cref="GuardSets"/>.
 /// Свой подуровень с наибольшим весом: наши запреты окончательны, а наши разрешения ничего не открывают сверх
 /// разрешённого другими фильтрами (брандмауэр Windows и т. п. по-прежнему могут запретить).
 /// </summary>
@@ -40,7 +43,7 @@ internal sealed class NetworkGuard : IDisposable
     private const byte WeightDnsBlock = 10;
 
     /// <summary>Системные программы, сеть которых лаунчер не отключает: без них не работает сеть всего компьютера.</summary>
-    private static readonly HashSet<string> ProtectedNames = new(StringComparer.OrdinalIgnoreCase)
+    internal static readonly HashSet<string> ProtectedNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "svchost.exe", "lsass.exe", "services.exe", "wininit.exe", "winlogon.exe", "csrss.exe", "smss.exe", "System"
     };
@@ -49,7 +52,7 @@ internal sealed class NetworkGuard : IDisposable
     /// Папки общих программ: Windows и её защитника. Фильтр действует на программу целиком, где бы она ни работала,
     /// поэтому ограничение, скажем, cmd.exe или powershell.exe затронуло бы и сценарии самой Windows.
     /// </summary>
-    private static readonly string[] SharedFolders = BuildSharedFolders();
+    internal static readonly string[] SharedFolders = BuildSharedFolders();
 
     private static readonly Guid[] AppLayers =
     {
@@ -58,63 +61,170 @@ internal sealed class NetworkGuard : IDisposable
 
     private static readonly Guid[] ConnectLayers = { Wfp.LayerConnectV4, Wfp.LayerConnectV6 };
 
+    /// <summary>Свой подуровень: ключ постоянный, чтобы служба после падения нашла в нём свои оставшиеся фильтры.</summary>
+    private static readonly Guid SubLayerKey = new("3f8a8b42-3e0e-4e1c-9985-02c8bdcffa40");
+
+    /// <summary>Как часто проверять, работают ли программы наборов, оставшихся от отключившихся лаунчеров.</summary>
+    private static readonly TimeSpan OrphanCheckInterval = TimeSpan.FromSeconds(5);
+
     private readonly Action<string> _log;
+    private readonly string? _statePath;
     private readonly object _sync = new();
-    private readonly Dictionary<object, GuardRequest> _owners = new();
+    private readonly GuardSets _sets = new();
     private readonly List<ulong> _filters = new();
     private readonly string _ownDirectory = Path.TrimEndingDirectorySeparator(Path.GetFullPath(AppContext.BaseDirectory));
+    private readonly System.Threading.Timer _orphanTimer;
     private IntPtr _engine;
     private IntPtr _displayName;
-    private Guid _subLayer;
     private ulong? _coreLuid;
+
+    /// <summary>В подуровне могут быть фильтры упавшей службы: следующая перестройка снимает всё, что в нём есть.</summary>
+    private bool _leftovers = true;
+
     private bool _disposed;
 
-    public NetworkGuard(Action<string> log) => _log = log;
+    /// <param name="statePath">Файл состояния (наборы на случай падения службы); null — без него.</param>
+    public NetworkGuard(Action<string> log, string? statePath = null)
+    {
+        _log = log;
+        _statePath = statePath;
+        _orphanTimer = new System.Threading.Timer(_ => CheckOrphans(), null, OrphanCheckInterval, OrphanCheckInterval);
+    }
+
+    /// <summary>
+    /// Запуск службы. Если подуровень фильтров уже есть в Windows, прежняя служба упала, не сняв их: её фильтры заменяются
+    /// наборами из файла состояния одной транзакцией. Правила, программы которых работают, действуют без перерыва
+    /// (лаунчеры переподключатся и пришлют свои наборы), остальные снимаются. После перезагрузки и обычной остановки
+    /// фильтров нет, и файл не нужен.
+    /// </summary>
+    public void Restore()
+    {
+        lock (_sync)
+        {
+            bool existed;
+            try
+            {
+                existed = EnsureEngine();
+            }
+            catch (Exception ex) when (ex is WfpException or DllNotFoundException or EntryPointNotFoundException)
+            {
+                // Фильтры Windows не готовы (служба BFE ещё запускается): после перезагрузки оставшихся фильтров нет,
+                // а следующая перестройка всё равно проверит подуровень.
+                ServiceLog.Warn(LogAreas.Wfp, LogCodes.WfpFail, null, "Фильтры Windows при запуске службы: " + ex.Message);
+                return;
+            }
+
+            if (!existed)
+            {
+                _leftovers = false;
+                DeleteState();
+                return;
+            }
+
+            var restored = LoadState();
+            _sets.AddOrphans(restored);
+            if (_sets.Orphans > 0)
+                _sets.Prune(RunningCheck(), DnsCapableInterfaces().Contains);
+            var kept = _sets.Orphans;
+            var error = Rebuild();
+            var text = "Служба запущена после сбоя: оставшиеся фильтры " +
+                       (kept > 0 ? $"заменены наборами отключившихся лаунчеров ({kept} из {restored.Count}), пока работают их программы" : "сняты");
+            if (error is null)
+                ServiceLog.Info(LogAreas.Wfp, LogCodes.WfpApply, null, text);
+            else
+            {
+                _log("Не удалось заменить фильтры, оставшиеся после сбоя службы: " + error);
+                ServiceLog.Error(LogAreas.Wfp, LogCodes.WfpFail, null, "Не удалось заменить фильтры, оставшиеся после сбоя службы: " + error);
+            }
+        }
+    }
 
     /// <summary>
     /// Заменить набор этого лаунчера. null — всё включено; иначе причина, почему фильтры не удалось поставить
     /// (тогда действуют прежние фильтры). Недопустимый запрос — <see cref="CoreConfigException"/>.
     /// </summary>
+    /// <param name="user">SID пользователя лаунчера: его набор заменяет наборы, оставшиеся от его прежних лаунчеров.</param>
     /// <param name="unguarded">Программы, которые не удалось проверить и поэтому ограничить (сетевой диск и т. п.).</param>
-    public string? Set(object owner, GuardRequest? request, out string? notice, out List<string> unguarded)
+    public string? Set(object owner, string? user, GuardRequest? request, out string? notice, out List<string> unguarded)
     {
         var clean = Validate(request, out notice, out unguarded);
         lock (_sync)
         {
             ObjectDisposedException.ThrowIf(_disposed, this);
-            var had = _owners.TryGetValue(owner, out var previous);
-            if (clean is null)
-                _owners.Remove(owner);
-            else
-                _owners[owner] = clean;
-
+            var snapshot = _sets.Snapshot();
+            _sets.Set(owner, user, clean);
             var error = Rebuild();
             if (error is not null)
-            {
-                // Не вышло: прежнее состояние, как и фильтры в Windows.
-                if (had)
-                    _owners[owner] = previous!;
-                else
-                    _owners.Remove(owner);
-            }
+                _sets.Restore(snapshot); // не вышло: прежнее состояние, как и фильтры в Windows
 
             return error;
         }
     }
 
-    /// <summary>Лаунчер отключился: его фильтры снимаются.</summary>
-    public void Remove(object owner)
+    /// <summary>
+    /// Лаунчер отключился (закрылся или упал): правила его приложений снимаются, а скрытие DNS остаётся, пока работают
+    /// программы приложений, которые продолжают работать и без лаунчера (<see cref="GuardSets.Release"/>).
+    /// </summary>
+    public void Release(object owner)
     {
         lock (_sync)
         {
-            if (_disposed || !_owners.Remove(owner))
+            if (_disposed || !_sets.Release(owner))
                 return;
             if (Rebuild() is { } error)
             {
-                _log("Не удалось снять фильтры лаунчера: " + error);
-                ServiceLog.Error(LogAreas.Wfp, LogCodes.WfpFail, null, "Не удалось снять фильтры лаунчера: " + error);
+                _log("Не удалось обновить фильтры после отключения лаунчера: " + error);
+                ServiceLog.Error(LogAreas.Wfp, LogCodes.WfpFail, null, "Не удалось обновить фильтры после отключения лаунчера: " + error);
+            }
+            else if (_sets.Orphans > 0)
+            {
+                ServiceLog.Info(LogAreas.Wfp, LogCodes.WfpApply, null,
+                    "Лаунчер отключился: скрытие DNS остаётся, пока работают программы его приложений и подключён системный VPN");
             }
         }
+    }
+
+    /// <summary>
+    /// Раз в <see cref="OrphanCheckInterval"/>: снять в наборах отключившихся лаунчеров правила закрывшихся программ и скрытие
+    /// DNS, адаптера VPN которого больше нет (<see cref="GuardSets.Prune"/>).
+    /// </summary>
+    private void CheckOrphans()
+    {
+        try
+        {
+            lock (_sync)
+            {
+                if (_disposed || _sets.Orphans == 0)
+                    return;
+            }
+
+            // списки процессов и адаптеров — без блокировки
+            var running = RunningCheck();
+            var dnsAdapters = DnsCapableInterfaces();
+            lock (_sync)
+            {
+                if (_disposed || !_sets.Prune(running, dnsAdapters.Contains))
+                    return;
+                if (Rebuild() is { } error)
+                    ServiceLog.Error(LogAreas.Wfp, LogCodes.WfpFail, null, "Не удалось снять фильтры закрывшихся программ: " + error);
+                else
+                    ServiceLog.Info(LogAreas.Wfp, LogCodes.WfpApply, null,
+                        "Сняты фильтры, оставшиеся после отключения лаунчера: программы закрылись или отключился VPN" +
+                        (_sets.Orphans > 0 ? $"; ещё действуют наборы: {_sets.Orphans}" : string.Empty));
+            }
+        }
+        catch (Exception ex)
+        {
+            // таймер не должен ронять службу
+            ServiceLog.Error(LogAreas.Wfp, LogCodes.WfpFail, null, "Проверка оставшихся фильтров: " + ex.Message);
+        }
+    }
+
+    /// <summary>Работает ли сейчас программа с этим путём (путь — как в правиле: настоящий или путь устройства).</summary>
+    private static Func<string, bool> RunningCheck()
+    {
+        var images = RunningImages();
+        return path => images.Contains(path) || DevicePath(path) is { } device && images.Contains(device);
     }
 
     /// <summary>Адаптер ядра появился (LUID) или пропал (null): правила «через ядро» пересчитываются.</summary>
@@ -125,7 +235,7 @@ internal sealed class NetworkGuard : IDisposable
             if (_disposed || _coreLuid == luid)
                 return;
             _coreLuid = luid;
-            if (_owners.Count == 0)
+            if (_sets.IsEmpty)
                 return;
             if (Rebuild() is { } error)
             {
@@ -333,7 +443,7 @@ internal sealed class NetworkGuard : IDisposable
     /// Программы служб, их сеть не трогаем: работающие сейчас в сеансе 0 и зарегистрированные в Windows, пусть и
     /// остановленные (служба может запуститься, пока фильтр ещё стоит).
     /// </summary>
-    private static HashSet<string> ServicePrograms()
+    internal static HashSet<string> ServicePrograms()
     {
         var result = new HashSet<string>(RegisteredServicePrograms(), StringComparer.OrdinalIgnoreCase);
         foreach (var process in System.Diagnostics.Process.GetProcesses())
@@ -489,10 +599,13 @@ internal sealed class NetworkGuard : IDisposable
         }
     }
 
-    /// <summary>Снять все наши фильтры и поставить заново по всем лаунчерам — одной транзакцией. null — получилось.</summary>
+    /// <summary>
+    /// Снять все наши фильтры и поставить заново по всем наборам — одной транзакцией. null — получилось.
+    /// Первая перестройка после запуска снимает всё, что есть в нашем подуровне: там могут быть фильтры упавшей службы.
+    /// </summary>
     private string? Rebuild()
     {
-        if (_owners.Count == 0 && _filters.Count == 0)
+        if (_sets.IsEmpty && _filters.Count == 0 && !_leftovers)
             return null;
         var watch = System.Diagnostics.Stopwatch.StartNew();
         var before = _filters.Count;
@@ -501,16 +614,24 @@ internal sealed class NetworkGuard : IDisposable
         try
         {
             EnsureEngine();
+            List<ulong> previous = _filters;
+            if (_leftovers)
+            {
+                step = "поиск фильтров, оставшихся после сбоя службы";
+                previous = OwnFilters();
+                before = previous.Count;
+            }
+
             step = "начало изменения фильтров";
             Check(Wfp.FwpmTransactionBegin0(_engine, 0));
             var added = new List<ulong>();
             try
             {
                 step = "снятие прежних фильтров";
-                foreach (var id in _filters)
+                foreach (var id in previous)
                     Wfp.FwpmFilterDeleteById0(_engine, id); // уже нет — не важно
 
-                if (_owners.Count > 0)
+                if (!_sets.IsEmpty)
                 {
                     step = "разрешение сети внутри компьютера";
                     var loopback = memory.Conditions(new[] { (Wfp.ConditionFlags, Wfp.MatchFlagsAllSet, Wfp.TypeUint32, (IntPtr)Wfp.ConditionFlagIsLoopback) });
@@ -518,7 +639,7 @@ internal sealed class NetworkGuard : IDisposable
                         added.Add(AddFilter(layer, WeightLoopback, Wfp.ActionPermit, loopback, 1));
                 }
 
-                foreach (var rule in _owners.Values.SelectMany(r => r.Apps))
+                foreach (var rule in _sets.All.SelectMany(r => r.Apps))
                 {
                     step = "правила приложения " + Path.GetFileName(rule.Paths[0]);
                     var appIds = rule.Paths.SelectMany(AppIds).Distinct(ByteArrayComparer.Instance).ToList();
@@ -553,7 +674,7 @@ internal sealed class NetworkGuard : IDisposable
                     }
                 }
 
-                var dnsIndexes = _owners.Values.Where(r => r.DnsInterfaces is { Count: > 0 }).SelectMany(r => r.DnsInterfaces!).Distinct().ToList();
+                var dnsIndexes = _sets.All.Where(r => r.DnsInterfaces is { Count: > 0 }).SelectMany(r => r.DnsInterfaces!).Distinct().ToList();
                 if (dnsIndexes.Count > 0)
                 {
                     // Без адаптера VPN DNS не закрываем: иначе на компьютере пропадут все имена (и VPN не переподключится).
@@ -571,7 +692,7 @@ internal sealed class NetworkGuard : IDisposable
                         var dnsClient = AppIds(Path.Combine(Environment.SystemDirectory, "svchost.exe")).ToList();
                         var dnsPrograms = dnsClient.Count == 0
                             ? new List<byte[]>() // не узнали службу — DNS всех программ, как надёжнее
-                            : dnsClient.Concat(_owners.Values.SelectMany(r => r.DnsPaths ?? new List<string>()).SelectMany(AppIds))
+                            : dnsClient.Concat(_sets.All.SelectMany(r => r.DnsPaths ?? new List<string>()).SelectMany(AppIds))
                                 .Distinct(ByteArrayComparer.Instance).ToList();
                         var dnsApps = dnsPrograms.Select(id => (Wfp.ConditionAppId, Wfp.MatchEqual, Wfp.TypeByteBlob, memory.Blob(id))).ToList();
                         var dnsBlock = memory.Conditions(new[] { port }.Concat(dnsApps).ToList());
@@ -596,11 +717,14 @@ internal sealed class NetworkGuard : IDisposable
 
             _filters.Clear();
             _filters.AddRange(added);
-            var rules = _owners.Values.SelectMany(r => r.Apps).ToList();
+            _leftovers = false;
+            SaveState();
+            var rules = _sets.All.SelectMany(r => r.Apps).ToList();
             ServiceLog.Info(LogAreas.Wfp, LogCodes.WfpApply, null,
-                $"Фильтры Windows: лаунчеров {_owners.Count}, правил {rules.Count} (через ядро {rules.Count(r => r.ViaCore)}), " +
+                $"Фильтры Windows: лаунчеров {_sets.Owners}" + (_sets.Orphans > 0 ? $", наборов отключившихся лаунчеров {_sets.Orphans}" : string.Empty) +
+                $", правил {rules.Count} (через ядро {rules.Count(r => r.ViaCore)}), " +
                 $"путей {rules.Sum(r => r.Paths.Count)}, адаптер ядра {(_coreLuid is { } c ? "LUID " + c : "нет")}, " +
-                $"DNS-адаптеров {_owners.Values.Where(r => r.DnsInterfaces is { Count: > 0 }).SelectMany(r => r.DnsInterfaces!).Distinct().Count()}, " +
+                $"DNS-адаптеров {_sets.All.Where(r => r.DnsInterfaces is { Count: > 0 }).SelectMany(r => r.DnsInterfaces!).Distinct().Count()}, " +
                 $"фильтров {added.Count} (было {before}), {watch.ElapsedMilliseconds} мс");
             if (ServiceLog.Detailed)
             {
@@ -631,7 +755,7 @@ internal sealed class NetworkGuard : IDisposable
         {
             DisplayData = new Wfp.DisplayData { Name = _displayName },
             LayerKey = layer,
-            SubLayerKey = _subLayer,
+            SubLayerKey = SubLayerKey,
             Weight = new Wfp.Value { Type = Wfp.TypeUint8, Data = (IntPtr)weight },
             NumFilterConditions = (uint)count,
             FilterCondition = conditions,
@@ -641,28 +765,125 @@ internal sealed class NetworkGuard : IDisposable
         return id;
     }
 
-    private void EnsureEngine()
+    /// <summary>
+    /// Открыть фильтры Windows (обычный сеанс: его фильтры переживают падение службы) и добавить свой подуровень.
+    /// true — подуровень уже был: служба упала, не сняв свои фильтры (после перезагрузки его нет).
+    /// </summary>
+    private bool EnsureEngine()
     {
         if (_engine != IntPtr.Zero)
-            return;
-        _displayName = Marshal.StringToHGlobalUni("Безопасный лаунчер: сеть приложений только через VPN");
-        var session = new Wfp.Session { Flags = Wfp.SessionFlagDynamic, DisplayData = new Wfp.DisplayData { Name = _displayName } };
+            return false;
+        if (_displayName == IntPtr.Zero)
+            _displayName = Marshal.StringToHGlobalUni("Безопасный лаунчер: сеть приложений только через VPN");
+        var session = new Wfp.Session { DisplayData = new Wfp.DisplayData { Name = _displayName } };
         Check(Wfp.FwpmEngineOpen0(null, Wfp.RpcAuthnDefault, IntPtr.Zero, ref session, out var engine));
-        _subLayer = Guid.NewGuid();
         var subLayer = new Wfp.SubLayer
         {
-            SubLayerKey = _subLayer,
+            SubLayerKey = SubLayerKey,
             DisplayData = new Wfp.DisplayData { Name = _displayName },
             Weight = ushort.MaxValue
         };
         var result = Wfp.FwpmSubLayerAdd0(engine, ref subLayer, IntPtr.Zero);
-        if (result != 0)
+        if (result != 0 && result != Wfp.ErrorAlreadyExists)
         {
             Wfp.FwpmEngineClose0(engine);
             Check(result);
         }
 
         _engine = engine;
+        return result == Wfp.ErrorAlreadyExists;
+    }
+
+    /// <summary>Все фильтры в нашем подуровне, в том числе оставшиеся от упавшей службы.</summary>
+    private List<ulong> OwnFilters()
+    {
+        var ids = new List<ulong>();
+        Check(Wfp.FwpmFilterCreateEnumHandle0(_engine, IntPtr.Zero, out var enumHandle));
+        try
+        {
+            const uint batch = 256;
+            while (true)
+            {
+                Check(Wfp.FwpmFilterEnum0(_engine, enumHandle, batch, out var entries, out var count));
+                try
+                {
+                    for (var i = 0; i < count; i++)
+                    {
+                        var filter = Marshal.PtrToStructure<Wfp.Filter>(Marshal.ReadIntPtr(entries, i * IntPtr.Size));
+                        if (filter.SubLayerKey == SubLayerKey)
+                            ids.Add(filter.FilterId);
+                    }
+                }
+                finally
+                {
+                    if (entries != IntPtr.Zero)
+                        Wfp.FwpmFreeMemory0(ref entries);
+                }
+
+                if (count < batch)
+                    break;
+            }
+        }
+        finally
+        {
+            Wfp.FwpmFilterDestroyEnumHandle0(_engine, enumHandle);
+        }
+
+        return ids;
+    }
+
+    // ---- файл состояния: наборы на случай падения службы ----
+
+    private void SaveState()
+    {
+        if (_statePath is null)
+            return;
+        try
+        {
+            if (_sets.IsEmpty)
+            {
+                DeleteState();
+                return;
+            }
+
+            Directory.CreateDirectory(Path.GetDirectoryName(_statePath)!);
+            var temp = _statePath + ".tmp";
+            File.WriteAllText(temp, _sets.Serialize(), new UTF8Encoding(false));
+            File.Move(temp, _statePath, overwrite: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            ServiceLog.Warn(LogAreas.Wfp, LogCodes.WfpFail, null, "Не удалось сохранить наборы фильтров на случай сбоя: " + ex.Message);
+        }
+    }
+
+    private List<GuardSets.Entry> LoadState()
+    {
+        try
+        {
+            return _statePath is not null && File.Exists(_statePath)
+                ? GuardSets.Deserialize(File.ReadAllText(_statePath))
+                : new List<GuardSets.Entry>();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            ServiceLog.Warn(LogAreas.Wfp, LogCodes.WfpFail, null, "Не удалось прочитать наборы фильтров после сбоя: " + ex.Message);
+            return new List<GuardSets.Entry>();
+        }
+    }
+
+    private void DeleteState()
+    {
+        if (_statePath is null)
+            return;
+        try
+        {
+            File.Delete(_statePath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // не страшно: при следующем запуске без оставшихся фильтров файл не читается
+        }
     }
 
     /// <summary>
@@ -728,6 +949,7 @@ internal sealed class NetworkGuard : IDisposable
             throw new WfpException(result);
     }
 
+    /// <summary>Служба останавливается: все наши фильтры и подуровень снимаются (сами они исчезли бы только при перезагрузке).</summary>
     public void Dispose()
     {
         lock (_sync)
@@ -735,10 +957,40 @@ internal sealed class NetworkGuard : IDisposable
             if (_disposed)
                 return;
             _disposed = true;
-            _owners.Clear();
-            _filters.Clear();
+            _orphanTimer.Dispose();
             if (_engine != IntPtr.Zero)
-                Wfp.FwpmEngineClose0(_engine); // динамический сеанс: Windows сама удаляет все его фильтры
+            {
+                try
+                {
+                    var ids = _leftovers ? OwnFilters() : _filters;
+                    Check(Wfp.FwpmTransactionBegin0(_engine, 0));
+                    try
+                    {
+                        foreach (var id in ids)
+                            Wfp.FwpmFilterDeleteById0(_engine, id);
+                        Check(Wfp.FwpmTransactionCommit0(_engine));
+                    }
+                    catch
+                    {
+                        Wfp.FwpmTransactionAbort0(_engine);
+                        throw;
+                    }
+
+                    var key = SubLayerKey;
+                    Wfp.FwpmSubLayerDeleteByKey0(_engine, ref key);
+                    _sets.Clear();
+                    DeleteState();
+                }
+                catch (Exception ex) when (ex is WfpException or DllNotFoundException or EntryPointNotFoundException)
+                {
+                    _log("Не удалось снять фильтры при остановке службы: " + ex.Message);
+                    ServiceLog.Error(LogAreas.Wfp, LogCodes.WfpFail, null, "Не удалось снять фильтры при остановке службы: " + ex.Message);
+                }
+
+                Wfp.FwpmEngineClose0(_engine);
+            }
+
+            _filters.Clear();
             _engine = IntPtr.Zero;
             if (_displayName != IntPtr.Zero)
                 Marshal.FreeHGlobal(_displayName);

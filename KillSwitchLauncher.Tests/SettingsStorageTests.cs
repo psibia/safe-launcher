@@ -112,6 +112,22 @@ public class SettingsStorageTests
     }
 
     [Fact]
+    public void UnknownEnumValue_OtherSettingsKept()
+    {
+        // Файл от более новой версии лаунчера: незнакомое значение не делает весь файл повреждённым.
+        using var dir = new TempDir();
+        var path = dir.File("settings.json");
+        File.WriteAllText(path, "{ \"KillSwitchEnabled\": false, \"RuleMode\": \"Новый\", \"HideBehavior\": \"Tray\", \"Apps\": [] }");
+
+        var settings = new SettingsStorage(path).Load();
+
+        Assert.False(settings.KillSwitchEnabled);
+        Assert.Equal(default(VpnRuleMode), settings.RuleMode);
+        Assert.Equal(HideBehavior.Tray, settings.HideBehavior);
+        Assert.False(File.Exists(path + ".broken"));
+    }
+
+    [Fact]
     public void BrokenFile_GivesDefaults_AndKeepsACopy()
     {
         using var dir = new TempDir();

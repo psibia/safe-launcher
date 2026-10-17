@@ -25,9 +25,15 @@ public static class ControlProtocol
     /// 1 — запуск ядра (служба без этого поля); 2 — управление ядром для проверки серверов (ApiPort/ApiSecret);
     /// 3 — перехват DNS и подменные адреса (HideDns, OutboundDns), сброс кэша DNS, блокировка обхода VPN (guard);
     /// 4 — непроверенные программы в ответе (Unguarded), DNS-правило для службы DNS Windows и приложений (DnsPaths);
-    /// 5 — журналы службы и ядра (logConfig, logRead, logMark, logClear, logFiles), корреляция команд (Cid).
+    /// 5 — журналы службы и ядра (logConfig, logRead, logMark, logClear, logFiles), корреляция команд (Cid);
+    /// 6 — редкие DNS-запросы через подключение (DnsOutbound);
+    /// 7 — проверка подключений через работающее ядро (CheckPort);
+    /// 8 — процессы программ приложения без метки лаунчера (Programs, BlockOutside); фильтры guard переживают падение
+    /// службы, а скрытие DNS остаётся и после отключения лаунчера;
+    /// 9 — установка обновления лаунчера по подписи выпуска (update);
+    /// 10 — новая версия лаунчера сообщает, что запустилась после обновления (updateStarted).
     /// </summary>
-    public const int Revision = 5;
+    public const int Revision = 10;
 
     /// <summary>С какой ревизии есть команды журналов.</summary>
     public const int LogsRevision = 5;
@@ -56,6 +62,19 @@ public static class ControlProtocol
 
     /// <summary>Файлы рядом с журналами за период: очищенные конфиги ядра и падения службы (для выгрузки).</summary>
     public const string OpLogFiles = "logFiles";
+
+    /// <summary>
+    /// Установить обновление лаунчера (<see cref="UpdateRequest"/>): служба проверяет подпись выпуска и версию, сохраняет
+    /// текущую версию для отката и запускает установку, которая начнётся, когда лаунчер закроется (см. UpdateRunner).
+    /// Ответ: <see cref="ControlReply.Version"/> — устанавливаемая версия.
+    /// </summary>
+    public const string OpUpdate = "update";
+
+    /// <summary>
+    /// Новая версия лаунчера запустилась после обновления (<see cref="UpdateRequest.JobId"/>). Помощник обновления ждёт этого
+    /// сообщения и без него возвращает прежнюю версию (см. UpdateRunner).
+    /// </summary>
+    public const string OpUpdateStarted = "updateStarted";
 
     /// <summary>Ядро завершилось само (упало или не смогло работать дальше).</summary>
     public const string EventCoreExited = "coreExited";
@@ -88,6 +107,22 @@ public sealed class ControlMessage
 
     /// <summary>Для команд журналов (logConfig, logRead, logMark, logFiles).</summary>
     public LogRequest? Logs { get; set; }
+
+    /// <summary>Для update: скачанный установщик и его подпись.</summary>
+    public UpdateRequest? Update { get; set; }
+}
+
+/// <summary>Обновление лаунчера: файлы, которые лаунчер скачал из выпуска GitHub (в папку пользователя).</summary>
+public sealed class UpdateRequest
+{
+    /// <summary>Установщик SafeLauncher-Setup-X.exe.</summary>
+    public string SetupPath { get; set; } = string.Empty;
+
+    /// <summary>Его подпись SafeLauncher-Setup-X.exe.sig.</summary>
+    public string SignaturePath { get; set; } = string.Empty;
+
+    /// <summary>Для updateStarted: номер обновления из status.json (<c>jobId</c>).</summary>
+    public string? JobId { get; set; }
 }
 
 /// <summary>Запрос к журналам службы. Какие поля нужны — см. описание команды в <see cref="ControlProtocol"/>.</summary>
@@ -167,8 +202,10 @@ public sealed class LogFileItem
 }
 
 /// <summary>
-/// Блокировка обхода VPN фильтрами Windows (WFP). Фильтры живут, пока подключён лаунчер, который их задал,
-/// и исчезают вместе с ним или со службой. Каждый guard заменяет прежний набор этого лаунчера; пустой — снимает его.
+/// Блокировка обхода VPN фильтрами Windows (WFP). Каждый guard заменяет прежний набор этого лаунчера; пустой — снимает его.
+/// После отключения лаунчера правила приложений снимаются, а скрытие DNS (DnsInterfaces, DnsPaths) остаётся, пока работают
+/// программы DnsPaths и адаптеры DnsInterfaces или пока лаунчер того же пользователя не пришлёт новый набор. Фильтры
+/// переживают падение службы и снимаются при перезагрузке.
 /// </summary>
 public sealed class GuardRequest
 {
@@ -244,6 +281,12 @@ public sealed class ControlReply
     /// <summary>Для start: ключ к управлению ядром, свой на каждый запуск.</summary>
     public string? ApiSecret { get; set; }
 
+    /// <summary>
+    /// Для start: прокси на 127.0.0.1 для проверки подключения через работающее ядро. Имя пользователя — tag подключения,
+    /// пароль — <see cref="ApiSecret"/>.
+    /// </summary>
+    public int? CheckPort { get; set; }
+
     /// <summary>Последние строки журнала ядра (при сбое и в status).</summary>
     public List<string>? Log { get; set; }
 
@@ -282,6 +325,12 @@ public sealed class CoreRequest
 
     /// <summary>DNS-сервер внутри подключения (tag → IP), например из файла WireGuard. Без него — 1.1.1.1 через подключение.</summary>
     public Dictionary<string, string>? OutboundDns { get; set; }
+
+    /// <summary>
+    /// При <see cref="HideDns"/>: tag подключения, через которое уходят к его DNS-серверу запросы программ, на которые ядро
+    /// не отвечает подменным адресом (редкие типы записей: TXT, SRV, MX…). null — к DNS компьютера, их видит провайдер.
+    /// </summary>
+    public string? DnsOutbound { get; set; }
 }
 
 /// <summary>Приложение лаунчера: его процессы (метка от лаунчера) идут через подключение Outbound.</summary>
@@ -295,4 +344,27 @@ public sealed class CoreAppRoute
 
     /// <summary>Домены (с поддоменами), к которым приложение ходит напрямую.</summary>
     public List<string> DirectDomains { get; set; } = new();
+
+    /// <summary>
+    /// Программы приложения. Их процессы без метки (копия, запущенная мимо лаунчера, или процесс, о котором лаунчер не
+    /// успел ответить ядру) идут через то же подключение, а с <see cref="BlockOutside"/> не получают сети. null или
+    /// пусто — такие процессы идут напрямую, как весь трафик компьютера.
+    /// </summary>
+    public List<CoreProgram>? Programs { get; set; }
+
+    /// <summary>Процессы <see cref="Programs"/> без метки блокировать, а не вести через подключение.</summary>
+    public bool BlockOutside { get; set; }
+}
+
+/// <summary>Программа приложения: exe-файл с этим именем в папке и, если <see cref="Subfolders"/>, в её вложенных папках.</summary>
+public sealed class CoreProgram
+{
+    /// <summary>Полный путь к папке, например C:\Program Files\App.</summary>
+    public string Folder { get; set; } = string.Empty;
+
+    /// <summary>Имя exe-файла, например app.exe.</summary>
+    public string Name { get; set; } = string.Empty;
+
+    /// <summary>И во вложенных папках: программы, которые ставят каждую версию в свою папку.</summary>
+    public bool Subfolders { get; set; }
 }

@@ -47,7 +47,7 @@ public interface IDialogService
     /// <summary>Несохранённые изменения: true — сохранить, false — не сохранять, null — остаться на странице.</summary>
     bool? AskSave(string title, string message, string saveText);
 
-    /// <summary>Файл .conf WireGuard; null — не выбран.</summary>
+    /// <summary>Файл .conf WireGuard или AmneziaWG или файл .vpn с ключом AmneziaVPN; null — не выбран.</summary>
     string? PickWireGuardFile();
 
     /// <summary>Текст из буфера обмена; null — там не текст или буфер занят другой программой.</summary>
@@ -140,8 +140,8 @@ public sealed class DialogService : IDialogService
     {
         var dialog = new OpenFileDialog
         {
-            Title = "Выберите файл WireGuard",
-            Filter = "Файлы WireGuard (*.conf)|*.conf|Все файлы (*.*)|*.*",
+            Title = "Выберите файл WireGuard или AmneziaWG",
+            Filter = "Файлы WireGuard, AmneziaWG и AmneziaVPN (*.conf, *.vpn)|*.conf;*.vpn|Все файлы (*.*)|*.*",
             CheckFileExists = true,
             Multiselect = false
         };

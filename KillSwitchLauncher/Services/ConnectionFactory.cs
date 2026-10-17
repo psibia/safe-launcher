@@ -7,26 +7,45 @@ using KillSwitchLauncher.Models;
 namespace KillSwitchLauncher.Services;
 
 /// <summary>
-/// Новое подключение из того, что вставил пользователь: ссылка на сервер, адрес подписки или текст файла WireGuard
-/// (лаунчер сам понимает, что это), либо прокси другой VPN-программы. И короткие описания подключений для списков.
+/// Новое подключение из того, что вставил пользователь: ссылка на сервер, адрес подписки, текст файла WireGuard
+/// или AmneziaWG или ключ vpn:// программы AmneziaVPN (лаунчер сам понимает, что это), либо прокси другой VPN-программы.
+/// И короткие описания подключений для списков.
 /// </summary>
 public static class ConnectionFactory
 {
     /// <summary>Похоже ли на подключение: так лаунчер решает, подставлять ли текст из буфера обмена.</summary>
     public static bool LooksLikeConnection(string? text) =>
         !string.IsNullOrWhiteSpace(text) &&
-        (WireGuardConf.LooksLikeConf(text) || ConnectionLinks.LooksLikeLink(text) || Subscriptions.LooksLikeUrl(text) && !text.Trim().Contains('\n'));
+        (WireGuardConf.LooksLikeConf(text) || AmneziaVpnKey.LooksLikeKey(text) || ConnectionLinks.LooksLikeLink(text) ||
+         Subscriptions.LooksLikeUrl(text) && !text.Trim().Contains('\n'));
 
     /// <summary>
     /// Распознаёт вставленный текст. Подписка возвращается ещё не загруженной: её список серверов скачивает вызывающий.
     /// Если распознать нельзя — <see cref="ConnectionParseException"/> с понятным объяснением.
     /// </summary>
-    /// <param name="fileName">Имя файла WireGuard без расширения: название подключения, если в файле его нет.</param>
+    /// <param name="fileName">Имя файла без расширения: название подключения, если в файле его нет.</param>
     public static VpnConnection FromText(string? text, IEnumerable<VpnConnection> existing, string? fileName = null)
     {
         var value = text?.Trim() ?? string.Empty;
         if (value.Length == 0)
-            throw new ConnectionParseException("Вставьте ссылку на сервер, адрес подписки или содержимое файла WireGuard.");
+            throw new ConnectionParseException("Вставьте ссылку на сервер, адрес подписки, ключ AmneziaVPN (vpn://) или содержимое файла WireGuard или AmneziaWG.");
+
+        // Ключ AmneziaVPN хранится как текст файла, который в нём записан: дальше это обычное подключение AmneziaWG или WireGuard.
+        if (AmneziaVpnKey.LooksLikeKey(value))
+        {
+            var (conf, keyName) = AmneziaVpnKey.ToConf(value);
+            ParsedServer server;
+            try
+            {
+                server = WireGuardConf.Parse(conf, keyName ?? fileName);
+            }
+            catch (ConnectionParseException ex)
+            {
+                throw new ConnectionParseException("Настройки из ключа vpn:// не подходят. " + ex.Message);
+            }
+
+            return New(ConnectionKind.WireGuard, server.Name, existing, c => c.WireGuardConfig = conf);
+        }
 
         if (WireGuardConf.LooksLikeConf(value))
         {
@@ -54,7 +73,7 @@ public static class ConnectionFactory
 
         throw new ConnectionParseException(
             "Не получилось распознать. Подойдёт ссылка vless://, vmess://, trojan://, ss://, hysteria2://, tuic:// или socks://, " +
-            "адрес подписки https://… или содержимое файла WireGuard (.conf).");
+            "адрес подписки https://…, ключ vpn:// от своего сервера в AmneziaVPN или содержимое файла WireGuard или AmneziaWG (.conf).");
     }
 
     /// <summary>Прокси другой VPN-программы на этом компьютере (v2rayN, Clash Verge, Hiddify).</summary>
@@ -74,6 +93,17 @@ public static class ConnectionFactory
         });
     }
 
+    /// <summary>
+    /// Уже добавленное подключение с теми же настройками, что у <paramref name="connection"/>, или null. Название не в счёт:
+    /// подписки сравниваются по адресу, остальные по серверу, к которому ведут (та же ссылка с другим названием, тот же файл
+    /// WireGuard или ключ vpn://, тот же прокси).
+    /// </summary>
+    public static VpnConnection? FindSame(VpnConnection connection, IEnumerable<VpnConnection> existing)
+    {
+        var key = SameKey(connection);
+        return key is null ? null : existing.FirstOrDefault(c => c.Id != connection.Id && SameKey(c) == key);
+    }
+
     /// <summary>Название, которого ещё нет в списке: «Германия», «Германия 2», «Германия 3»…</summary>
     public static string UniqueName(string name, IEnumerable<VpnConnection> existing, Guid? except = null)
     {
@@ -91,7 +121,7 @@ public static class ConnectionFactory
         }
     }
 
-    /// <summary>Вид подключения для списка: «VLESS · Reality», «Подписка · 12 серверов», «WireGuard», «SOCKS5 127.0.0.1:10808».</summary>
+    /// <summary>Вид подключения для списка: «VLESS · Reality», «Подписка · 12 серверов», «WireGuard», «AmneziaWG», «SOCKS5 127.0.0.1:10808».</summary>
     public static string Describe(VpnConnection connection)
     {
         switch (connection.Kind)
@@ -110,7 +140,7 @@ public static class ConnectionFactory
         }
         catch (ConnectionParseException)
         {
-            return connection.Kind == ConnectionKind.WireGuard ? "WireGuard · файл повреждён" : "Ссылка не распознаётся";
+            return connection.Kind == ConnectionKind.WireGuard ? WireGuardConf.ProtocolName(connection.WireGuardConfig) + " · файл повреждён" : "Ссылка не распознаётся";
         }
     }
 
@@ -132,6 +162,21 @@ public static class ConnectionFactory
         var word = (count % 100) is >= 11 and <= 14 ? "серверов"
             : (count % 10) switch { 1 => "сервер", 2 or 3 or 4 => "сервера", _ => "серверов" };
         return $"{count} {word}";
+    }
+
+    private static string? SameKey(VpnConnection connection)
+    {
+        if (connection.Kind == ConnectionKind.Subscription)
+            return string.IsNullOrWhiteSpace(connection.SubscriptionUrl) ? null : "subscription " + connection.SubscriptionUrl.Trim();
+        try
+        {
+            var (outbound, dns) = ConnectionOutbound.BuildWithDns(connection, "same");
+            return outbound.ToJsonString() + " " + dns;
+        }
+        catch (ConnectionParseException)
+        {
+            return null;
+        }
     }
 
     private static VpnConnection New(ConnectionKind kind, string name, IEnumerable<VpnConnection> existing, Action<VpnConnection> fill)

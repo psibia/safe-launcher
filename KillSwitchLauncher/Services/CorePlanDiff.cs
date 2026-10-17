@@ -54,9 +54,22 @@ public static class CorePlanDiff
                 parts.Add($"DNS внутри «{Name(names, tag)}»: {a ?? "нет"} → {b ?? "нет"}");
         }
 
+        if (before.Request.DnsOutbound != after.Request.DnsOutbound)
+            parts.Add($"редкие DNS-запросы: {Via(names, before.Request.DnsOutbound)} → {Via(names, after.Request.DnsOutbound)}");
+
         var appNames = AppNames(before, after);
         var oldApps = before.Request.Apps.ToDictionary(a => a.Tag);
         var newApps = after.Request.Apps.ToDictionary(a => a.Tag);
+
+        // Копии всех приложений сменились одинаково (обычно это общая настройка): одной строкой, иначе у каждого приложения.
+        var outside = newApps.Keys.Intersect(oldApps.Keys)
+            .Select(tag => (Before: Outside(oldApps[tag]), After: Outside(newApps[tag])))
+            .Distinct()
+            .ToList();
+        var together = outside.Count == 1 && outside[0].Before != outside[0].After;
+        if (together)
+            parts.Add($"копии приложений мимо лаунчера: {outside[0].Before} → {outside[0].After}");
+
         foreach (var tag in newApps.Keys.Except(oldApps.Keys))
             parts.Add($"добавлено приложение «{Name(appNames, tag)}» через «{Name(names, newApps[tag].Outbound)}»");
         foreach (var tag in oldApps.Keys.Except(newApps.Keys))
@@ -69,6 +82,13 @@ public static class CorePlanDiff
                 parts.Add($"«{Name(appNames, tag)}» сменило подключение: «{Name(names, a.Outbound)}» → «{Name(names, b.Outbound)}»");
             if (!a.DirectDomains.SequenceEqual(b.DirectDomains, StringComparer.OrdinalIgnoreCase))
                 parts.Add($"«{Name(appNames, tag)}»: исключения доменов {a.DirectDomains.Count} → {b.DirectDomains.Count}");
+            if (Outside(a) != Outside(b))
+            {
+                if (!together)
+                    parts.Add($"«{Name(appNames, tag)}»: копии мимо лаунчера {Outside(a)} → {Outside(b)}");
+            }
+            else if (!SamePrograms(a.Programs, b.Programs))
+                parts.Add($"«{Name(appNames, tag)}»: программы для копий мимо лаунчера {a.Programs?.Count ?? 0} → {b.Programs?.Count ?? 0}");
         }
 
         return parts.Count > 0 ? string.Join("; ", parts) : "изменился порядок или служебные поля настроек";
@@ -106,6 +126,15 @@ public static class CorePlanDiff
 
     private static string Short(JsonNode? node) => node is null ? "нет" : node is JsonValue v ? v.ToString() : "…";
 
+    /// <summary>Как идут копии приложения, запущенные мимо лаунчера (<see cref="CoreAppRoute.Programs"/>).</summary>
+    private static string Outside(CoreAppRoute route) =>
+        route.Programs is not { Count: > 0 } ? "напрямую" : route.BlockOutside ? "без сети" : "через VPN";
+
+    internal static bool SamePrograms(List<CoreProgram>? a, List<CoreProgram>? b) =>
+        (a ?? new List<CoreProgram>()).Select(Key).SequenceEqual((b ?? new List<CoreProgram>()).Select(Key), StringComparer.OrdinalIgnoreCase);
+
+    private static string Key(CoreProgram program) => program.Folder + "\\" + program.Name + (program.Subfolders ? "\\…" : string.Empty);
+
     private static string Tag(JsonObject outbound) => outbound["tag"]?.ToString() ?? "?";
 
     private static string Type(JsonObject outbound) => outbound["type"]?.ToString() ?? "?";
@@ -114,6 +143,9 @@ public static class CorePlanDiff
 
     private static string Name(IReadOnlyDictionary<string, string> names, string tag) =>
         names.TryGetValue(tag, out var name) ? name : tag;
+
+    private static string Via(IReadOnlyDictionary<string, string> names, string? tag) =>
+        tag is null ? "DNS компьютера" : $"через «{Name(names, tag)}»";
 
     private static Dictionary<string, string> ConnectionNames(CorePlan a, CorePlan b)
     {
@@ -125,6 +157,8 @@ public static class CorePlanDiff
                 if (plan.ConnectionTags.TryGetValue(app.ConnectionId, out var tag))
                     result[tag] = app.ConnectionName;
             }
+            if (plan.Request.DnsOutbound is { } dnsTag && plan.DnsConnectionName is { } dnsName)
+                result.TryAdd(dnsTag, dnsName);
         }
         return result;
     }

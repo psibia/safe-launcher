@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
@@ -22,8 +23,7 @@ internal static class NetworkSamples
     public static VpnConnection Link(string name, string link = Trojan) => new() { Name = name, Kind = ConnectionKind.Link, Link = link };
 
     public static AppEntry App(string name, AppNetworkMode mode = AppNetworkMode.Inherit, Guid? connection = null,
-        ProtectionOverride closeOnDrop = ProtectionOverride.Inherit, ProtectionOverride requireVpn = ProtectionOverride.Inherit,
-        params string[] domains) => new()
+        ProtectionOverride closeOnDrop = ProtectionOverride.Inherit, params string[] domains) => new()
     {
         Name = name,
         ExePath = $@"C:\Apps\{name}\{name}.exe",
@@ -32,7 +32,6 @@ internal static class NetworkSamples
             Mode = mode,
             ConnectionId = connection,
             CloseOnDrop = closeOnDrop,
-            RequireVpn = requireVpn,
             DirectDomains = domains.ToList()
         }
     };
@@ -118,6 +117,95 @@ public class CorePlanTests
     }
 
     [Fact]
+    public void Fingerprint_DoesNotDependOnTileOrder()
+    {
+        var vless = NetworkSamples.Link("VLESS", SampleConnections.VlessReality);
+        var wireGuard = new VpnConnection { Name = "WireGuard", Kind = ConnectionKind.WireGuard, WireGuardConfig = SampleConnections.WireGuard };
+        var amnezia = new VpnConnection { Name = "AmneziaWG", Kind = ConnectionKind.WireGuard, WireGuardConfig = SampleConnections.AmneziaWg };
+        var settings = NetworkSamples.Settings(vless,
+            NetworkSamples.App("A", AppNetworkMode.OwnConnection, wireGuard.Id),
+            NetworkSamples.App("B", AppNetworkMode.OwnConnection, amnezia.Id),
+            NetworkSamples.App("C", domains: "example.com"));
+        settings.Connections.Add(wireGuard);
+        settings.Connections.Add(amnezia);
+        var before = CorePlan.Build(settings, ipv6: false);
+        Assert.Equal(3, before.Request.Outbounds.Count);
+
+        // Перетаскивание плиток меняет порядок приложений в настройках.
+        settings.Apps.Reverse();
+        settings.Connections.Reverse();
+
+        Assert.Equal(before.Fingerprint, CorePlan.Build(settings, ipv6: false).Fingerprint);
+    }
+
+    [Fact]
+    public void SameWireGuardTwice_OneTunnel()
+    {
+        // Один и тот же файл, добавленный дважды: для сервера это один клиент, два туннеля отбивали бы друг у друга связь.
+        var first = new VpnConnection { Name = "Дом", Kind = ConnectionKind.WireGuard, WireGuardConfig = SampleConnections.AmneziaWg };
+        var copy = new VpnConnection { Name = "Дом 2", Kind = ConnectionKind.WireGuard, WireGuardConfig = SampleConnections.AmneziaWg };
+        var other = new VpnConnection { Name = "WireGuard", Kind = ConnectionKind.WireGuard, WireGuardConfig = SampleConnections.WireGuard };
+        var settings = NetworkSamples.Settings(NetworkSamples.Link("VLESS", SampleConnections.VlessReality),
+            NetworkSamples.App("A", AppNetworkMode.OwnConnection, first.Id),
+            NetworkSamples.App("B", AppNetworkMode.OwnConnection, copy.Id),
+            NetworkSamples.App("C", AppNetworkMode.OwnConnection, other.Id),
+            NetworkSamples.App("D"));
+        settings.Connections.Add(first);
+        settings.Connections.Add(copy);
+        settings.Connections.Add(other);
+
+        var plan = CorePlan.Build(settings, ipv6: false);
+
+        var a = CorePlan.ConnectionTag(first.Id);
+        var b = CorePlan.ConnectionTag(copy.Id);
+        var shared = string.CompareOrdinal(a, b) < 0 ? a : b;
+        Assert.Equal(shared, plan.ConnectionTags[first.Id]);
+        Assert.Equal(shared, plan.ConnectionTags[copy.Id]);
+        string Outbound(string app) => plan.Request.Apps.Single(r => r.Tag == plan.Apps.Values.Single(x => x.Name == app).Tag).Outbound;
+        Assert.Equal(shared, Outbound("A"));
+        Assert.Equal(shared, Outbound("B"));
+        Assert.Equal(CorePlan.ConnectionTag(other.Id), Outbound("C"));
+        Assert.Equal(3, plan.Request.Outbounds.Count);
+        Assert.Single(plan.Request.Outbounds, o => (string?)o["tag"] == shared);
+        Assert.All(plan.Request.OutboundDns ?? new Dictionary<string, string>(),
+            dns => Assert.Contains(plan.Request.Outbounds, o => (string?)o["tag"] == dns.Key));
+
+        settings.Apps.Reverse();
+        settings.Connections.Reverse();
+        Assert.Equal(plan.Fingerprint, CorePlan.Build(settings, ipv6: false).Fingerprint);
+
+        var request = new Svc.CoreRequest
+        {
+            Outbounds = plan.Request.Outbounds,
+            Apps = plan.Request.Apps.Select(r => new Svc.CoreAppRoute { Tag = r.Tag, Outbound = r.Outbound, DirectDomains = r.DirectDomains }).ToList(),
+            OutboundDns = plan.Request.OutboundDns
+        };
+        Assert.Single(Svc.CoreConfigBuilder.Build(request, new Svc.CoreApi(9090, "ключ"))["endpoints"]!.AsArray(),
+            e => (string?)e!["tag"] == shared);
+    }
+
+    [Fact]
+    public void SameWireGuardKey_OtherSettingsDiffer_OneTunnel()
+    {
+        // Тот же ключ, но в копии файла поменяли MTU: сервер всё равно видит одного клиента, туннель должен быть один.
+        var first = new VpnConnection { Name = "Дом", Kind = ConnectionKind.WireGuard, WireGuardConfig = SampleConnections.WireGuard };
+        var edited = new VpnConnection
+        {
+            Name = "Дом 2", Kind = ConnectionKind.WireGuard, WireGuardConfig = SampleConnections.WireGuard.Replace("MTU = 1420", "MTU = 1280")
+        };
+        var settings = NetworkSamples.Settings(NetworkSamples.Link("VLESS", SampleConnections.VlessReality),
+            NetworkSamples.App("A", AppNetworkMode.OwnConnection, first.Id),
+            NetworkSamples.App("B", AppNetworkMode.OwnConnection, edited.Id));
+        settings.Connections.Add(first);
+        settings.Connections.Add(edited);
+
+        var plan = CorePlan.Build(settings, ipv6: false);
+
+        Assert.Equal(plan.ConnectionTags[first.Id], plan.ConnectionTags[edited.Id]);
+        Assert.Single(plan.Request.Outbounds, o => (string?)o["type"] == "wireguard");
+    }
+
+    [Fact]
     public void ServiceAcceptsThePlan()
     {
         var connection = NetworkSamples.Link("Германия");
@@ -133,6 +221,276 @@ public class CorePlanTests
         var config = Svc.CoreConfigBuilder.Build(request, new Svc.CoreApi(9090, "ключ"));
 
         Assert.Equal(2, config["dns"]!["rules"]!.AsArray().Count(r => (string)r!["server"]! != Svc.CoreConfigBuilder.LocalDnsTag));
+    }
+
+    [Fact]
+    public void HideDns_RareQueriesThroughMainConnection()
+    {
+        var main = NetworkSamples.Link("Германия");
+        var settings = NetworkSamples.Settings(main, NetworkSamples.App("Discord"));
+        Assert.Null(CorePlan.Build(settings, ipv6: false).Request.DnsOutbound);
+
+        settings.HideDns = true;
+        var plan = CorePlan.Build(settings, ipv6: false);
+
+        Assert.Equal(CorePlan.ConnectionTag(main.Id), plan.Request.DnsOutbound);
+        Assert.Equal("Германия", plan.DnsConnectionName);
+        Assert.Single(plan.Request.Outbounds);
+    }
+
+    [Fact]
+    public void HideDns_MainConnectionJoinsCore_EvenIfNoAppUsesIt()
+    {
+        // Все приложения идут через свои подключения: основное попадает в ядро только ради DNS.
+        var main = NetworkSamples.Link("Германия");
+        var own = NetworkSamples.Link("Своё", SampleConnections.VlessReality);
+        var settings = NetworkSamples.Settings(main, NetworkSamples.App("Discord", AppNetworkMode.OwnConnection, own.Id));
+        settings.Connections.Add(own);
+        var before = CorePlan.Build(settings, ipv6: false);
+        Assert.Single(before.Request.Outbounds);
+
+        settings.HideDns = true;
+        var plan = CorePlan.Build(settings, ipv6: false);
+
+        Assert.Equal(CorePlan.ConnectionTag(main.Id), plan.Request.DnsOutbound);
+        Assert.Equal(2, plan.Request.Outbounds.Count);
+        Assert.Equal(CorePlan.ConnectionTag(own.Id), plan.Request.Apps.Single().Outbound);
+        Assert.Single(plan.Apps);
+        Assert.Contains("редкие DNS-запросы: DNS компьютера → через «Германия»", CorePlanDiff.Describe(before, plan));
+
+        // и служба собирает из такого плана настройки ядра
+        var request = new Svc.CoreRequest
+        {
+            Outbounds = plan.Request.Outbounds,
+            Apps = plan.Request.Apps.Select(a => new Svc.CoreAppRoute { Tag = a.Tag, Outbound = a.Outbound, DirectDomains = a.DirectDomains }).ToList(),
+            HideDns = plan.Request.HideDns,
+            OutboundDns = plan.Request.OutboundDns,
+            DnsOutbound = plan.Request.DnsOutbound
+        };
+        var dns = Svc.CoreConfigBuilder.Build(request, new Svc.CoreApi(9090, "ключ"))["dns"]!;
+        Assert.Equal("dns-" + plan.Request.DnsOutbound, (string)dns["rules"]!.AsArray().Last()!["server"]!);
+    }
+
+    [Theory]
+    [InlineData("системный VPN")]
+    [InlineData("нет приложений через ядро")]
+    [InlineData("основное не выбрано")]
+    [InlineData("основное не разобрать")]
+    public void HideDns_WithoutMainConnection_RareQueriesAsBefore(string situation)
+    {
+        var main = NetworkSamples.Link("Германия");
+        var own = NetworkSamples.Link("Своё", SampleConnections.VlessReality);
+        var app = NetworkSamples.App("Discord", AppNetworkMode.OwnConnection, own.Id);
+        var settings = NetworkSamples.Settings(main, app);
+        settings.Connections.Add(own);
+        settings.HideDns = true;
+        switch (situation)
+        {
+            case "системный VPN":
+                settings.NetworkMode = GlobalNetworkMode.SystemVpn;
+                break;
+            case "нет приложений через ядро":
+                app.Network.Mode = AppNetworkMode.OwnAdapters;
+                break;
+            case "основное не выбрано":
+                settings.ConnectionId = null;
+                break;
+            default:
+                main.Link = "vless://нет";
+                break;
+        }
+
+        var plan = CorePlan.Build(settings, ipv6: false);
+
+        Assert.Null(plan.Request.DnsOutbound);
+        Assert.Null(plan.DnsConnectionName);
+        Assert.DoesNotContain(plan.Request.Outbounds, o => (string?)o["tag"] == CorePlan.ConnectionTag(main.Id));
+        Assert.Empty(plan.Problems);
+    }
+
+    [Fact]
+    public void HideDns_MainIsSameWireGuardAsApp_OneTunnel()
+    {
+        var main = new VpnConnection { Name = "Дом", Kind = ConnectionKind.WireGuard, WireGuardConfig = SampleConnections.AmneziaWg };
+        var copy = new VpnConnection { Name = "Дом 2", Kind = ConnectionKind.WireGuard, WireGuardConfig = SampleConnections.AmneziaWg };
+        var settings = NetworkSamples.Settings(main, NetworkSamples.App("A", AppNetworkMode.OwnConnection, copy.Id));
+        settings.Connections.Add(copy);
+        settings.HideDns = true;
+
+        var plan = CorePlan.Build(settings, ipv6: false);
+
+        var tunnel = (string)Assert.Single(plan.Request.Outbounds)["tag"]!;
+        Assert.Equal(tunnel, plan.Request.DnsOutbound);
+        Assert.Equal(tunnel, plan.Request.Apps.Single().Outbound);
+    }
+
+    /// <summary>Программы приложения без файловой системы: папка C:\Apps\имя, exe по имени.</summary>
+    internal static IReadOnlyList<CoreProgram> ProgramsOf(AppEntry app) =>
+        new[] { new CoreProgram { Folder = $@"C:\Apps\{app.Name}", Name = app.Name + ".exe", Subfolders = true } };
+
+    [Fact]
+    public void OutsideCopies_ProgramsGoWithTheApp()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var settings = NetworkSamples.Settings(connection, NetworkSamples.App("Discord"));
+
+        var route = CorePlan.Build(settings, false, ProgramsOf).Request.Apps.Single();
+        Assert.Equal(@"C:\Apps\Discord", Assert.Single(route.Programs!).Folder);
+        Assert.False(route.BlockOutside);
+
+        settings.OutsideCopies = OutsideCopies.Block;
+        route = CorePlan.Build(settings, false, ProgramsOf).Request.Apps.Single();
+        Assert.Single(route.Programs!);
+        Assert.True(route.BlockOutside);
+
+        settings.OutsideCopies = OutsideCopies.Allow;
+        var asked = 0;
+        route = CorePlan.Build(settings, false, app => { asked++; return ProgramsOf(app); }).Request.Apps.Single();
+        Assert.Null(route.Programs);
+        Assert.False(route.BlockOutside);
+        Assert.Equal(0, asked);
+    }
+
+    [Fact]
+    public void OutsideCopies_ViaLauncher_CoreLeadsCopiesLikeVpn()
+    {
+        // Пока лаунчер не взял копию под контроль, ядро ведёт её через подключение приложения, как при «Через VPN».
+        var connection = NetworkSamples.Link("Германия");
+        var settings = NetworkSamples.Settings(connection, NetworkSamples.App("Discord"));
+        var vpn = CorePlan.Build(settings, false, ProgramsOf);
+
+        settings.OutsideCopies = OutsideCopies.Launcher;
+        var launcher = CorePlan.Build(settings, false, ProgramsOf);
+
+        var route = launcher.Request.Apps.Single();
+        Assert.Single(route.Programs!);
+        Assert.False(route.BlockOutside);
+        Assert.Equal(vpn.Fingerprint, launcher.Fingerprint);
+    }
+
+    [Fact]
+    public void OutsideCopies_ProgramOfSystemVpnApp_NotTaken()
+    {
+        // Одна программа на двух плитках: через ядро и под системным VPN. Её процессы без метки — не обязательно копии
+        // приложения через ядро, и уводить их в его подключение нельзя.
+        var connection = NetworkSamples.Link("Германия");
+        var viaCore = NetworkSamples.App("Chat");
+        var other = NetworkSamples.App("Discord");
+        var plan = CorePlan.Build(NetworkSamples.Settings(connection, viaCore, NetworkSamples.App("Chat", AppNetworkMode.OwnAdapters), other), false, ProgramsOf);
+
+        Assert.Null(plan.Request.Apps.Single(r => r.Tag == CorePlan.AppTag(viaCore.Id)).Programs);
+        Assert.Single(plan.Request.Apps.Single(r => r.Tag == CorePlan.AppTag(other.Id)).Programs!);
+    }
+
+    [Fact]
+    public void OutsideCopies_ChangeIsDescribed()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var settings = NetworkSamples.Settings(connection, NetworkSamples.App("Discord"));
+        var vpn = CorePlan.Build(settings, false, ProgramsOf);
+        settings.OutsideCopies = OutsideCopies.Block;
+        var block = CorePlan.Build(settings, false, ProgramsOf);
+        settings.OutsideCopies = OutsideCopies.Allow;
+        var allow = CorePlan.Build(settings, false, ProgramsOf);
+        settings.OutsideCopies = OutsideCopies.Vpn;
+        var moved = CorePlan.Build(settings, false,
+            app => new[] { ProgramsOf(app)[0], new CoreProgram { Folder = @"D:\Discord", Name = "Discord.exe" } });
+
+        Assert.NotEqual(vpn.Fingerprint, block.Fingerprint);
+        Assert.Equal("копии приложений мимо лаунчера: через VPN → без сети", CorePlanDiff.Describe(vpn, block));
+        Assert.Equal("копии приложений мимо лаунчера: без сети → напрямую", CorePlanDiff.Describe(block, allow));
+        Assert.Equal("«Discord»: программы для копий мимо лаунчера 1 → 2", CorePlanDiff.Describe(vpn, moved));
+    }
+
+    [Fact]
+    public void OutsideCopies_AppOverridesGlobal()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var blocked = NetworkSamples.App("Discord");
+        blocked.Network.OutsideCopies = OutsideCopiesOverride.Block;
+        var allowed = NetworkSamples.App("Telegram");
+        allowed.Network.OutsideCopies = OutsideCopiesOverride.Allow;
+        var inherit = NetworkSamples.App("Chat");
+        var settings = NetworkSamples.Settings(connection, blocked, allowed, inherit);
+
+        var request = CorePlan.Build(settings, false, ProgramsOf).Request;
+        CoreAppRoute Route(AppEntry app) => request.Apps.Single(r => r.Tag == CorePlan.AppTag(app.Id));
+        Assert.Single(Route(blocked).Programs!);
+        Assert.True(Route(blocked).BlockOutside);
+        Assert.Null(Route(allowed).Programs);
+        Assert.False(Route(allowed).BlockOutside);
+        Assert.Single(Route(inherit).Programs!);
+        Assert.False(Route(inherit).BlockOutside);
+
+        // Общее «Разрешить» не трогает приложение со своим значением.
+        settings.OutsideCopies = OutsideCopies.Allow;
+        request = CorePlan.Build(settings, false, ProgramsOf).Request;
+        Assert.True(Route(blocked).BlockOutside);
+        Assert.Null(Route(inherit).Programs);
+
+        // Своё «Через VPN» при общем «Разрешить»: программы других приложений под системным VPN всё так же не в счёт.
+        blocked.Network.OutsideCopies = OutsideCopiesOverride.Vpn;
+        settings.Apps.Add(NetworkSamples.App("Discord", AppNetworkMode.OwnAdapters));
+        request = CorePlan.Build(settings, false, ProgramsOf).Request;
+        Assert.Null(Route(blocked).Programs);
+    }
+
+    [Fact]
+    public void OfflineApp_NotInCore_ItsProgramsNotTaken()
+    {
+        // «Без сети» — не через ядро. Та же программа у приложения через ядро: её процессы без метки — не обязательно его копии.
+        var connection = NetworkSamples.Link("Германия");
+        var viaCore = NetworkSamples.App("Chat");
+        var offline = NetworkSamples.App("Chat");
+        offline.Network.Mode = AppNetworkMode.Offline;
+
+        var plan = CorePlan.Build(NetworkSamples.Settings(connection, viaCore, offline), false, ProgramsOf);
+
+        var route = Assert.Single(plan.Request.Apps);
+        Assert.Equal(CorePlan.AppTag(viaCore.Id), route.Tag);
+        Assert.Null(route.Programs);
+        Assert.False(plan.Apps.ContainsKey(offline.Id));
+        Assert.False(plan.Problems.ContainsKey(offline.Id));
+        Assert.Empty(CorePlan.Build(NetworkSamples.Settings(connection, offline), false, ProgramsOf).Request.Apps);
+    }
+
+    [Fact]
+    public void OutsideCopies_AppChangeIsDescribed()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var discord = NetworkSamples.App("Discord");
+        var settings = NetworkSamples.Settings(connection, discord, NetworkSamples.App("Telegram"));
+        var vpn = CorePlan.Build(settings, false, ProgramsOf);
+        discord.Network.OutsideCopies = OutsideCopiesOverride.Block;
+        var discordBlocked = CorePlan.Build(settings, false, ProgramsOf);
+        settings.OutsideCopies = OutsideCopies.Block;
+        var allBlocked = CorePlan.Build(settings, false, ProgramsOf);
+
+        Assert.Equal("«Discord»: копии мимо лаунчера через VPN → без сети", CorePlanDiff.Describe(vpn, discordBlocked));
+        Assert.Equal("«Telegram»: копии мимо лаунчера через VPN → без сети", CorePlanDiff.Describe(discordBlocked, allBlocked));
+        Assert.Equal("копии приложений мимо лаунчера: через VPN → без сети", CorePlanDiff.Describe(vpn, allBlocked));
+    }
+
+    [Fact]
+    public void Programs_AppFolderAndItsSubfolders()
+    {
+        using var dir = new TempDir();
+        var exe = dir.File("Telegram Desktop", "Telegram.exe");
+        Directory.CreateDirectory(Path.GetDirectoryName(exe)!);
+        File.WriteAllText(exe, "");
+
+        var programs = CorePlan.Programs(new AppEntry { ExePath = exe });
+
+        Assert.Contains(programs, p => string.Equals(p.Folder, Path.GetDirectoryName(exe), StringComparison.OrdinalIgnoreCase) && p.Subfolders);
+        Assert.All(programs, p => Assert.Equal("Telegram.exe", p.Name));
+    }
+
+    [Fact]
+    public void Programs_StoreAppsAndEngines_None()
+    {
+        Assert.Empty(CorePlan.Programs(new AppEntry { ExePath = @"C:\Program Files\WindowsApps\Vendor.App_1.0_x64\app.exe", AppUserModelId = "Vendor.App_abc!App" }));
+        Assert.Empty(CorePlan.Programs(new AppEntry { ExePath = @"C:\Program Files\Java\jre\bin\javaw.exe" }));
+        Assert.Empty(CorePlan.Programs(new AppEntry { ExePath = "" }));
     }
 }
 
@@ -181,6 +539,29 @@ public class CoreConfigDnsTests
         Assert.Equal("ключ", (string)api["secret"]!);
         Assert.Null(Svc.CoreConfigBuilder.Build(Request())["experimental"]);
     }
+
+    [Fact]
+    public void CheckProxy_OnLoopbackWithKey_UserChoosesConnection()
+    {
+        var request = Request();
+        request.Outbounds.Add(new JsonObject { ["type"] = "wireguard", ["tag"] = "wg", ["address"] = new JsonArray("10.0.0.2/32"), ["private_key"] = "k" });
+        var config = Svc.CoreConfigBuilder.Build(request, new Svc.CoreApi(45678, "ключ", 45679));
+
+        var check = config["inbounds"]!.AsArray().Single(i => (string?)i!["tag"] == Svc.CoreConfigBuilder.CheckInboundTag)!;
+        Assert.Equal(("mixed", "127.0.0.1", 45679), ((string)check["type"]!, (string)check["listen"]!, (int)check["listen_port"]!));
+        Assert.Equal(new[] { "vpn:ключ", "wg:ключ" }, check["users"]!.AsArray().Select(u => $"{u!["username"]}:{u["password"]}"));
+
+        // Правила проверки — первыми: соединение проверки не попадёт под правила приложений и DNS.
+        var rules = config["route"]!["rules"]!.AsArray();
+        Assert.All(rules.Take(3), r => Assert.Equal(Svc.CoreConfigBuilder.CheckInboundTag, (string)r!["inbound"]![0]!));
+        Assert.Equal(("vpn", "vpn"), ((string)rules[0]!["auth_user"]![0]!, (string)rules[0]!["outbound"]!));
+        Assert.Equal(("wg", "wg"), ((string)rules[1]!["auth_user"]![0]!, (string)rules[1]!["outbound"]!));
+        Assert.Equal("reject", (string)rules[2]!["action"]!);
+        Assert.Null(rules[2]!["auth_user"]);
+
+        Assert.Single(Svc.CoreConfigBuilder.Build(Request(), new Svc.CoreApi(45678, "ключ"))["inbounds"]!.AsArray());
+        Assert.Single(Svc.CoreConfigBuilder.Build(new Svc.CoreRequest(), new Svc.CoreApi(45678, "ключ", 45679))["inbounds"]!.AsArray());
+    }
 }
 
 public class LauncherNetworkTests
@@ -221,7 +602,20 @@ public class LauncherNetworkTests
         public Task<IReadOnlyList<string>> LogTailAsync(CancellationToken cancellation) =>
             Task.FromResult<IReadOnlyList<string>>(CoreLog);
 
+        /// <summary>Соединения через ядро; null — ядро не ответило. Тест заменяет список целиком (проверка идёт в другом потоке).</summary>
+        public volatile List<CoreConnection>? Connections = new();
+        public int ConnectionQueries;
+
+        public Task<CoreConnectionList> ConnectionsAsync(TimeSpan timeout, CancellationToken cancellation)
+        {
+            Interlocked.Increment(ref ConnectionQueries);
+            var connections = Connections;
+            return Task.FromResult(connections is null ? CoreConnectionList.Failed("нет ответа") : new CoreConnectionList(connections, null));
+        }
+
         public void Crash() => Lost?.Invoke("упало", new List<string>());
+
+        public CoreCheckProxy? CheckProxy { get; set; } = new(45679, "ключ");
 
         public bool Disposed;
 
@@ -235,6 +629,7 @@ public class LauncherNetworkTests
         public readonly List<Guid> Blocked = new();
         public int Frozen;
         public int Thawed;
+        public readonly List<Guid> FrozenApps = new();
 
         public IReadOnlyList<Guid> RunningApps()
         {
@@ -245,6 +640,7 @@ public class LauncherNetworkTests
         public IDisposable Freeze(IReadOnlyCollection<Guid> appIds)
         {
             Frozen++;
+            FrozenApps.AddRange(appIds);
             return new Thaw(this);
         }
 
@@ -331,13 +727,214 @@ public class LauncherNetworkTests
     }
 
     [Fact]
-    public async Task ServerNotAnswering_LaunchRefused_WhenRequired()
+    public async Task OtherChanges_WaitWhileAppsRun()
+    {
+        // Работает приложение через WireGuard. Запуск приложения через VLESS не перезапускает ядро (перезапуск оборвал бы
+        // соединения WireGuard), хотя с тех пор изменилось то, что запускаемого не касается. Здесь проверяется только запуск:
+        // в лаунчере добавленное приложение с копиями мимо лаунчера применяется сразу (KeepRunningAsync).
+        var vless = NetworkSamples.Link("VLESS", SampleConnections.VlessReality);
+        var wireGuard = new VpnConnection { Name = "WireGuard", Kind = ConnectionKind.WireGuard, WireGuardConfig = SampleConnections.WireGuard };
+        var wg = NetworkSamples.App("WG", AppNetworkMode.OwnConnection, wireGuard.Id);
+        var browser = NetworkSamples.App("Браузер", AppNetworkMode.OwnConnection, vless.Id);
+        var other = NetworkSamples.App("Другое", AppNetworkMode.OwnConnection, vless.Id);
+        var settings = NetworkSamples.Settings(vless, wg, browser, other);
+        settings.Connections.Add(wireGuard);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false));
+        Assert.Null(await network.PrepareLaunchAsync(wg.Id));
+        _processes.Running.Add(wg.Id);
+
+        // В сети появился IPv6, у другого приложения новые исключения, добавлено приложение, плитки переставлены.
+        other.Network.DirectDomains.Add("example.com");
+        var added = NetworkSamples.App("Новое", AppNetworkMode.OwnConnection, wireGuard.Id);
+        settings.Apps.Add(added);
+        settings.Apps.Reverse();
+        network.Update(CorePlan.Build(settings, ipv6: true));
+
+        Assert.Null(await network.PrepareLaunchAsync(browser.Id));
+        Assert.Equal(1, _backend.Starts);
+        Assert.Equal(0, _processes.Frozen);
+        Assert.Equal(CorePlan.AppTag(browser.Id), network.TagFor(browser.Id));
+        Assert.Null(network.TagFor(added.Id));
+        _processes.Running.Add(browser.Id);
+
+        // Новому приложению нынешних настроек ядра не хватает: перезапуск, и с ним остальные изменения.
+        Assert.Null(await network.PrepareLaunchAsync(added.Id));
+        Assert.Equal(2, _backend.Starts);
+        Assert.Equal(1, _processes.Frozen);
+        Assert.True(_backend.Last!.Ipv6);
+        Assert.Equal(CorePlan.AppTag(added.Id), network.TagFor(added.Id));
+    }
+
+    [Theory]
+    [InlineData("сервер подключения")]
+    [InlineData("скрывать DNS")]
+    public async Task ChangesForLaunchedApp_Restart(string change)
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var b = NetworkSamples.App("B");
+        var settings = NetworkSamples.Settings(connection, a, b);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false));
+        await network.PrepareLaunchAsync(a.Id);
+        _processes.Running.Add(a.Id);
+
+        if (change == "скрывать DNS")
+            settings.HideDns = true;
+        else
+            connection.Link = "trojan://secret@5.6.7.9:443?sni=example.com#Другой";
+        network.Update(CorePlan.Build(settings, false));
+
+        Assert.Null(await network.PrepareLaunchAsync(b.Id));
+        Assert.Equal(2, _backend.Starts);
+        Assert.Equal(1, _processes.Frozen);
+    }
+
+    [Fact]
+    public async Task MainConnectionOnlyForDns_ChangeWaitsWhileAppsRun()
+    {
+        var main = NetworkSamples.Link("Германия");
+        var own = NetworkSamples.Link("Своё", SampleConnections.VlessReality);
+        var a = NetworkSamples.App("A", AppNetworkMode.OwnConnection, own.Id);
+        var b = NetworkSamples.App("B", AppNetworkMode.OwnConnection, own.Id);
+        var settings = NetworkSamples.Settings(main, a, b);
+        settings.Connections.Add(own);
+        settings.HideDns = true;
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false));
+        Assert.Null(await network.PrepareLaunchAsync(a.Id));
+        _processes.Running.Add(a.Id);
+        Assert.Equal(CorePlan.ConnectionTag(main.Id), _backend.Last!.DnsOutbound);
+
+        // Через основное подключение идут только редкие DNS-запросы: из-за смены его сервера обрывать A незачем.
+        main.Link = "trojan://secret@5.6.7.9:443?sni=example.com#Другой";
+        network.Update(CorePlan.Build(settings, false));
+
+        Assert.Null(await network.PrepareLaunchAsync(b.Id));
+        Assert.Equal(1, _backend.Starts);
+        Assert.Equal(0, _processes.Frozen);
+    }
+
+    [Fact]
+    public async Task CheckRoute_WireGuardOfRunningCore_ThroughCore()
+    {
+        // Второй туннель с ключом, который уже работает в ядре, отбил бы у ядра связь с сервером: такой WireGuard
+        // (и его копия в другом подключении) проверяется через ядро. Остальное — отдельной копией ядра, как раньше.
+        var home = new VpnConnection { Name = "Дом", Kind = ConnectionKind.WireGuard, WireGuardConfig = SampleConnections.AmneziaWg };
+        var copy = new VpnConnection { Name = "Дом 2", Kind = ConnectionKind.WireGuard, WireGuardConfig = SampleConnections.AmneziaWg };
+        var other = new VpnConnection { Name = "WireGuard", Kind = ConnectionKind.WireGuard, WireGuardConfig = SampleConnections.WireGuard };
+        var vless = NetworkSamples.Link("VLESS", SampleConnections.VlessReality);
+        var app = NetworkSamples.App("A", AppNetworkMode.OwnConnection, home.Id);
+        var browser = NetworkSamples.App("Браузер");
+        var settings = NetworkSamples.Settings(vless, app, browser);
+        settings.Connections.Add(home);
+        settings.Connections.Add(copy);
+        settings.Connections.Add(other);
+        JsonObject Server(VpnConnection connection) => ConnectionOutbound.Resolve(connection).Outbound;
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false));
+
+        Assert.Null(network.CheckRouteFor(Server(home)));
+
+        Assert.Null(await network.PrepareLaunchAsync(app.Id));
+        var route = network.CheckRouteFor(Server(home));
+        Assert.Equal(CorePlan.ConnectionTag(home.Id), route?.Tag);
+        Assert.Equal(_backend.CheckProxy, route?.Proxy);
+        Assert.Equal(route, network.CheckRouteFor(Server(copy)));
+        Assert.Null(network.CheckRouteFor(Server(other)));
+        Assert.Null(network.CheckRouteFor(Server(vless)));
+
+        _backend.CheckProxy = null; // служба старше протокола 7
+        Assert.Null(network.CheckRouteFor(Server(home)));
+        _backend.CheckProxy = new CoreCheckProxy(45679, "ключ");
+
+        await network.StopAsync();
+        Assert.Null(network.CheckRouteFor(Server(home)));
+    }
+
+    [Fact]
+    public async Task NothingRunning_NextLaunchTakesNewSettings()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var b = NetworkSamples.App("B");
+        var settings = NetworkSamples.Settings(connection, a, b);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false));
+        await network.PrepareLaunchAsync(a.Id);
+
+        // A уже закрыто, ядро ещё не выключилось, других программ через него нет: обрывать нечего, и ядро сразу берёт новые настройки.
+        network.Update(CorePlan.Build(settings, ipv6: true));
+        Assert.Null(await network.PrepareLaunchAsync(b.Id));
+
+        Assert.Equal(2, _backend.Starts);
+        Assert.Equal(0, _processes.Frozen);
+        Assert.True(_backend.Last!.Ipv6);
+    }
+
+    [Fact]
+    public async Task ServerDown_ClosesByCurrentSettings()
+    {
+        // «Закрывать при обрыве» включили, когда ядро уже работало: ядро ради этого не перезапускается,
+        // но при обрыве приложение закрывается.
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A", closeOnDrop: ProtectionOverride.Off);
+        var settings = NetworkSamples.Settings(connection, a);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false));
+        await network.PrepareLaunchAsync(a.Id);
+        _processes.Running.Add(a.Id);
+
+        a.Network.CloseOnDrop = ProtectionOverride.On;
+        network.Update(CorePlan.Build(settings, false));
+        _backend.Delay = _ => null;
+        await network.CheckHealthAsync();
+        await network.CheckHealthAsync();
+
+        Assert.Equal(1, _backend.Starts);
+        Assert.Equal(new[] { a.Id }, _processes.Killed);
+    }
+
+    [Fact]
+    public async Task OfflineRun_NotClosedOrFrozenByCore()
+    {
+        // «B» по настройкам через подключение, но запущено разово без сети: ядро его не ведёт, и при обрыве сервера
+        // закрывается только «A».
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A", closeOnDrop: ProtectionOverride.On);
+        var b = NetworkSamples.App("B", closeOnDrop: ProtectionOverride.On);
+        var settings = NetworkSamples.Settings(connection, a, b);
+        var processes = new CoreAppProcesses(_processes);
+        processes.SetOffline(new[] { b.Id });
+        using var network = new LauncherNetwork(processes, () => _backend, TimeSpan.FromHours(1), TimeSpan.FromHours(1))
+        {
+            ProbeRetryPause = TimeSpan.FromMilliseconds(10)
+        };
+        network.Update(CorePlan.Build(settings, false));
+        await network.PrepareLaunchAsync(a.Id);
+        _processes.Running.Add(a.Id);
+        _processes.Running.Add(b.Id);
+
+        Assert.Equal(new[] { a.Id }, processes.RunningApps());
+        _backend.Delay = _ => null;
+        await network.CheckHealthAsync();
+        await network.CheckHealthAsync();
+
+        Assert.Equal(new[] { a.Id }, _processes.Killed);
+        Assert.Contains(b.Id, _processes.Running);
+
+        processes.SetOffline(Array.Empty<Guid>());
+        Assert.Equal(new[] { b.Id }, processes.RunningApps());
+    }
+
+    [Fact]
+    public async Task ServerNotAnswering_LaunchRefused()
     {
         var connection = NetworkSamples.Link("Германия");
         var strict = NetworkSamples.App("Строгое");
-        var relaxed = NetworkSamples.App("Без проверки", requireVpn: ProtectionOverride.Off);
         using var network = Network();
-        network.Update(CorePlan.Build(NetworkSamples.Settings(connection, strict, relaxed), false));
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection, strict), false));
         _backend.Delay = _ => null;
         _backend.CoreLog.AddRange(new[]
         {
@@ -353,8 +950,6 @@ public class LauncherNetworkTests
         Assert.Equal(connection.Id, failure!.ConnectionId);
         Assert.Contains("ядро не смогло связаться", failure.Summary);
         Assert.Contains("dns: exchange failed", Assert.Single(failure.CoreLog));
-
-        Assert.Null(await network.PrepareLaunchAsync(relaxed.Id));
     }
 
     [Fact]
@@ -402,29 +997,6 @@ public class LauncherNetworkTests
         Assert.Contains("не выбрано подключение", await network.PrepareLaunchAsync(app.Id));
         Assert.Equal(0, _backend.Starts);
         Assert.True(network.IsViaCore(app.Id));
-    }
-
-    [Fact]
-    public async Task CoreCrash_ClosesEveryAppThroughCore()
-    {
-        var connection = NetworkSamples.Link("Германия");
-        var a = NetworkSamples.App("A", closeOnDrop: ProtectionOverride.Off);
-        var other = Guid.NewGuid();
-        using var network = Network();
-        network.Update(CorePlan.Build(NetworkSamples.Settings(connection, a), false));
-        await network.PrepareLaunchAsync(a.Id);
-        _processes.Running.Add(a.Id);
-        _processes.Running.Add(other);
-        KillReport? report = null;
-        network.CoreLost += (_, r) => report = r;
-
-        _backend.Crash();
-
-        Assert.NotNull(report);
-        Assert.Equal(new[] { a.Id }, _processes.Killed); // даже без «Закрывать при обрыве»
-        Assert.Contains(other, _processes.Running);
-        Assert.False(network.IsCoreRunning);
-        Assert.True(_backend.Disposed);
     }
 
     [Fact]
@@ -482,14 +1054,16 @@ public class LauncherNetworkTests
     }
 
     [Fact]
-    public async Task CoreStops_WhenLastAppExits()
+    public async Task CoreStops_WhenLastAppExits_AndNoAppsThroughCoreInSettings()
     {
+        // Приложение перевели на системный VPN (или убрали), пока оно работало: ядро больше не нужно его копиям.
         var connection = NetworkSamples.Link("Германия");
         var a = NetworkSamples.App("A");
         using var network = Network(TimeSpan.FromMilliseconds(100));
         network.Update(CorePlan.Build(NetworkSamples.Settings(connection, a), false));
         await network.PrepareLaunchAsync(a.Id);
         _processes.Running.Add(a.Id);
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection), false));
 
         network.OnProcessesChanged();
         await Task.Delay(400);
@@ -501,6 +1075,831 @@ public class LauncherNetworkTests
         Assert.True(await Wait.UntilAsync(() => _backend.Stops == 1, TimeSpan.FromSeconds(5)));
         Assert.False(network.IsCoreRunning);
     }
+
+    [Fact]
+    public async Task CoreKeptOn_WhileOtherProgramsHaveConnections()
+    {
+        // Пока ядро работает, через него идут и соединения других программ: выключение ядра их оборвало бы.
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        using var network = Network(TimeSpan.FromMilliseconds(100));
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection, a), false, NoCopies));
+        await network.PrepareLaunchAsync(a.Id);
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection), false, NoCopies)); // приложений через ядро в настройках не осталось
+        _backend.Connections = new List<CoreConnection>
+        {
+            new("tcp", 443, @"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            new("udp", 53, @"C:\Windows\System32\svchost.exe")
+        };
+
+        network.OnProcessesChanged(); // A закрылось
+        Assert.True(await Wait.UntilAsync(() => Volatile.Read(ref _backend.ConnectionQueries) >= 3, TimeSpan.FromSeconds(5)));
+        Assert.Equal(0, _backend.Stops);
+        Assert.True(network.IsCoreRunning);
+
+        // Остался только запрос DNS: он разовый, ядро выключается.
+        _backend.Connections = new List<CoreConnection> { new("udp", 53, @"C:\Windows\System32\svchost.exe") };
+        Assert.True(await Wait.UntilAsync(() => _backend.Stops == 1, TimeSpan.FromSeconds(5)));
+        Assert.False(network.IsCoreRunning);
+    }
+
+    [Fact]
+    public async Task ConnectionsUnknown_CoreStopsAsBefore()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        using var network = Network(TimeSpan.FromMilliseconds(100));
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection, a), false, NoCopies));
+        await network.PrepareLaunchAsync(a.Id);
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection), false, NoCopies));
+        _backend.Connections = null;
+
+        network.OnProcessesChanged();
+
+        Assert.True(await Wait.UntilAsync(() => _backend.Stops == 1, TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public void OtherPrograms_WithoutLauncherAppsAndLookups()
+    {
+        var all = new[]
+        {
+            new CoreConnection("tcp", 443, @"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            new CoreConnection("udp", 3478, @"C:\Users\u\AppData\Local\Discord\app-1.0\Discord.exe"),
+            new CoreConnection("tcp", 3389, ""),
+            new CoreConnection("tcp", 53, @"C:\Windows\System32\svchost.exe"),
+            new CoreConnection("udp", 53, @"C:\Windows\System32\svchost.exe"),
+            new CoreConnection("udp", 123, @"C:\Windows\System32\svchost.exe"),
+            new CoreConnection("udp", 7, Svc.CoreConfigBuilder.TagPrefix + @"a1|C:\Games\game.exe"),
+            new CoreConnection("tcp", 443, @"C:\Program Files\Google\Chrome\Application\CHROME.EXE")
+        };
+
+        var others = LauncherNetwork.OthersOf(all);
+
+        Assert.Equal(Svc.CoreConfigBuilder.TagPrefix, LauncherNetwork.LauncherProcessPrefix);
+        Assert.Equal(new[] { 443, 3478, 3389, 53, 443 }, others.Select(c => c.Port));
+        Assert.Equal("5: chrome.exe ×2, Discord.exe, svchost.exe, программа не определена", LauncherNetwork.Describe(others));
+    }
+
+    [Fact]
+    public async Task OtherProgramsConnections_LaunchRestartsOnlyIfNeeded()
+    {
+        // Приложений нет, но через ядро идут соединения других программ: запуск приложения, которому хватает нынешних
+        // настроек, ядро не перезапускает (перезапуск оборвал бы эти соединения).
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var b = NetworkSamples.App("B");
+        var settings = NetworkSamples.Settings(connection, a, b);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false));
+        await network.PrepareLaunchAsync(a.Id);
+        _backend.Connections = new List<CoreConnection> { new("tcp", 443, @"C:\Program Files\Mozilla Firefox\firefox.exe") };
+
+        network.Update(CorePlan.Build(settings, ipv6: true));
+        Assert.Null(await network.PrepareLaunchAsync(b.Id));
+        Assert.Equal(1, _backend.Starts);
+
+        // Запускаемому нынешних настроек не хватает: перезапуск со всеми изменениями.
+        b.Network.DirectDomains.Add("example.com");
+        network.Update(CorePlan.Build(settings, ipv6: true));
+        Assert.Null(await network.PrepareLaunchAsync(b.Id));
+        Assert.Equal(2, _backend.Starts);
+        Assert.True(_backend.Last!.Ipv6);
+    }
+
+    [Fact]
+    public async Task CoreLost_NoAppsThroughCoreInSettings_NotReportedNotRestarted()
+    {
+        // Ядро работало без приложений (ждало, пока закроются соединения других программ), приложение уже убрали из
+        // настроек, и ядро упало: сообщать не о чем, запускать заново незачем.
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        using var network = Network();
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection, a), false));
+        await network.PrepareLaunchAsync(a.Id);
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection), false));
+        var reported = false;
+        network.CoreLost += (_, _) => reported = true;
+
+        _backend.Crash();
+        await Task.Delay(200);
+
+        Assert.False(reported);
+        Assert.False(network.IsCoreRunning);
+        Assert.Equal(1, _backend.Starts);
+    }
+
+    [Fact]
+    public async Task CoreLost_WithoutRunningApps_RestartedQuietly()
+    {
+        // Приложение через ядро есть в настройках, но не запущено: ядро нужно его копиям мимо лаунчера и запускается
+        // заново, а сообщать пользователю не о чем.
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        using var network = Network();
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection, a), false));
+        Assert.Null(await network.KeepRunningAsync("тест"));
+        var reported = false;
+        network.CoreLost += (_, _) => reported = true;
+        network.CoreRecovered += (_, _) => reported = true;
+
+        _backend.Crash();
+
+        Assert.True(await Wait.UntilAsync(() => network.IsCoreRunning, TimeSpan.FromSeconds(5)));
+        Assert.Equal(2, _backend.Starts);
+        Assert.Equal(0, _processes.Frozen);
+        Assert.False(reported);
+    }
+
+    [Fact]
+    public async Task KeepRunning_StartsCoreForCopies_WithoutLaunch()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var settings = NetworkSamples.Settings(connection, a);
+        settings.OutsideCopies = OutsideCopies.Block;
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false, CorePlanTests.ProgramsOf));
+
+        Assert.Null(await network.KeepRunningAsync("открыт лаунчер"));
+
+        Assert.Equal(1, _backend.Starts);
+        Assert.True(network.IsCoreRunning);
+        Assert.True(network.OutsideBlocked(a.Id)); // копия по ярлыку сразу без сети
+        Assert.Equal(0, _backend.Probes); // сервер проверяется только перед запуском приложения
+
+        // Повторный вызов с теми же настройками ничего не делает, запуск приложения ядро не перезапускает.
+        Assert.Null(await network.KeepRunningAsync("изменились настройки"));
+        Assert.Null(await network.PrepareLaunchAsync(a.Id));
+        Assert.Equal(1, _backend.Starts);
+    }
+
+    [Fact]
+    public async Task KeepRunning_NoAppsThroughCore_CoreNotStarted()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var system = NetworkSamples.App("Под системным VPN", AppNetworkMode.OwnAdapters);
+        using var network = Network();
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection, system), false));
+
+        Assert.Null(await network.KeepRunningAsync("открыт лаунчер"));
+
+        Assert.Equal(0, _backend.Starts);
+        Assert.False(network.IsCoreRunning);
+    }
+
+    [Fact]
+    public async Task KeepRunning_StartFails_ReasonReturned()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        using var network = Network();
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection, a), false));
+        _backend.FailStart = true;
+
+        Assert.Equal("не вышло", await network.KeepRunningAsync("открыт лаунчер"));
+        Assert.False(network.IsCoreRunning);
+
+        // Запуск приложения пробует снова.
+        _backend.FailStart = false;
+        Assert.Null(await network.PrepareLaunchAsync(a.Id));
+        Assert.True(network.IsCoreRunning);
+    }
+
+    /// <summary>У приложения нет программ для копий мимо лаунчера (копии идут напрямую при любых настройках).</summary>
+    private static IReadOnlyList<CoreProgram> NoCopies(AppEntry app) => Array.Empty<CoreProgram>();
+
+    private static readonly List<CoreConnection> ChromeConnection = new()
+    {
+        new("tcp", 443, @"C:\Program Files\Google\Chrome\Application\chrome.exe")
+    };
+
+    [Fact]
+    public async Task KeepRunning_NewApp_CopiesGoAsChosenAtOnce()
+    {
+        // Добавили приложение, пока A работает: его копия по ярлыку должна сразу идти как выбрано, поэтому ядро
+        // перезапускается сразу, а A на это время приостанавливается.
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var settings = NetworkSamples.Settings(connection, a);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false, CorePlanTests.ProgramsOf));
+        await network.PrepareLaunchAsync(a.Id);
+        _processes.Running.Add(a.Id);
+
+        var b = NetworkSamples.App("B");
+        settings.Apps.Add(b);
+        network.Update(CorePlan.Build(settings, false, CorePlanTests.ProgramsOf));
+        Assert.Null(await network.KeepRunningAsync("изменились настройки"));
+
+        Assert.Equal(2, _backend.Starts);
+        Assert.Equal((1, 1), (_processes.Frozen, _processes.Thawed));
+        Assert.False(network.OutsideBlocked(b.Id));
+        Assert.Equal(CorePlan.AppTag(a.Id), network.TagFor(a.Id));
+        Assert.Empty(_processes.Killed);
+    }
+
+    [Fact]
+    public async Task KeepRunning_NotUrgent_WaitsWhileSomethingGoesThrough()
+    {
+        // IPv6 и новый сервер подключения не срочно: прежние настройки работают, перезапуск оборвал бы соединения.
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var settings = NetworkSamples.Settings(connection, a);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false, CorePlanTests.ProgramsOf));
+        await network.PrepareLaunchAsync(a.Id);
+        _processes.Running.Add(a.Id);
+
+        connection.Link = "trojan://secret@5.6.7.9:443?sni=example.com#Другой";
+        network.Update(CorePlan.Build(settings, ipv6: true, CorePlanTests.ProgramsOf));
+        Assert.Null(await network.KeepRunningAsync("изменились настройки"));
+        Assert.Equal(1, _backend.Starts);
+        Assert.Equal(0, _processes.Frozen);
+
+        // A закрылось, а через ядро идут соединения других программ. Копии A мимо лаунчера должны идти через новый сервер,
+        // а запуска A, который применил бы его, может и не быть: перезапуск сразу.
+        _processes.Running.Clear();
+        _backend.Connections = ChromeConnection;
+        Assert.Null(await network.KeepRunningAsync("изменились настройки"));
+        Assert.Equal(2, _backend.Starts);
+        Assert.True(_backend.Last!.Ipv6);
+    }
+
+    [Fact]
+    public async Task KeepRunning_ServerChanged_AppWithoutCopies_WaitsWhileSomethingGoesThrough()
+    {
+        // У A копии идут напрямую: новый сервер нужен только при запуске, перезапуск подождёт, пока через ядро ничего не идёт.
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var settings = NetworkSamples.Settings(connection, a);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false, NoCopies));
+        Assert.Null(await network.KeepRunningAsync("открыт лаунчер"));
+        _backend.Connections = ChromeConnection;
+
+        connection.Link = "trojan://secret@5.6.7.9:443?sni=example.com#Другой";
+        network.Update(CorePlan.Build(settings, ipv6: true, NoCopies));
+        Assert.Null(await network.KeepRunningAsync("изменились настройки"));
+        Assert.Equal(1, _backend.Starts);
+
+        // Через ядро ничего не идёт: перезапуск с новыми настройками.
+        _backend.Connections = new List<CoreConnection>();
+        Assert.Null(await network.KeepRunningAsync("изменились настройки"));
+        Assert.Equal(2, _backend.Starts);
+        Assert.True(_backend.Last!.Ipv6);
+    }
+
+    [Fact]
+    public async Task KeepRunning_NotUrgent_AppliedOnceOtherProgramsClose()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var settings = NetworkSamples.Settings(connection, a);
+        using var network = Network(TimeSpan.FromMilliseconds(30));
+        network.Update(CorePlan.Build(settings, false, CorePlanTests.ProgramsOf));
+        Assert.Null(await network.KeepRunningAsync("открыт лаунчер"));
+        _backend.Connections = ChromeConnection;
+
+        network.Update(CorePlan.Build(settings, ipv6: true, CorePlanTests.ProgramsOf));
+        Assert.Null(await network.KeepRunningAsync("изменились настройки"));
+        Assert.Equal(1, _backend.Starts);
+
+        // Ядро проверяет снова само, без новых изменений настроек.
+        _backend.Connections = new List<CoreConnection>();
+        Assert.True(await Wait.UntilAsync(() => _backend.Starts == 2, TimeSpan.FromSeconds(5)));
+        Assert.True(_backend.Last!.Ipv6);
+    }
+
+    [Theory]
+    [InlineData("без интернета")]
+    [InlineData("напрямую")]
+    [InlineData("у приложения")]
+    public async Task KeepRunning_OutsideCopiesChanged_AppliedAtOnce_EvenWithOtherPrograms(string change)
+    {
+        // Хром открыт по ярлыку и идёт через ядро как копия приложения: смена «Если открыто не из лаунчера» действует сразу,
+        // хотя перезапуск оборвёт его соединения.
+        var connection = NetworkSamples.Link("Германия");
+        var chrome = NetworkSamples.App("Chrome");
+        var settings = NetworkSamples.Settings(connection, chrome);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false, CorePlanTests.ProgramsOf));
+        Assert.Null(await network.KeepRunningAsync("открыт лаунчер"));
+        Assert.False(network.OutsideBlocked(chrome.Id));
+        _backend.Connections = ChromeConnection;
+
+        if (change == "без интернета")
+            settings.OutsideCopies = OutsideCopies.Block;
+        else if (change == "напрямую")
+            settings.OutsideCopies = OutsideCopies.Allow;
+        else
+            chrome.Network.OutsideCopies = OutsideCopiesOverride.Block;
+        network.Update(CorePlan.Build(settings, false, CorePlanTests.ProgramsOf));
+        Assert.Null(await network.KeepRunningAsync("изменились настройки"));
+
+        Assert.Equal(2, _backend.Starts);
+        Assert.Equal(change == "напрямую" ? null : true, network.OutsideBlocked(chrome.Id));
+    }
+
+    [Fact]
+    public async Task KeepRunning_AppRemoved_CoreStopsAtOnce_EvenWithOtherPrograms()
+    {
+        // Хром убрали из лаунчера, а его копия по ярлыку шла через ядро: ядро выключается сразу, Хром идёт напрямую.
+        var connection = NetworkSamples.Link("Германия");
+        var chrome = NetworkSamples.App("Chrome");
+        var settings = NetworkSamples.Settings(connection, chrome);
+        using var network = Network(TimeSpan.FromMilliseconds(30));
+        network.Update(CorePlan.Build(settings, false, CorePlanTests.ProgramsOf));
+        Assert.Null(await network.KeepRunningAsync("открыт лаунчер"));
+        _backend.Connections = ChromeConnection;
+
+        settings.Apps.Remove(chrome);
+        network.Update(CorePlan.Build(settings, false, CorePlanTests.ProgramsOf));
+        Assert.Null(await network.KeepRunningAsync("изменились настройки"));
+
+        Assert.Equal(1, _backend.Stops);
+        Assert.False(network.IsCoreRunning);
+        Assert.Null(network.TagFor(chrome.Id));
+    }
+
+    [Fact]
+    public async Task KeepRunning_AppWithCopiesRemoved_RestartsWithoutIt_WhileAnotherRuns()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var chrome = NetworkSamples.App("Chrome");
+        var settings = NetworkSamples.Settings(connection, a, chrome);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false, CorePlanTests.ProgramsOf));
+        await network.PrepareLaunchAsync(a.Id);
+        _processes.Running.Add(a.Id);
+
+        settings.Apps.Remove(chrome);
+        network.Update(CorePlan.Build(settings, false, CorePlanTests.ProgramsOf));
+        Assert.Null(await network.KeepRunningAsync("изменились настройки"));
+
+        Assert.Equal(2, _backend.Starts);
+        Assert.Equal((1, 1), (_processes.Frozen, _processes.Thawed));
+        Assert.DoesNotContain(_backend.Last!.Apps, r => r.Tag == CorePlan.AppTag(chrome.Id));
+        Assert.Equal(CorePlan.AppTag(a.Id), network.TagFor(a.Id));
+    }
+
+    [Fact]
+    public async Task KeepRunning_AppWithoutCopiesChanged_WaitsUntilLaunch()
+    {
+        // У B копии идут напрямую и B не запущено: его новые исключения нужны только при запуске.
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var b = NetworkSamples.App("B");
+        var settings = NetworkSamples.Settings(connection, a, b);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false, NoCopies));
+        await network.PrepareLaunchAsync(a.Id);
+        _processes.Running.Add(a.Id);
+
+        b.Network.DirectDomains.Add("example.com");
+        network.Update(CorePlan.Build(settings, false, NoCopies));
+        Assert.Null(await network.KeepRunningAsync("изменились настройки"));
+        Assert.Equal(1, _backend.Starts);
+
+        Assert.Null(await network.PrepareLaunchAsync(b.Id));
+        Assert.Equal(2, _backend.Starts);
+        Assert.Equal(1, _processes.Frozen);
+    }
+
+    [Theory]
+    [InlineData("другое подключение")]
+    [InlineData("исключения")]
+    [InlineData("системный VPN")]
+    [InlineData("убрано")]
+    public async Task KeepRunning_RunningAppChanged_AppliedAtOnce(string change)
+    {
+        // Условия работающего приложения поменяли: оно сразу идёт по новым (фильтры Windows тоже меняются сразу).
+        var connection = NetworkSamples.Link("Германия");
+        var other = NetworkSamples.Link("Нидерланды", SampleConnections.VlessReality);
+        var a = NetworkSamples.App("A");
+        var b = NetworkSamples.App("B");
+        var settings = NetworkSamples.Settings(connection, a, b);
+        settings.Connections.Add(other);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false, NoCopies));
+        await network.PrepareLaunchAsync(a.Id);
+        _processes.Running.Add(a.Id);
+        _backend.Connections = ChromeConnection;
+
+        switch (change)
+        {
+            case "другое подключение":
+                a.Network.Mode = AppNetworkMode.OwnConnection;
+                a.Network.ConnectionId = other.Id;
+                break;
+            case "исключения":
+                a.Network.DirectDomains.Add("example.com");
+                break;
+            case "системный VPN":
+                a.Network.Mode = AppNetworkMode.OwnAdapters;
+                break;
+            default:
+                // Лаунчер отпускает убранное приложение (Forget) и сообщает ядру, что оно работало.
+                settings.Apps.Remove(a);
+                _processes.Running.Remove(a.Id);
+                break;
+        }
+        network.Update(CorePlan.Build(settings, false, NoCopies));
+        Assert.Null(await network.KeepRunningAsync("изменились настройки", released: change == "убрано" ? new[] { a.Id } : null));
+
+        Assert.Equal(2, _backend.Starts);
+        Assert.Equal(change == "убрано" ? (0, 0) : (1, 1), (_processes.Frozen, _processes.Thawed));
+        Assert.True(network.IsCoreRunning);
+        if (change is "системный VPN" or "убрано")
+            Assert.Null(network.TagFor(a.Id));
+        else
+            Assert.Equal(CorePlan.AppTag(a.Id), network.TagFor(a.Id));
+        if (change == "другое подключение")
+            Assert.Equal(CorePlan.ConnectionTag(other.Id), _backend.Last!.Apps.Single(r => r.Tag == CorePlan.AppTag(a.Id)).Outbound);
+    }
+
+    [Fact]
+    public async Task KeepRunning_RunningAppJoinsCore_PausedUntilCoreKnowsIt()
+    {
+        // B работало под системным VPN, его перевели на подключение лаунчера: фильтры Windows уже пускают B в адаптер ядра,
+        // а ядро до перезапуска не знает его метки. Поэтому B тоже приостанавливается на время перезапуска.
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var b = NetworkSamples.App("B", AppNetworkMode.OwnAdapters);
+        var settings = NetworkSamples.Settings(connection, a, b);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false, NoCopies));
+        await network.PrepareLaunchAsync(a.Id);
+        _processes.Running.Add(a.Id);
+        _processes.Running.Add(b.Id);
+
+        b.Network.Mode = AppNetworkMode.Inherit;
+        network.Update(CorePlan.Build(settings, false, NoCopies));
+        Assert.Null(await network.KeepRunningAsync("изменились настройки"));
+
+        Assert.Equal(2, _backend.Starts);
+        Assert.Equal(new[] { a.Id, b.Id }.OrderBy(id => id), _processes.FrozenApps.OrderBy(id => id));
+        Assert.Equal(CorePlan.AppTag(b.Id), network.TagFor(b.Id));
+    }
+
+    [Fact]
+    public async Task CoreRecovered_SettingsChangedMeanwhile_AppliedAfterwards()
+    {
+        // Ядро упало, пока менялись настройки: оно запускается заново с прежними, а затем сразу применяет новые.
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var settings = NetworkSamples.Settings(connection, a);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false, CorePlanTests.ProgramsOf));
+        Assert.Null(await network.KeepRunningAsync("открыт лаунчер"));
+
+        var b = NetworkSamples.App("B");
+        settings.Apps.Add(b);
+        network.Update(CorePlan.Build(settings, false, CorePlanTests.ProgramsOf));
+        _backend.Crash();
+
+        Assert.True(await Wait.UntilAsync(() => _backend.Starts == 3, TimeSpan.FromSeconds(5)));
+        Assert.True(await Wait.UntilAsync(() => network.OutsideBlocked(b.Id) == false, TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task KeepRunning_LastAppLeavesCore_CoreStopsAtOnce()
+    {
+        // Единственное приложение через ядро перевели на системный VPN, пока оно работает: ядро ему больше не нужно.
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var settings = NetworkSamples.Settings(connection, a);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false, NoCopies));
+        await network.PrepareLaunchAsync(a.Id);
+        _processes.Running.Add(a.Id);
+        _backend.Connections = ChromeConnection;
+
+        a.Network.Mode = AppNetworkMode.OwnAdapters;
+        network.Update(CorePlan.Build(settings, false, NoCopies));
+        Assert.Null(await network.KeepRunningAsync("изменились настройки"));
+
+        Assert.Equal(1, _backend.Stops);
+        Assert.False(network.IsCoreRunning);
+        Assert.Null(network.TagFor(a.Id));
+    }
+
+    [Fact]
+    public async Task KeepRunning_HideDnsChanged_AppliedAtOnce()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var settings = NetworkSamples.Settings(connection, a);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false, NoCopies));
+        await network.PrepareLaunchAsync(a.Id);
+        _processes.Running.Add(a.Id);
+
+        settings.HideDns = true;
+        network.Update(CorePlan.Build(settings, false, NoCopies));
+        Assert.Null(await network.KeepRunningAsync("изменились настройки"));
+
+        Assert.Equal(2, _backend.Starts);
+        Assert.True(_backend.Last!.HideDns);
+        Assert.Equal(1, _processes.Frozen);
+    }
+
+    [Fact]
+    public async Task KeepRunning_UrgentRestartFails_RunningAppsClosed()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var settings = NetworkSamples.Settings(connection, a);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false, NoCopies));
+        await network.PrepareLaunchAsync(a.Id);
+        _processes.Running.Add(a.Id);
+        string? lost = null;
+        network.CoreLost += (reason, _) => lost = reason;
+
+        a.Network.DirectDomains.Add("example.com");
+        network.Update(CorePlan.Build(settings, false, NoCopies));
+        _backend.FailStart = true;
+
+        Assert.Equal("не вышло", await network.KeepRunningAsync("изменились настройки"));
+        Assert.Equal(new[] { a.Id }, _processes.Killed);
+        Assert.Equal(new[] { a.Id }, _processes.Blocked);
+        Assert.NotNull(lost);
+        Assert.False(network.IsCoreRunning);
+        Assert.Equal((1, 1), (_processes.Frozen, _processes.Thawed));
+    }
+
+    [Fact]
+    public async Task KeepRunning_UrgentRestartFails_AppLeavingCoreKeepsRunning()
+    {
+        // A и B работают через ядро, B перевели на системный VPN, а ядро с новыми настройками не запустилось. Закрывается
+        // только A: B ядро больше не нужно.
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var b = NetworkSamples.App("B");
+        var settings = NetworkSamples.Settings(connection, a, b);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false, NoCopies));
+        await network.PrepareLaunchAsync(a.Id);
+        _processes.Running.Add(a.Id);
+        _processes.Running.Add(b.Id);
+
+        b.Network.Mode = AppNetworkMode.OwnAdapters;
+        network.Update(CorePlan.Build(settings, false, NoCopies));
+        _backend.FailStart = true;
+
+        Assert.Equal("не вышло", await network.KeepRunningAsync("изменились настройки"));
+        Assert.Equal(new[] { a.Id }, _processes.Killed);
+        Assert.Equal(new[] { a.Id }, _processes.Blocked);
+        Assert.Equal(new[] { a.Id, b.Id }.OrderBy(id => id), _processes.FrozenApps.OrderBy(id => id));
+        Assert.Equal((1, 1), (_processes.Frozen, _processes.Thawed));
+    }
+
+    [Fact]
+    public async Task KeepRunning_CoreNotRunning_RunningAppJoins_PausedUntilCoreKnowsIt()
+    {
+        // Ядро не работало (все приложения под системным VPN). Работающее B перевели на подключение лаунчера: на время
+        // запуска ядра оно приостанавливается, иначе его соединения без метки ушли бы напрямую.
+        var connection = NetworkSamples.Link("Германия");
+        var b = NetworkSamples.App("B", AppNetworkMode.OwnAdapters);
+        var settings = NetworkSamples.Settings(connection, b);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false, NoCopies));
+        Assert.Null(await network.KeepRunningAsync("открыт лаунчер"));
+        Assert.False(network.IsCoreRunning);
+        _processes.Running.Add(b.Id);
+
+        b.Network.Mode = AppNetworkMode.Inherit;
+        network.Update(CorePlan.Build(settings, false, NoCopies));
+        Assert.Null(await network.KeepRunningAsync("изменились настройки"));
+
+        Assert.Equal(1, _backend.Starts);
+        Assert.Equal(new[] { b.Id }, _processes.FrozenApps);
+        Assert.Equal((1, 1), (_processes.Frozen, _processes.Thawed));
+        Assert.Equal(CorePlan.AppTag(b.Id), network.TagFor(b.Id));
+    }
+
+    [Fact]
+    public void UrgentChange_OnlyWhatWouldGoOtherwise()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var b = NetworkSamples.App("B");
+        var settings = NetworkSamples.Settings(connection, a, b);
+        var before = CorePlan.Build(settings, false, CorePlanTests.ProgramsOf);
+        var beforeNoCopies = CorePlan.Build(settings, false, NoCopies);
+        CorePlan After(Func<AppEntry, IReadOnlyList<CoreProgram>>? programs = null, bool ipv6 = false) =>
+            CorePlan.Build(settings, ipv6, programs ?? CorePlanTests.ProgramsOf);
+
+        Assert.Null(LauncherNetwork.UrgentChange(before, After(), Array.Empty<Guid>()));
+        Assert.Null(LauncherNetwork.UrgentChange(before, After(ipv6: true), new[] { a.Id }));
+
+        // Новый сервер подключения: у запущенных приложений прежний продолжает работать, новый — при следующем запуске. Копии
+        // мимо лаунчера идут через новый сервер сразу, только если ни одно приложение этого подключения не запущено.
+        connection.Link = "trojan://secret@5.6.7.9:443?sni=example.com#Другой";
+        Assert.Null(LauncherNetwork.UrgentChange(before, After(), new[] { a.Id, b.Id }));
+        Assert.Null(LauncherNetwork.UrgentChange(before, After(), new[] { a.Id }));
+        Assert.Contains(LauncherNetwork.UrgentChange(before, After(), Array.Empty<Guid>()), new[] { "копии «A» мимо лаунчера", "копии «B» мимо лаунчера" });
+        Assert.Null(LauncherNetwork.UrgentChange(beforeNoCopies, After(NoCopies), Array.Empty<Guid>()));
+
+        // Исключения B (новый сервер уже в ядре): срочно, только если B работает или его копии идут через ядро.
+        before = After();
+        beforeNoCopies = After(NoCopies);
+        b.Network.DirectDomains.Add("example.com");
+        Assert.Equal("копии «B» мимо лаунчера", LauncherNetwork.UrgentChange(before, After(), Array.Empty<Guid>()));
+        Assert.Equal("работающее приложение «B»", LauncherNetwork.UrgentChange(before, After(), new[] { b.Id }));
+        Assert.Null(LauncherNetwork.UrgentChange(beforeNoCopies, After(NoCopies), Array.Empty<Guid>()));
+        Assert.Equal("работающее приложение «B»", LauncherNetwork.UrgentChange(beforeNoCopies, After(NoCopies), new[] { b.Id }));
+
+        settings.HideDns = true;
+        Assert.Equal("DNS-запросы всех программ", LauncherNetwork.UrgentChange(before, After(), Array.Empty<Guid>()));
+    }
+
+    [Fact]
+    public async Task Idle_AppsThroughCoreInSettings_CoreKeepsRunning_AndCatchesUpWithSettings()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var settings = NetworkSamples.Settings(connection, a);
+        using var network = Network(TimeSpan.FromMilliseconds(30));
+        network.Update(CorePlan.Build(settings, false));
+        await network.PrepareLaunchAsync(a.Id);
+        _processes.Running.Add(a.Id);
+        settings.Apps.Add(NetworkSamples.App("B"));
+        network.Update(CorePlan.Build(settings, false));
+
+        // Приложение закрылось: ядро не выключается, а догоняет новые настройки (через него ничего не идёт).
+        _processes.Running.Clear();
+        network.OnProcessesChanged();
+
+        Assert.True(await Wait.UntilAsync(() => _backend.Starts == 2, TimeSpan.FromSeconds(5)));
+        await Task.Delay(200);
+        Assert.Equal(0, _backend.Stops);
+        Assert.True(network.IsCoreRunning);
+    }
+
+    [Fact]
+    public async Task CoreCrash_Restart_AppsPausedThenContinue()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var other = Guid.NewGuid();
+        using var network = Network();
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection, a), false));
+        await network.PrepareLaunchAsync(a.Id);
+        _processes.Running.Add(a.Id);
+        _processes.Running.Add(other);
+        var recovered = new TaskCompletionSource<IReadOnlyList<string>>(TaskCreationOptions.RunContinuationsAsynchronously);
+        network.CoreRecovered += (_, apps) => recovered.TrySetResult(apps);
+        var lost = false;
+        network.CoreLost += (_, _) => lost = true;
+
+        _backend.Crash();
+
+        Assert.Equal(new[] { "A" }, await recovered.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(2, _backend.Starts);
+        Assert.Equal((1, 1), (_processes.Frozen, _processes.Thawed));
+        Assert.Empty(_processes.Killed);
+        Assert.False(lost);
+        Assert.True(network.IsCoreRunning);
+        Assert.Equal(CoreAppState.Protected, network.StateOf(a.Id));
+    }
+
+    [Fact]
+    public async Task CoreCrash_RestartFails_OnlyAppsThroughCoreClosed()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A", closeOnDrop: ProtectionOverride.Off);
+        var other = Guid.NewGuid();
+        using var network = Network();
+        network.RecoveryBudget = TimeSpan.FromMilliseconds(300);
+        network.RecoveryPause = TimeSpan.FromMilliseconds(50);
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection, a), false));
+        await network.PrepareLaunchAsync(a.Id);
+        _processes.Running.Add(a.Id);
+        _processes.Running.Add(other);
+        var lost = new TaskCompletionSource<string>(TaskCreationOptions.RunContinuationsAsynchronously);
+        network.CoreLost += (reason, _) => lost.TrySetResult(reason);
+
+        _backend.FailStart = true; // служба после сбоя так и не вернулась
+        _backend.Crash();
+
+        Assert.Contains("Запустить ядро заново не удалось", await lost.Task.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.Equal(new[] { a.Id }, _processes.Killed); // даже без «Закрывать при обрыве»
+        Assert.Contains(other, _processes.Running);
+        Assert.True(_backend.Starts > 2); // несколько попыток
+        Assert.Equal((1, 1), (_processes.Frozen, _processes.Thawed));
+        Assert.False(network.IsCoreRunning);
+    }
+
+    [Fact]
+    public async Task CoreCrash_RestartFails_NothingRunning_ReportedAndRetriedLater()
+    {
+        // Ядро было нужно только копиям приложений мимо лаунчера, и служба не вернулась: без ядра копии идут напрямую, поэтому
+        // пользователь узнаёт об этом, а лаунчер ещё раз пробует запустить ядро позже.
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        using var network = Network();
+        network.RecoveryBudget = TimeSpan.FromMilliseconds(300);
+        network.RecoveryPause = TimeSpan.FromMilliseconds(50);
+        network.RecoveryRetry = TimeSpan.FromMilliseconds(300);
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection, a), false));
+        Assert.Null(await network.KeepRunningAsync("тест"));
+        var lost = new TaskCompletionSource<KillReport>(TaskCreationOptions.RunContinuationsAsynchronously);
+        network.CoreLost += (_, report) => lost.TrySetResult(report);
+
+        _backend.FailStart = true;
+        _backend.Crash();
+
+        var closed = await lost.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Empty(closed.Killed);
+        Assert.False(network.IsCoreRunning);
+        _backend.FailStart = false;
+        Assert.True(await Wait.UntilAsync(() => network.IsCoreRunning, TimeSpan.FromSeconds(5)));
+    }
+
+    [Fact]
+    public async Task Health_CoreRestartedDuringProbe_MissNotCounted()
+    {
+        // Ядро упало и запустилось заново с теми же настройками, пока шла проверка: её промах относится к старому ядру.
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        using var network = Network();
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection, a), false));
+        await network.PrepareLaunchAsync(a.Id);
+        _processes.Running.Add(a.Id);
+        var crashed = false;
+        _backend.Delay = _ =>
+        {
+            if (!crashed)
+            {
+                crashed = true;
+                _backend.Crash();
+            }
+
+            return null;
+        };
+
+        await network.CheckHealthAsync();
+        Assert.True(await Wait.UntilAsync(() => network.IsCoreRunning, TimeSpan.FromSeconds(5)));
+        await network.CheckHealthAsync();
+
+        Assert.Equal(CoreAppState.Protected, network.StateOf(a.Id)); // засчитан один промах из двух
+    }
+
+    [Fact]
+    public async Task CoreCrash_ThirdTimeInFiveMinutes_AppsClosed()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        using var network = Network();
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection, a), false));
+        await network.PrepareLaunchAsync(a.Id);
+        _processes.Running.Add(a.Id);
+        var recovered = 0;
+        network.CoreRecovered += (_, _) => Interlocked.Increment(ref recovered);
+        string? reason = null;
+        network.CoreLost += (r, _) => reason = r;
+
+        _backend.Crash();
+        Assert.True(await Wait.UntilAsync(() => Volatile.Read(ref recovered) == 1, TimeSpan.FromSeconds(5)));
+        _backend.Crash();
+        Assert.True(await Wait.UntilAsync(() => Volatile.Read(ref recovered) == 2, TimeSpan.FromSeconds(5)));
+        _backend.Crash();
+
+        Assert.Contains("слишком часто", reason);
+        Assert.Equal(new[] { a.Id }, _processes.Killed);
+        Assert.Equal(3, _backend.Starts);
+        Assert.False(network.IsCoreRunning);
+    }
+
+    [Fact]
+    public async Task OutsideCopies_KnownWhileCoreRuns_ChangeRestartsForLaunch()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var b = NetworkSamples.App("B");
+        var settings = NetworkSamples.Settings(connection, a, b);
+        using var network = Network();
+        network.Update(CorePlan.Build(settings, false, CorePlanTests.ProgramsOf));
+        Assert.Null(network.OutsideBlocked(a.Id)); // ядро не работает: копии идут напрямую
+
+        await network.PrepareLaunchAsync(a.Id);
+        _processes.Running.Add(a.Id);
+        Assert.False(network.OutsideBlocked(a.Id));
+
+        // Запускаемое приложение пошло бы иначе, чем с новыми настройками: перезапуск, работающее приостанавливается.
+        settings.OutsideCopies = OutsideCopies.Block;
+        network.Update(CorePlan.Build(settings, false, CorePlanTests.ProgramsOf));
+        Assert.False(network.OutsideBlocked(a.Id));
+        Assert.Null(await network.PrepareLaunchAsync(b.Id));
+
+        Assert.Equal(2, _backend.Starts);
+        Assert.Equal(1, _processes.Frozen);
+        Assert.True(network.OutsideBlocked(a.Id));
+        Assert.All(_backend.Last!.Apps, r => Assert.True(r.BlockOutside));
+    }
 }
 
 public class CoreApiClientTests
@@ -508,16 +1907,23 @@ public class CoreApiClientTests
     private sealed class Handler : HttpMessageHandler
     {
         public HttpRequestMessage? Request;
+        public readonly List<string> Urls = new();
         public HttpStatusCode Status = HttpStatusCode.OK;
         public string Body = "{\"delay\":42}";
+        public Func<string, (HttpStatusCode Status, string Body)>? Answer;
         public Exception? Throw;
+        public TimeSpan Pause;
 
-        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
             Request = request;
+            Urls.Add(request.RequestUri!.AbsoluteUri);
+            if (Pause > TimeSpan.Zero)
+                await Task.Delay(Pause, cancellationToken);
             if (Throw is not null)
-                return Task.FromException<HttpResponseMessage>(Throw);
-            return Task.FromResult(new HttpResponseMessage(Status) { Content = new StringContent(Body, Encoding.UTF8, "application/json") });
+                throw Throw;
+            var (status, body) = Answer?.Invoke(request.RequestUri.AbsoluteUri) ?? (Status, Body);
+            return new HttpResponseMessage(status) { Content = new StringContent(body, Encoding.UTF8, "application/json") };
         }
     }
 
@@ -532,6 +1938,7 @@ public class CoreApiClientTests
         Assert.StartsWith("/proxies/c1/delay", handler.Request.RequestUri.AbsolutePath);
         Assert.Contains("timeout=5000", handler.Request.RequestUri.Query);
         Assert.Equal("Bearer", handler.Request.Headers.Authorization!.Scheme);
+        Assert.Single(handler.Urls); // первая страница открылась: вторая не нужна
     }
 
     [Theory]
@@ -564,9 +1971,119 @@ public class CoreApiClientTests
     [Fact]
     public async Task Probe_CoreUnreachable()
     {
-        using var api = new CoreApiClient(9090, "ключ", new Handler { Throw = new HttpRequestException("Подключение не установлено") });
+        var handler = new Handler { Throw = new HttpRequestException("Подключение не установлено") };
+        using var api = new CoreApiClient(9090, "ключ", handler);
 
         Assert.Contains("нет связи с управлением ядра", (await api.ProbeAsync("c1", TimeSpan.FromSeconds(5))).Failure);
+        Assert.Single(handler.Urls); // вторая страница тут не поможет
+    }
+
+    [Fact]
+    public async Task Probe_FirstPageFails_SecondCounts()
+    {
+        var handler = new Handler
+        {
+            Answer = url => url.Contains("cloudflare")
+                ? (HttpStatusCode.ServiceUnavailable, "{\"message\":\"An error occurred in the delay test\"}")
+                : (HttpStatusCode.OK, "{\"delay\":77}")
+        };
+        using var api = new CoreApiClient(9090, "ключ", handler);
+
+        var probe = await api.ProbeAsync("c1", TimeSpan.FromSeconds(5));
+
+        Assert.Equal(77, probe.Delay);
+        Assert.Null(probe.Failure);
+        Assert.Contains("An error occurred in the delay test", probe.Note);
+        Assert.Equal(2, handler.Urls.Count);
+        Assert.Contains("gstatic", handler.Urls[1]);
+    }
+
+    [Fact]
+    public async Task Probe_BothPagesFail_Miss()
+    {
+        var handler = new Handler { Status = HttpStatusCode.GatewayTimeout, Body = "{\"message\":\"Timeout\"}" };
+        using var api = new CoreApiClient(9090, "ключ", handler);
+
+        var probe = await api.ProbeAsync("c1", TimeSpan.FromSeconds(5));
+
+        Assert.Null(probe.Delay);
+        Assert.Equal("сервер не ответил за 5 с («Timeout»); вторая страница: сервер не ответил за 5 с («Timeout»)", probe.Failure);
+        Assert.Equal(2, handler.Urls.Count);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.NotFound)]
+    [InlineData(HttpStatusCode.Unauthorized)]
+    public async Task Probe_CoreRefused_NoSecondPage(HttpStatusCode status)
+    {
+        var handler = new Handler { Status = status, Body = "{}" };
+        using var api = new CoreApiClient(9090, "ключ", handler);
+
+        Assert.Null((await api.ProbeAsync("c1", TimeSpan.FromSeconds(5))).Delay);
+        Assert.Single(handler.Urls);
+    }
+
+    [Fact]
+    public async Task Connections_ProgramsAndPorts()
+    {
+        // Так отвечает ядро (sing-box 1.14, GET /connections).
+        var handler = new Handler
+        {
+            Body = """
+                {"downloadTotal":30,"uploadTotal":12,"connections":[
+                 {"id":"7a1","metadata":{"network":"tcp","type":"tun/tun-in","sourceIP":"172.31.250.1","destinationIP":"203.0.113.10",
+                  "sourcePort":"50311","destinationPort":"443","host":"","dnsMode":"normal",
+                  "processPath":"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe"},
+                  "upload":10,"download":20,"start":"2026-10-15T08:00:00Z","chains":["direct"],"rule":"final","rulePayload":""},
+                 {"id":"7a2","metadata":{"network":"udp","type":"tun/tun-in","destinationPort":"7",
+                  "processPath":"launcher:a1|C:\\Games\\game.exe"},"upload":2,"download":10,"chains":["c1"]}]}
+                """
+        };
+        using var api = new CoreApiClient(9090, "ключ", handler);
+
+        var list = await api.ConnectionsAsync(TimeSpan.FromSeconds(3));
+
+        Assert.Null(list.Failure);
+        Assert.Equal(new[]
+        {
+            new CoreConnection("tcp", 443, @"C:\Program Files\Google\Chrome\Application\chrome.exe"),
+            new CoreConnection("udp", 7, @"launcher:a1|C:\Games\game.exe")
+        }, list.Items);
+        Assert.Equal("/connections", handler.Request!.RequestUri!.AbsolutePath);
+        Assert.Equal("Bearer", handler.Request.Headers.Authorization!.Scheme);
+    }
+
+    [Theory]
+    [InlineData(HttpStatusCode.OK, "{\"downloadTotal\":0,\"uploadTotal\":0,\"connections\":null}", null)]
+    [InlineData(HttpStatusCode.OK, "{\"downloadTotal\":0,\"uploadTotal\":0,\"connections\":[]}", null)]
+    [InlineData(HttpStatusCode.Unauthorized, "{\"message\":\"Unauthorized\"}", "не приняло ключ")]
+    [InlineData(HttpStatusCode.OK, "не json", "непонятный ответ")]
+    public async Task Connections_NoneOrFailure(HttpStatusCode status, string body, string? failure)
+    {
+        using var api = new CoreApiClient(9090, "ключ", new Handler { Status = status, Body = body });
+
+        var list = await api.ConnectionsAsync(TimeSpan.FromSeconds(3));
+
+        if (failure is null)
+        {
+            Assert.Empty(list.Items!);
+        }
+        else
+        {
+            Assert.Null(list.Items);
+            Assert.Contains(failure, list.Failure);
+        }
+    }
+
+    [Fact]
+    public async Task Connections_CoreSilent_GivesUp()
+    {
+        using var api = new CoreApiClient(9090, "ключ", new Handler { Pause = TimeSpan.FromSeconds(30) });
+
+        var list = await api.ConnectionsAsync(TimeSpan.FromMilliseconds(200));
+
+        Assert.Null(list.Items);
+        Assert.Contains("управление ядра не ответило", list.Failure);
     }
 }
 

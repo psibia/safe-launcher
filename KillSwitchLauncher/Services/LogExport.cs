@@ -203,6 +203,13 @@ public static class LogExport
             return options.HideSites ? masker.MaskDomains(result) : result;
         }
 
+        // Журнал событий и отчёты о сбоях пишутся без скрытия адресов, даже если журналы их скрывают: скрываем здесь.
+        string CleanRaw(string? text)
+        {
+            var result = options.HideAddresses || input.Logging.HideAddresses ? masker.MaskAddressesNow(text) : masker.MaskSecretsOnly(text);
+            return options.HideSites ? masker.MaskDomains(result) : result;
+        }
+
         var all = new List<LogLine>(input.Launcher.Count + input.Service.Count);
         all.AddRange(input.Launcher.Where(l => InPeriod(l.TimeUtc, period)));
         all.AddRange(input.Service.Where(l => InPeriod(l.TimeUtc, period)));
@@ -261,7 +268,7 @@ public static class LogExport
             var events = new StringBuilder();
             foreach (var e in input.Events.Where(e => InPeriod(e.Time.ToUniversalTime(), period)))
                 events.Append(e.Time.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture)).Append('\t').Append(e.Kind).Append('\t')
-                    .Append(Clean(e.Text)).Append("\r\n");
+                    .Append(CleanRaw(e.Text)).Append("\r\n");
             Text("events.txt", events.ToString());
 
             Json("settings.json", input.Settings);
@@ -284,7 +291,7 @@ public static class LogExport
             foreach (var crash in input.LauncherCrashes.Concat(input.ServiceFiles.Where(f => f.Name.StartsWith(CrashReport.FilePrefix, StringComparison.OrdinalIgnoreCase))))
             {
                 var prefix = input.LauncherCrashes.Contains(crash) ? "launcher-" : "service-";
-                Text("crashes/" + prefix + crash.Name, Clean(crash.Content));
+                Text("crashes/" + prefix + crash.Name, CleanRaw(crash.Content));
             }
 
             if (options.IncludeDns)

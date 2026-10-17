@@ -29,7 +29,7 @@ public sealed class AddConnectionViewModel : ObservableObject
     private bool _isBusy;
     private LocalProxyHint? _proxyHint;
 
-    /// <param name="existing">Уже добавленные подключения: новое получит название, которого среди них нет.</param>
+    /// <param name="existing">Уже добавленные подключения: новое получит название, которого среди них нет, а такое же не добавится.</param>
     /// <param name="add">Сохранить новое подключение (подписка к этому моменту уже загружена).</param>
     public AddConnectionViewModel(Func<IReadOnlyList<VpnConnection>> existing, Func<VpnConnection, Task> add, IDialogService dialogs)
     {
@@ -46,7 +46,7 @@ public sealed class AddConnectionViewModel : ObservableObject
 
     public ICommand AddCommand { get; }
 
-    /// <summary>«Файл WireGuard»: прочитать .conf и подставить его текст.</summary>
+    /// <summary>«Файл WireGuard или AmneziaWG»: прочитать .conf и подставить его текст.</summary>
     public ICommand PickFileCommand { get; }
 
     /// <summary>Подставить прокси запущенной VPN-программы.</summary>
@@ -189,6 +189,12 @@ public sealed class AddConnectionViewModel : ObservableObject
         catch (ConnectionParseException ex)
         {
             Error = ex.Message;
+            return null;
+        }
+
+        if (ConnectionFactory.FindSame(connection, _existing()) is { } same)
+        {
+            Error = $"Такое подключение уже есть: «{same.Name}».";
             return null;
         }
 

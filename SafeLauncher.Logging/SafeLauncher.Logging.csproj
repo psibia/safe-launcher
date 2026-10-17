@@ -1,7 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
-  <!-- Технический журнал: формат строки, хранение по дням, скрытие адресов и секретов, разбор строк ядра.
-       Общая библиотека лаунчера и службы (см. notes/logging в папке проекта). Без Windows-зависимостей, чтобы тесты шли везде. -->
+  <!-- Технический журнал: формат строки, хранение по дням, скрытие адресов и секретов, разбор строк ядра; проверка подписи
+       обновлений (Updates). Общая библиотека лаунчера и службы (см. notes/logging в папке проекта). Без Windows-зависимостей, чтобы тесты шли везде. -->
   <PropertyGroup>
     <TargetFramework>net8.0</TargetFramework>
     <Nullable>enable</Nullable>
@@ -10,11 +10,17 @@
     <AssemblyName>SafeLauncher.Logging</AssemblyName>
     <RootNamespace>SafeLauncher.Logging</RootNamespace>
     <Product>Безопасный лаунчер</Product>
-    <Version>2.1.0</Version>
+    <Version>2.3.7</Version>
   </PropertyGroup>
 
   <ItemGroup>
     <InternalsVisibleTo Include="KillSwitchLauncher.Tests" />
+  </ItemGroup>
+
+  <!-- Открытый ключ подписи выпусков (Updates\UpdatePackage.cs): по нему лаунчер и служба проверяют обновления.
+       Его создаёт build-installer.cmd при первой сборке; без него обновление идёт по-старому, с запросом прав Windows. -->
+  <ItemGroup Condition="Exists('..\installer\update-public-key.pem')">
+    <EmbeddedResource Include="..\installer\update-public-key.pem" LogicalName="update-public-key.pem" Visible="false" />
   </ItemGroup>
 
 </Project>

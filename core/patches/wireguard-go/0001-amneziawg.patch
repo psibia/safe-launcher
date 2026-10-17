@@ -1,0 +1,2578 @@
+diff --git a/conn/bind_std.go b/conn/bind_std.go
+index 2ec0aa7..1d9c73c 100644
+--- a/conn/bind_std.go
++++ b/conn/bind_std.go
+@@ -14,6 +14,7 @@ import (
+ 	"runtime"
+ 	"strconv"
+ 	"sync"
++	"sync/atomic"
+ 	"syscall"
+ 
+ 	"github.com/sagernet/sing/common"
+@@ -43,6 +44,7 @@ type StdNetBind struct {
+ 	onWrite             func(size int)
+ 	reservedAccess      sync.RWMutex
+ 	reservedForEndpoint map[netip.AddrPort][3]uint8
++	preserveReserved    atomic.Bool
+ 
+ 	mu            sync.Mutex // protects all fields except as specified
+ 	ipv4          *net.UDPConn
+@@ -275,7 +277,7 @@ again:
+ 				return 0, err
+ 			}
+ 			sizes[0] = dataLength
+-			if dataLength > 3 {
++			if dataLength > 3 && !s.preserveReserved.Load() {
+ 				common.ClearArray(bufs[0][1:4])
+ 			}
+ 			endpoints[0] = &StdNetEndpoint{AddrPort: source}
+@@ -301,6 +303,14 @@ func (s *StdNetBind) SetEgressProvider(provider EgressProvider) {
+ 	s.egressProvider = provider
+ }
+ 
++// SetPreserveReservedBytes makes the bind deliver received datagrams as they
++// are. By default it clears bytes 1-3, the reserved bytes of WireGuard
++// messages, which Cloudflare WARP fills in; AmneziaWG datagrams carry data
++// there. The device calls it when AmneziaWG is configured.
++func (s *StdNetBind) SetPreserveReservedBytes() {
++	s.preserveReserved.Store(true)
++}
++
+ // SetIOActivityFuncs sets callbacks invoked once per receive and send syscall batch:
+ // onRead with the size of the first packet of a received batch, onWrite with the size of
+ // the first packet of a sent batch. Call it before Open.
+@@ -381,7 +391,7 @@ func (s *StdNetBind) receiveIP(
+ 		if sizes[i] == 0 {
+ 			continue
+ 		}
+-		if msg.N > 3 {
++		if msg.N > 3 && !s.preserveReserved.Load() {
+ 			common.ClearArray(bufs[i][1:4])
+ 		}
+ 		ep := &StdNetEndpoint{AddrPort: M.AddrPortFromNet(msg.Addr)} // TODO: remove allocation
+diff --git a/conn/msgx_darwin.go b/conn/msgx_darwin.go
+index 1725343..98c351e 100644
+--- a/conn/msgx_darwin.go
++++ b/conn/msgx_darwin.go
+@@ -313,7 +313,7 @@ func (s *StdNetBind) makeReceiveMsgX(conn *net.UDPConn, isV6 bool) (ReceiveFunc,
+ 		numMsgs := int(n)
+ 		for i := 0; i < numMsgs; i++ {
+ 			sizes[i] = int(state.hdrs[i].DataLen)
+-			if sizes[i] > 3 {
++			if sizes[i] > 3 && !s.preserveReserved.Load() {
+ 				bufs[i][1] = 0
+ 				bufs[i][2] = 0
+ 				bufs[i][3] = 0
+diff --git a/device/awg.go b/device/awg.go
+new file mode 100644
+index 0000000..b6e9f97
+--- /dev/null
++++ b/device/awg.go
+@@ -0,0 +1,524 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
++ *
++ * AmneziaWG: WireGuard with obfuscated packets (junk and signature packets,
++ * message paddings and headers, header protection, custom timings).
++ * Ported from github.com/amnezia-vpn/amneziawg-go (MIT); wire compatible with
++ * its releases from v0.2.12 (AmneziaWG 1.0) to v3.1.20260828 (AmneziaWG 3.1),
++ * and with AmneziaWG 1.5 configurations (J1-J3, Itime).
++ */
++
++package device
++
++import (
++	"crypto/rand"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"strconv"
++	"strings"
++	"sync/atomic"
++	"time"
++
++	"golang.org/x/crypto/chacha20"
++	"golang.org/x/crypto/chacha20poly1305"
++)
++
++const (
++	HeaderCipherKeySize   = 32
++	HeaderCipherNonceSize = 12
++)
++
++// HeaderCipherKey is the AmneziaWG header protection key.
++type HeaderCipherKey [HeaderCipherKeySize]byte
++
++func (key *HeaderCipherKey) FromHex(src string) error {
++	return loadExactHex(key[:], src)
++}
++
++func (key HeaderCipherKey) IsZero() bool {
++	var zero HeaderCipherKey
++	return key == zero
++}
++
++// UintRange is a closed range of uint32 values: lo in the low 32 bits, hi in
++// the high 32 bits. Zero means "not set".
++type UintRange uint64
++
++func (r *UintRange) FromUint32(lo, hi uint32) {
++	*r = UintRange(uint64(hi)<<32 | uint64(lo))
++}
++
++// FromString parses "a" or "a-b".
++func (r *UintRange) FromString(str string) error {
++	loText, hiText, isRange := strings.Cut(str, "-")
++	lo, err := strconv.ParseUint(strings.TrimSpace(loText), 10, 32)
++	if err != nil {
++		return err
++	}
++	hi := lo
++	if isRange {
++		hi, err = strconv.ParseUint(strings.TrimSpace(hiText), 10, 32)
++		if err != nil {
++			return err
++		}
++	}
++	if hi < lo {
++		return errors.New("wrong range specified")
++	}
++	r.FromUint32(uint32(lo), uint32(hi))
++	return nil
++}
++
++func (r UintRange) Lo() uint32 {
++	return uint32(r)
++}
++
++func (r UintRange) Hi() uint32 {
++	return uint32(r >> 32)
++}
++
++func (r UintRange) IsZero() bool {
++	return r == 0
++}
++
++func (r UintRange) Contains(num uint32) bool {
++	return r.Lo() <= num && num <= r.Hi()
++}
++
++func (r UintRange) Overlap(other UintRange) bool {
++	return r.Lo() <= other.Hi() && other.Lo() <= r.Hi()
++}
++
++// PickOne returns a random value of the range.
++func (r UintRange) PickOne() uint32 {
++	return r.Lo() + fastrandn(r.Hi()-r.Lo()+1)
++}
++
++func (r UintRange) String() string {
++	if r.Lo() == r.Hi() {
++		return strconv.FormatUint(uint64(r.Lo()), 10)
++	}
++	return strconv.FormatUint(uint64(r.Lo()), 10) + "-" + strconv.FormatUint(uint64(r.Hi()), 10)
++}
++
++type AtomicUintRange struct {
++	v atomic.Uint64
++}
++
++func (a *AtomicUintRange) Load() UintRange {
++	return UintRange(a.v.Load())
++}
++
++func (a *AtomicUintRange) Store(r UintRange) {
++	a.v.Store(uint64(r))
++}
++
++func (a *AtomicUintRange) Swap(r UintRange) UintRange {
++	return UintRange(a.v.Swap(uint64(r)))
++}
++
++// Message kinds: indexes of awgParams.headers and awgParams.paddings (H1-H4, S1-S4).
++const (
++	awgInit = iota
++	awgResponse
++	awgCookie
++	awgTransport
++)
++
++var (
++	awgMessageTypes = [4]uint32{MessageInitiationType, MessageResponseType, MessageCookieReplyType, MessageTransportType}
++	awgMessageSizes = [4]int{MessageInitiationSize, MessageResponseSize, MessageCookieReplySize, MessageTransportHeaderSize}
++)
++
++// maxPacketSize is the largest UDP payload over IPv4.
++const maxPacketSize = 65507
++
++// awgUDPWindow is the initial UDP window of a peer (AmneziaWG 3.1): its largest
++// datagram, which bounds random trailers and content padding.
++const awgUDPWindow = 500
++
++// awgParams is an immutable snapshot of the AmneziaWG settings of a device.
++// Device.awg is nil for plain WireGuard: then every code path is the original one.
++type awgParams struct {
++	junkCount uint32 // Jc
++	junkMin   uint32 // Jmin
++	junkMax   uint32 // Jmax
++
++	headers  [4]UintRange // H1-H4: message types
++	paddings [4]uint32    // S1-S4: random bytes before the message
++
++	ipackets [5]*obfChain // I1-I5: signature packets
++	jpackets [3]*obfChain // J1-J3: AmneziaWG 1.5, sent instead of I1-I5 until Itime passes
++	itime    uint32       // Itime, seconds: AmneziaWG 1.5
++
++	headerKey      *HeaderCipherKey // header protection, nil if off
++	contentPadding UintRange        // random padding of transport content instead of padding to 16 bytes
++	randomTrailers bool             // AmneziaWG 3.1: random bytes after handshake messages, random padding of transport content
++	disableCookies bool             // AmneziaWG 3.1: no cookie replies (and no rate limit) under load
++
++	rekeyAfterTime       UintRange // seconds
++	rekeyTimeout         UintRange // seconds
++	rejectAfterTime      UintRange // seconds
++	keepaliveTimeout     UintRange // seconds
++	maxHandshakeAttempts UintRange
++}
++
++func newAWGParams() *awgParams {
++	p := new(awgParams)
++	for kind, msgType := range awgMessageTypes {
++		p.headers[kind].FromUint32(msgType, msgType)
++	}
++	return p
++}
++
++func (p *awgParams) clone() *awgParams {
++	c := *p
++	if p.headerKey != nil {
++		key := *p.headerKey
++		c.headerKey = &key
++	}
++	return &c
++}
++
++func (p *awgParams) validate() error {
++	if p.junkCount > 0 {
++		if p.junkMax < p.junkMin {
++			return fmt.Errorf("jmax %d is less than jmin %d", p.junkMax, p.junkMin)
++		}
++		if p.junkMax > maxPacketSize-MessageEncapsulatingTransportSize {
++			return fmt.Errorf("jmax %d is too large", p.junkMax)
++		}
++	}
++	for kind, padding := range p.paddings {
++		if int(padding)+awgMessageSizes[kind]+MessageTransportSize > maxPacketSize {
++			return fmt.Errorf("s%d %d is too large", kind+1, padding)
++		}
++		if p.headerKey != nil && padding < HeaderCipherNonceSize {
++			return fmt.Errorf("s%d must be at least %d to use header protection", kind+1, HeaderCipherNonceSize)
++		}
++	}
++	for i := range p.headers {
++		for j := i + 1; j < len(p.headers); j++ {
++			if p.headers[i].Overlap(p.headers[j]) {
++				return fmt.Errorf("h%d and h%d overlap", i+1, j+1)
++			}
++		}
++	}
++	return nil
++}
++
++// headerCipher is the header protection keystream for a message whose padding
++// starts with nonce; nil if header protection is off.
++func (p *awgParams) headerCipher(nonce []byte) *chacha20.Cipher {
++	if p.headerKey == nil || len(nonce) < HeaderCipherNonceSize {
++		return nil
++	}
++	cipher, err := chacha20.NewUnauthenticatedCipher(p.headerKey[:], nonce[:HeaderCipherNonceSize])
++	if err != nil {
++		return nil
++	}
++	return cipher
++}
++
++// classify finds what a received datagram is, as amneziawg-go does: by its size
++// (S1-S4 plus the message size, or more with random trailers) and type (H1-H4).
++// With header protection it unmasks the header in place. It returns the message
++// type, the padding to skip and the length of the message after it (handshake
++// messages without their trailer), or MessageUnknownType for junk, signature
++// packets and garbage.
++func (p *awgParams) classify(packet []byte) (uint32, int, int) {
++	var mask [4]byte
++	cipher := p.headerCipher(packet)
++	if p.headerKey != nil {
++		if cipher == nil {
++			return MessageUnknownType, 0, 0
++		}
++		cipher.XORKeyStream(mask[:], mask[:])
++	}
++	size := len(packet)
++	for kind := awgInit; kind <= awgTransport; kind++ {
++		padding := int(p.paddings[kind])
++		length := awgMessageSizes[kind]
++		if kind == awgTransport {
++			if size < padding+MessageTransportSize {
++				continue
++			}
++			length = size - padding
++		} else if size != padding+length && !(p.randomTrailers && size > padding+length) {
++			continue
++		}
++		msgType := binary.LittleEndian.Uint32(packet[padding:]) ^ binary.LittleEndian.Uint32(mask[:])
++		if !p.headers[kind].Contains(msgType) {
++			continue
++		}
++		if cipher != nil {
++			binary.LittleEndian.PutUint32(packet[padding:], msgType)
++			end := padding + length
++			if kind == awgTransport {
++				end = padding + MessageTransportHeaderSize
++			}
++			cipher.XORKeyStream(packet[padding+4:end], packet[padding+4:end])
++		}
++		return awgMessageTypes[kind], padding, length
++	}
++	return MessageUnknownType, 0, 0
++}
++
++// newMessageBuffer returns a buffer for a handshake message of the given kind:
++// MessageEncapsulatingTransportSize free bytes, the padding, the message and
++// trailer bytes (none if trailer < 1). The padding and the trailer are random;
++// the message is also returned separately for the caller to fill.
++func (p *awgParams) newMessageBuffer(kind int, trailer int) (buffer []byte, message []byte) {
++	start := MessageEncapsulatingTransportSize + int(p.paddings[kind])
++	end := start + awgMessageSizes[kind]
++	buffer = make([]byte, end+max(trailer, 0))
++	_, _ = rand.Read(buffer[MessageEncapsulatingTransportSize:start])
++	_, _ = rand.Read(buffer[end:])
++	return buffer, buffer[start:end]
++}
++
++// randomTrailer is how many random bytes follow a datagram of size bytes
++// (AmneziaWG 3.1 RandomTrailers): up to the UDP window, or -1 if trailers are off.
++func (p *awgParams) randomTrailer(window uint32, size int) int {
++	if !p.randomTrailers {
++		return -1
++	}
++	if int(window) < size {
++		return 0
++	}
++	return int(fastrandn(window - uint32(size)))
++}
++
++// protect applies header protection to a filled message of newMessageBuffer.
++func (p *awgParams) protect(buffer []byte, message []byte) {
++	cipher := p.headerCipher(buffer[MessageEncapsulatingTransportSize:])
++	if cipher != nil {
++		cipher.XORKeyStream(message, message)
++	}
++}
++
++// transportPadding is S4: how many random bytes precede a transport message.
++func (device *Device) transportPadding() uint32 {
++	if p := device.awg.Load(); p != nil {
++		return p.paddings[awgTransport]
++	}
++	return 0
++}
++
++// prefixPackets returns the datagrams sent before a handshake initiation: the
++// signature packets I1-I5 (or, with an AmneziaWG 1.5 Itime, J1-J3 until it
++// passes) and Jc junk packets. Each starts after MessageEncapsulatingTransportSize
++// free bytes.
++func (device *Device) prefixPackets(p *awgParams) [][]byte {
++	var packets [][]byte
++	chains := p.jpackets[:]
++	if p.hasSignaturePackets() {
++		device.awgSignature.Lock()
++		now := time.Now()
++		if !device.awgSignature.sent || !now.Before(device.awgSignature.next) {
++			chains = p.ipackets[:]
++			device.awgSignature.sent = true
++			device.awgSignature.next = now.Add(time.Duration(p.itime) * time.Second)
++		}
++		device.awgSignature.Unlock()
++	}
++	for _, chain := range chains {
++		if chain == nil {
++			continue
++		}
++		packet := make([]byte, MessageEncapsulatingTransportSize+chain.ObfuscatedLen(0))
++		chain.Obfuscate(packet[MessageEncapsulatingTransportSize:], nil)
++		packets = append(packets, packet)
++	}
++	for range p.junkCount {
++		size := p.junkMin
++		if p.junkMax > p.junkMin {
++			size += fastrandn(p.junkMax - p.junkMin)
++		}
++		packet := make([]byte, MessageEncapsulatingTransportSize+int(size))
++		_, _ = rand.Read(packet[MessageEncapsulatingTransportSize:])
++		packets = append(packets, packet)
++	}
++	return packets
++}
++
++func (p *awgParams) hasSignaturePackets() bool {
++	for _, chain := range p.ipackets {
++		if chain != nil {
++			return true
++		}
++	}
++	return false
++}
++
++// contentPaddingSize is how many zero bytes follow transport content of
++// contentSize bytes in a datagram of packetSize bytes, as amneziawg-go 3.1 pads:
++// a random ContentPaddingAddition or, with RandomTrailers, a random size, both
++// within the UDP window of the peer; otherwise the WireGuard padding to a
++// multiple of 16.
++func (p *awgParams) contentPaddingSize(window uint32, packetSize, contentSize, mtu int) int {
++	if !p.contentPadding.IsZero() {
++		if int(window) < packetSize {
++			return 0
++		}
++		return min(int(p.contentPadding.PickOne()), int(window)-packetSize)
++	}
++	if trailer := p.randomTrailer(window, packetSize); trailer >= 0 {
++		return trailer
++	}
++	return calculatePaddingSize(contentSize, mtu)
++}
++
++// raiseUDPWindow makes the UDP window of the peer at least size and returns it.
++func (peer *Peer) raiseUDPWindow(size uint32) uint32 {
++	for {
++		window := peer.udpWindow.Load()
++		if window >= size {
++			return window
++		}
++		if peer.udpWindow.CompareAndSwap(window, size) {
++			return size
++		}
++	}
++}
++
++// cookiesDisabled is AmneziaWG 3.1 DisableCookies.
++func (device *Device) cookiesDisabled() bool {
++	p := device.awg.Load()
++	return p != nil && p.disableCookies
++}
++
++// sealAWG encrypts elem into an AmneziaWG transport message in place: S4
++// random bytes, the header with an H4 type, the content and its padding,
++// then header protection. The plaintext is at
++// MessageEncapsulatingTransportSize+elem.padding+MessageTransportHeaderSize.
++func (device *Device) sealAWG(p *awgParams, elem *QueueOutboundElement, nonce *[chacha20poly1305.NonceSize]byte) {
++	if padding := p.paddings[awgTransport]; elem.padding != padding {
++		// S4 was set after the packet was placed, as when the TUN reader
++		// waited for it from before the configuration: move the packet
++		from := MessageEncapsulatingTransportSize + int(elem.padding) + MessageTransportHeaderSize
++		to := MessageEncapsulatingTransportSize + int(padding) + MessageTransportHeaderSize
++		size := len(elem.packet)
++		if to+size+chacha20poly1305.Overhead > cap(elem.buffer) {
++			// no room: the packet is lost, a keepalive goes instead
++			size = 0
++			elem.keepalive = true
++		}
++		copy(elem.buffer[to:to+size], elem.buffer[from:from+size])
++		elem.packet = elem.buffer[to : to+size]
++		elem.padding = padding
++	}
++	start := MessageEncapsulatingTransportSize + int(elem.padding)
++	contentStart := start + MessageTransportHeaderSize
++	_, _ = rand.Read(elem.buffer[MessageEncapsulatingTransportSize:start])
++
++	header := elem.buffer[start:contentStart]
++	binary.LittleEndian.PutUint32(header[0:4], p.headers[awgTransport].PickOne())
++	binary.LittleEndian.PutUint32(header[4:8], elem.keypair.remoteIndex)
++	binary.LittleEndian.PutUint64(header[8:16], elem.nonce)
++
++	size := len(elem.packet)
++	packetSize := int(elem.padding) + MessageTransportSize + size
++	window := elem.peer.raiseUDPWindow(uint32(packetSize))
++	space := cap(elem.buffer) - contentStart - size - chacha20poly1305.Overhead
++	paddingSize := max(0, min(p.contentPaddingSize(window, packetSize, size, int(device.tun.mtu.Load())), space))
++	content := elem.buffer[contentStart : contentStart+size+paddingSize]
++	clear(content[size:])
++
++	binary.LittleEndian.PutUint64(nonce[4:], elem.nonce)
++	sealed := elem.keypair.send.Seal(header, nonce[:], content, nil)
++	elem.packet = elem.buffer[:start+len(sealed)]
++
++	if cipher := p.headerCipher(elem.buffer[MessageEncapsulatingTransportSize:start]); cipher != nil {
++		cipher.XORKeyStream(header, header)
++	}
++}
++
++// inputPacketLength returns the S4 padding and the buffer size for an injected
++// packet of n bytes (InputPacket, InputPackets); the size is over
++// MaxMessageSize if the packet does not fit.
++func (device *Device) inputPacketLength(n int) (uint32, int) {
++	length := MessageEncapsulatingTransportSize + MessageTransportHeaderSize + n + PaddingMultiple + chacha20poly1305.Overhead
++	p := device.awg.Load()
++	if p == nil {
++		return 0, length
++	}
++	padding := p.paddings[awgTransport]
++	length += int(padding)
++	if length <= MaxMessageSize && (!p.contentPadding.IsZero() || p.randomTrailers) {
++		// room for the random padding, which stays within the UDP window of the
++		// peer: its largest datagram, in practice a full one
++		window := max(awgUDPWindow, int(device.tun.mtu.Load())+MessageTransportSize+int(padding))
++		length = min(max(length, MessageEncapsulatingTransportSize+window), MaxMessageSize)
++	}
++	return padding, length
++}
++
++// Timings: the WireGuard constants unless AmneziaWG sets them.
++
++// plainParams has no timings set: the WireGuard constants.
++var plainParams awgParams
++
++func (device *Device) timingParams() *awgParams {
++	if p := device.awg.Load(); p != nil {
++		return p
++	}
++	return &plainParams
++}
++
++// timing is r seconds (pick chooses a value of the range), or def if r is not set.
++func timing(r UintRange, pick func(UintRange) uint32, def time.Duration) time.Duration {
++	if r.IsZero() {
++		return def
++	}
++	return time.Duration(pick(r)) * time.Second
++}
++
++// retransmitHandshakeTimeout replaces RekeyTimeout for handshake retransmission.
++func (device *Device) retransmitHandshakeTimeout() time.Duration {
++	return timing(device.timingParams().rekeyTimeout, UintRange.PickOne, RekeyTimeout)
++}
++
++// rekeyMinTimeout replaces RekeyTimeout as the minimum time between handshake initiations.
++func (device *Device) rekeyMinTimeout() time.Duration {
++	return timing(device.timingParams().rekeyTimeout, UintRange.Lo, RekeyTimeout)
++}
++
++// sendKeepaliveTimeout replaces KeepaliveTimeout for passive keepalives.
++func (device *Device) sendKeepaliveTimeout() time.Duration {
++	return timing(device.timingParams().keepaliveTimeout, UintRange.PickOne, KeepaliveTimeout)
++}
++
++// newHandshakeTimeout replaces KeepaliveTimeout + RekeyTimeout.
++func (device *Device) newHandshakeTimeout() time.Duration {
++	p := device.timingParams()
++	return timing(p.keepaliveTimeout, UintRange.Hi, KeepaliveTimeout) + timing(p.rekeyTimeout, UintRange.PickOne, RekeyTimeout)
++}
++
++// keyRefreshTimeoutSending replaces RekeyAfterTime.
++func (device *Device) keyRefreshTimeoutSending() time.Duration {
++	return timing(device.timingParams().rekeyAfterTime, UintRange.PickOne, RekeyAfterTime)
++}
++
++// keyRefreshTimeoutReceiving replaces RejectAfterTime - KeepaliveTimeout - RekeyTimeout.
++func (device *Device) keyRefreshTimeoutReceiving() time.Duration {
++	p := device.timingParams()
++	return max(0, timing(p.rejectAfterTime, UintRange.PickOne, RejectAfterTime)-
++		timing(p.keepaliveTimeout, UintRange.Lo, KeepaliveTimeout)-
++		timing(p.rekeyTimeout, UintRange.Lo, RekeyTimeout))
++}
++
++// keychainExpireTime replaces RejectAfterTime.
++func (device *Device) keychainExpireTime() time.Duration {
++	return timing(device.timingParams().rejectAfterTime, UintRange.Hi, RejectAfterTime)
++}
++
++// maxHandshakeAttempts replaces MaxTimerHandshakes.
++func (device *Device) maxHandshakeAttempts() uint32 {
++	if r := device.timingParams().maxHandshakeAttempts; !r.IsZero() {
++		return r.PickOne()
++	}
++	return MaxTimerHandshakes
++}
+diff --git a/device/awg_obf.go b/device/awg_obf.go
+new file mode 100644
+index 0000000..047f89a
+--- /dev/null
++++ b/device/awg_obf.go
+@@ -0,0 +1,348 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
++ *
++ * AmneziaWG signature packets (I1-I5, J1-J3), ported from
++ * github.com/amnezia-vpn/amneziawg-go (MIT).
++ */
++
++package device
++
++import (
++	"crypto/rand"
++	"encoding/base64"
++	"encoding/binary"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"strconv"
++	"strings"
++	"sync/atomic"
++	"time"
++)
++
++// An obf writes one part of a signature packet. src is the data the chain
++// wraps; signature packets carry no data, so it is empty for them.
++type obf interface {
++	Obfuscate(dst, src []byte)
++	ObfuscatedLen(srcLen int) int
++}
++
++type obfBuilder func(val string) (obf, error)
++
++var obfBuilders = map[string]obfBuilder{
++	"b":  newBytesObf,
++	"t":  newTimestampObf,
++	"r":  newRandObf,
++	"rc": newRandCharObf,
++	"rd": newRandDigitsObf,
++	"d":  newDataObf,
++	"ds": newDataStringObf,
++	"dz": newDataSizeObf,
++	// AmneziaWG 1.5
++	"c":  newCounterObf,
++	"wt": newWaitObf,
++}
++
++// obfChain is a signature packet: a sequence of tags such as
++// "<b 0x0102><r 16><t>". Spec is the text it was parsed from.
++type obfChain struct {
++	Spec string
++	obfs []obf
++}
++
++// newObfChain parses a signature packet; nil if spec has no tags.
++func newObfChain(spec string) (*obfChain, error) {
++	var (
++		obfs []obf
++		errs []error
++	)
++	remaining := spec
++	for {
++		start := strings.IndexByte(remaining, '<')
++		if start == -1 {
++			break
++		}
++		end := strings.IndexByte(remaining[start:], '>')
++		if end == -1 {
++			return nil, errors.New("missing enclosing >")
++		}
++		end += start
++		parts := strings.Fields(remaining[start+1 : end])
++		remaining = remaining[end+1:]
++		if len(parts) == 0 {
++			errs = append(errs, errors.New("empty tag"))
++			continue
++		}
++		key := strings.ToLower(parts[0])
++		builder, ok := obfBuilders[key]
++		if !ok {
++			errs = append(errs, fmt.Errorf("unknown tag <%s>", parts[0]))
++			continue
++		}
++		val := ""
++		if len(parts) > 1 {
++			val = parts[1]
++		}
++		o, err := builder(val)
++		if err != nil {
++			errs = append(errs, fmt.Errorf("failed to build <%s>: %w", parts[0], err))
++			continue
++		}
++		obfs = append(obfs, o)
++	}
++	if len(errs) > 0 {
++		return nil, errors.Join(errs...)
++	}
++	if len(obfs) == 0 {
++		return nil, nil
++	}
++	chain := &obfChain{Spec: spec, obfs: obfs}
++	if size := chain.ObfuscatedLen(0); size > maxPacketSize-MessageEncapsulatingTransportSize {
++		return nil, fmt.Errorf("packet of %d bytes is too large", size)
++	}
++	return chain, nil
++}
++
++func (c *obfChain) Obfuscate(dst, src []byte) {
++	written := 0
++	for _, o := range c.obfs {
++		obfLen := o.ObfuscatedLen(len(src))
++		o.Obfuscate(dst[written:written+obfLen], src)
++		written += obfLen
++	}
++}
++
++func (c *obfChain) ObfuscatedLen(n int) int {
++	total := 0
++	for _, o := range c.obfs {
++		total += o.ObfuscatedLen(n)
++	}
++	return total
++}
++
++// tagLength parses the size of <r>, <rc>, <rd> and <dz>.
++func tagLength(val string) (int, error) {
++	length, err := strconv.Atoi(val)
++	if err != nil {
++		return 0, err
++	}
++	if length < 0 || length > maxPacketSize {
++		return 0, fmt.Errorf("invalid length %d", length)
++	}
++	return length, nil
++}
++
++// <b 0x...>: static bytes.
++type bytesObf struct {
++	data []byte
++}
++
++func newBytesObf(val string) (obf, error) {
++	val = strings.TrimPrefix(strings.TrimPrefix(val, "0x"), "0X")
++	if len(val) == 0 {
++		return nil, errors.New("empty argument")
++	}
++	if len(val)%2 != 0 {
++		// AmneziaWG 1.5 accepted an odd number of digits as if led by a zero.
++		val = "0" + val
++	}
++	data, err := hex.DecodeString(val)
++	if err != nil {
++		return nil, err
++	}
++	return &bytesObf{data: data}, nil
++}
++
++func (o *bytesObf) Obfuscate(dst, src []byte) {
++	copy(dst, o.data)
++}
++
++func (o *bytesObf) ObfuscatedLen(int) int {
++	return len(o.data)
++}
++
++// <t>: current UNIX time, 4 bytes.
++type timestampObf struct{}
++
++func newTimestampObf(string) (obf, error) {
++	return &timestampObf{}, nil
++}
++
++func (o *timestampObf) Obfuscate(dst, src []byte) {
++	binary.BigEndian.PutUint32(dst, uint32(time.Now().Unix()))
++}
++
++func (o *timestampObf) ObfuscatedLen(int) int {
++	return 4
++}
++
++// <r N>: random bytes.
++type randObf struct {
++	length int
++}
++
++func newRandObf(val string) (obf, error) {
++	length, err := tagLength(val)
++	if err != nil {
++		return nil, err
++	}
++	return &randObf{length: length}, nil
++}
++
++func (o *randObf) Obfuscate(dst, src []byte) {
++	_, _ = rand.Read(dst[:o.length])
++}
++
++func (o *randObf) ObfuscatedLen(int) int {
++	return o.length
++}
++
++// <rc N>: random letters.
++const chars52 = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
++
++type randCharObf struct {
++	length int
++}
++
++func newRandCharObf(val string) (obf, error) {
++	length, err := tagLength(val)
++	if err != nil {
++		return nil, err
++	}
++	return &randCharObf{length: length}, nil
++}
++
++func (o *randCharObf) Obfuscate(dst, src []byte) {
++	_, _ = rand.Read(dst[:o.length])
++	for i := range dst[:o.length] {
++		dst[i] = chars52[dst[i]%52]
++	}
++}
++
++func (o *randCharObf) ObfuscatedLen(int) int {
++	return o.length
++}
++
++// <rd N>: random digits.
++const digits10 = "0123456789"
++
++type randDigitObf struct {
++	length int
++}
++
++func newRandDigitsObf(val string) (obf, error) {
++	length, err := tagLength(val)
++	if err != nil {
++		return nil, err
++	}
++	return &randDigitObf{length: length}, nil
++}
++
++func (o *randDigitObf) Obfuscate(dst, src []byte) {
++	_, _ = rand.Read(dst[:o.length])
++	for i := range dst[:o.length] {
++		dst[i] = digits10[dst[i]%10]
++	}
++}
++
++func (o *randDigitObf) ObfuscatedLen(int) int {
++	return o.length
++}
++
++// <d>: the data as is.
++type dataObf struct{}
++
++func newDataObf(string) (obf, error) {
++	return &dataObf{}, nil
++}
++
++func (o *dataObf) Obfuscate(dst, src []byte) {
++	copy(dst, src)
++}
++
++func (o *dataObf) ObfuscatedLen(n int) int {
++	return n
++}
++
++// <ds>: the data in base64.
++type dataStringObf struct{}
++
++func newDataStringObf(string) (obf, error) {
++	return &dataStringObf{}, nil
++}
++
++func (o *dataStringObf) Obfuscate(dst, src []byte) {
++	base64.RawStdEncoding.Encode(dst, src)
++}
++
++func (o *dataStringObf) ObfuscatedLen(n int) int {
++	return base64.RawStdEncoding.EncodedLen(n)
++}
++
++// <dz N>: the data size, N bytes big endian.
++type dataSizeObf struct {
++	length int
++}
++
++func newDataSizeObf(val string) (obf, error) {
++	length, err := tagLength(val)
++	if err != nil {
++		return nil, err
++	}
++	return &dataSizeObf{length: length}, nil
++}
++
++func (o *dataSizeObf) Obfuscate(dst, src []byte) {
++	srcLen := len(src)
++	for i := o.length - 1; i >= 0; i-- {
++		dst[i] = byte(srcLen & 0xFF)
++		srcLen >>= 8
++	}
++}
++
++func (o *dataSizeObf) ObfuscatedLen(int) int {
++	return o.length
++}
++
++// <c>, AmneziaWG 1.5: counter of signature packets sent, 8 bytes big endian.
++var signaturePacketCounter atomic.Uint64
++
++type counterObf struct{}
++
++func newCounterObf(val string) (obf, error) {
++	if val != "" {
++		return nil, errors.New("takes no argument")
++	}
++	return &counterObf{}, nil
++}
++
++func (o *counterObf) Obfuscate(dst, src []byte) {
++	binary.BigEndian.PutUint64(dst, signaturePacketCounter.Add(1))
++}
++
++func (o *counterObf) ObfuscatedLen(int) int {
++	return 8
++}
++
++// <wt N>, AmneziaWG 1.5: a pause of N milliseconds before the next packet.
++// Accepted but not waited for: the pause would hold up the goroutine that
++// sends the handshake, and with it the tunnel's outgoing packets.
++type waitObf struct{}
++
++func newWaitObf(val string) (obf, error) {
++	timeout, err := strconv.Atoi(val)
++	if err != nil {
++		return nil, err
++	}
++	if timeout < 0 || timeout > 5000 {
++		return nil, errors.New("timeout must be from 0 to 5000 ms")
++	}
++	return &waitObf{}, nil
++}
++
++func (o *waitObf) Obfuscate(dst, src []byte) {}
++
++func (o *waitObf) ObfuscatedLen(int) int {
++	return 0
++}
+diff --git a/device/awg_test.go b/device/awg_test.go
+new file mode 100644
+index 0000000..27ff617
+--- /dev/null
++++ b/device/awg_test.go
+@@ -0,0 +1,333 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
++ */
++
++package device
++
++import (
++	"bytes"
++	"crypto/rand"
++	"encoding/binary"
++	"encoding/hex"
++	"strings"
++	"testing"
++)
++
++func TestUintRange(t *testing.T) {
++	for _, test := range []struct {
++		text   string
++		lo, hi uint32
++		ok     bool
++	}{
++		{"5", 5, 5, true},
++		{"5-10", 5, 10, true},
++		{" 5 - 10 ", 5, 10, true},
++		{"0", 0, 0, true},
++		{"4294967295", 4294967295, 4294967295, true},
++		{"10-5", 0, 0, false},
++		{"4294967296", 0, 0, false},
++		{"-5", 0, 0, false},
++		{"5-", 0, 0, false},
++		{"a", 0, 0, false},
++		{"", 0, 0, false},
++		{"1-2-3", 0, 0, false},
++	} {
++		var r UintRange
++		err := r.FromString(test.text)
++		if (err == nil) != test.ok {
++			t.Fatalf("%q: error %v, want ok=%v", test.text, err, test.ok)
++		}
++		if !test.ok {
++			continue
++		}
++		if r.Lo() != test.lo || r.Hi() != test.hi {
++			t.Fatalf("%q: got %d-%d", test.text, r.Lo(), r.Hi())
++		}
++		var again UintRange
++		if err := again.FromString(r.String()); err != nil || again != r {
++			t.Fatalf("%q: String %q does not parse back", test.text, r.String())
++		}
++	}
++
++	var r UintRange
++	r.FromUint32(10, 12)
++	seen := map[uint32]bool{}
++	for range 1000 {
++		value := r.PickOne()
++		if !r.Contains(value) {
++			t.Fatalf("PickOne %d is out of %s", value, r)
++		}
++		seen[value] = true
++	}
++	if len(seen) != 3 {
++		t.Fatalf("PickOne of %s gave %v", r, seen)
++	}
++	var other UintRange
++	other.FromUint32(12, 20)
++	if !r.Overlap(other) || !other.Overlap(r) {
++		t.Fatal("10-12 and 12-20 overlap")
++	}
++	other.FromUint32(13, 20)
++	if r.Overlap(other) || other.Overlap(r) {
++		t.Fatal("10-12 and 13-20 do not overlap")
++	}
++}
++
++func TestObfChain(t *testing.T) {
++	for _, spec := range []string{"", "no tags here"} {
++		chain, err := newObfChain(spec)
++		if chain != nil || err != nil {
++			t.Fatalf("%q: got %v, %v", spec, chain, err)
++		}
++	}
++
++	for _, test := range []struct {
++		spec   string
++		length int
++		check  func(packet []byte) bool
++	}{
++		{"<b 0xdeadbeef>", 4, func(p []byte) bool { return bytes.Equal(p, []byte{0xde, 0xad, 0xbe, 0xef}) }},
++		{"<b 0Xabc>", 2, func(p []byte) bool { return bytes.Equal(p, []byte{0x0a, 0xbc}) }},
++		{"<b c0ffee>", 3, func(p []byte) bool { return bytes.Equal(p, []byte{0xc0, 0xff, 0xee}) }},
++		{"<r 10>", 10, nil},
++		{"<rc 64>", 64, func(p []byte) bool { return strings.Trim(string(p), chars52) == "" }},
++		{"<rd 64>", 64, func(p []byte) bool { return strings.Trim(string(p), digits10) == "" }},
++		{"<t>", 4, nil},
++		{"<c>", 8, nil},
++		{"<wt 100>", 0, nil},
++		{"<B 0x01><R 2><T>", 7, func(p []byte) bool { return p[0] == 1 }},
++		{"x<b 0x01>y<b 0x02>z", 2, func(p []byte) bool { return bytes.Equal(p, []byte{1, 2}) }},
++		{"<r 0>", 0, nil},
++	} {
++		chain, err := newObfChain(test.spec)
++		if err != nil {
++			t.Fatalf("%q: %v", test.spec, err)
++		}
++		if chain == nil || chain.Spec != test.spec {
++			t.Fatalf("%q: got chain %v", test.spec, chain)
++		}
++		if length := chain.ObfuscatedLen(0); length != test.length {
++			t.Fatalf("%q: length %d, want %d", test.spec, length, test.length)
++		}
++		packet := make([]byte, test.length)
++		chain.Obfuscate(packet, nil)
++		if test.check != nil && !test.check(packet) {
++			t.Fatalf("%q: wrong packet %x", test.spec, packet)
++		}
++	}
++
++	for _, spec := range []string{
++		"<x>", "<b>", "<b 0xzz>", "<r -1>", "<r 70000>", "<r>", "<r 16", "<>",
++		"<wt 6000>", "<wt>", "<c 1>", "<r 65507>", "<r 40000><r 40000>",
++	} {
++		if chain, err := newObfChain(spec); err == nil {
++			t.Fatalf("%q: no error, chain %v", spec, chain)
++		}
++	}
++
++	// <d>, <ds>, <dz> wrap data, which signature packets do not have
++	chain, err := newObfChain("<dz 2><d><ds>")
++	if err != nil {
++		t.Fatal(err)
++	}
++	data := []byte("hello")
++	packet := make([]byte, chain.ObfuscatedLen(len(data)))
++	chain.Obfuscate(packet, data)
++	if want := "\x00\x05helloaGVsbG8"; string(packet) != want {
++		t.Fatalf("got %q, want %q", packet, want)
++	}
++
++	counter, _ := newObfChain("<c>")
++	first := make([]byte, 8)
++	second := make([]byte, 8)
++	counter.Obfuscate(first, nil)
++	counter.Obfuscate(second, nil)
++	if binary.BigEndian.Uint64(second) != binary.BigEndian.Uint64(first)+1 {
++		t.Fatalf("counter went %x, %x", first, second)
++	}
++}
++
++func testAWGParams(t *testing.T, lines string) *awgParams {
++	t.Helper()
++	p := newAWGParams()
++	for _, line := range strings.Split(lines, "\n") {
++		key, value, _ := strings.Cut(line, "=")
++		if err := p.set(key, value); err != nil {
++			t.Fatalf("%s: %v", line, err)
++		}
++	}
++	if err := p.validate(); err != nil {
++		t.Fatal(err)
++	}
++	return p
++}
++
++func randomKeyHex(t *testing.T) string {
++	var key [32]byte
++	if _, err := rand.Read(key[:]); err != nil {
++		t.Fatal(err)
++	}
++	return hex.EncodeToString(key[:])
++}
++
++func TestAWGClassify(t *testing.T) {
++	configs := map[string]string{
++		"awg1":     "s1=15\ns2=40\nh1=1020325451\nh2=3288052141\nh3=1766607858\nh4=2528465083",
++		"awg2":     "s1=15\ns2=40\ns3=20\ns4=10\nh1=100-200\nh2=300-400\nh3=500-600\nh4=700-800",
++		"awg3":     "s1=24\ns2=12\ns3=16\ns4=13\nh1=100-200\nh2=300-400\nh3=500-600\nh4=700-800\nheader_protection_key=" + randomKeyHex(t),
++		"awg3.1":   "s1=24\ns2=12\ns3=16\ns4=13\nh1=100-200\nh2=300-400\nh3=500-600\nh4=700-800\nheader_protection_key=" + randomKeyHex(t) + "\nrandom_trailers=1",
++		"trailers": "s1=15\ns2=40\ns3=20\ns4=10\nh1=100-200\nh2=300-400\nh3=500-600\nh4=700-800\nrandom_trailers=true",
++		"defaults": "jc=3",
++	}
++	for name, lines := range configs {
++		p := testAWGParams(t, lines)
++		for kind := awgInit; kind <= awgCookie; kind++ {
++			trailers := 0
++			for range 50 {
++				trailer := p.randomTrailer(awgUDPWindow, int(p.paddings[kind])+awgMessageSizes[kind])
++				if trailer > 0 {
++					trailers++
++				}
++				buffer, message := p.newMessageBuffer(kind, trailer)
++				if _, err := rand.Read(message); err != nil {
++					t.Fatal(err)
++				}
++				binary.LittleEndian.PutUint32(message, p.headers[kind].PickOne())
++				original := bytes.Clone(message)
++				p.protect(buffer, message)
++				if p.headerKey != nil && bytes.Equal(original[:4], message[:4]) && bytes.Equal(original[4:], message[4:]) {
++					t.Fatalf("%s: message %d is not protected", name, kind)
++				}
++				msgType, padding, length := p.classify(buffer[MessageEncapsulatingTransportSize:])
++				if msgType != awgMessageTypes[kind] || padding != int(p.paddings[kind]) || length != awgMessageSizes[kind] {
++					t.Fatalf("%s: message %d classified as %d with padding %d, length %d", name, kind, msgType, padding, length)
++				}
++				start := MessageEncapsulatingTransportSize + padding
++				if !bytes.Equal(buffer[start:start+length], original) {
++					t.Fatalf("%s: message %d is not restored", name, kind)
++				}
++			}
++			if p.randomTrailers != (trailers > 0) {
++				t.Fatalf("%s: %d of 50 messages %d with trailers", name, trailers, kind)
++			}
++		}
++
++		// transport message: the header protection covers its 16 bytes of header
++		for _, contentLength := range []int{0, 16, 48, 1420} {
++			padding := int(p.paddings[awgTransport])
++			packet := make([]byte, padding+MessageTransportSize+contentLength)
++			if _, err := rand.Read(packet); err != nil {
++				t.Fatal(err)
++			}
++			binary.LittleEndian.PutUint32(packet[padding:], p.headers[awgTransport].PickOne())
++			original := bytes.Clone(packet)
++			if cipher := p.headerCipher(packet); cipher != nil {
++				header := packet[padding : padding+MessageTransportHeaderSize]
++				cipher.XORKeyStream(header, header)
++			}
++			msgType, gotPadding, length := p.classify(packet)
++			if msgType != MessageTransportType || gotPadding != padding || length != len(packet)-padding {
++				t.Fatalf("%s: transport classified as %d with padding %d, length %d", name, msgType, gotPadding, length)
++			}
++			if !bytes.Equal(packet, original) {
++				t.Fatalf("%s: transport header is not restored", name)
++			}
++		}
++
++		// a datagram too short for a transport message
++		short := make([]byte, int(p.paddings[awgTransport])+MessageTransportSize-1)
++		binary.LittleEndian.PutUint32(short[p.paddings[awgTransport]:], p.headers[awgTransport].Lo())
++		if msgType, _, _ := p.classify(short); msgType != MessageUnknownType && p.headerKey == nil {
++			t.Fatalf("%s: short datagram classified as %d", name, msgType)
++		}
++	}
++
++	// without header protection, a datagram with an unknown type is junk
++	p := testAWGParams(t, configs["awg2"])
++	junk := make([]byte, 200)
++	binary.LittleEndian.PutUint32(junk[p.paddings[awgTransport]:], 50)
++	if msgType, _, _ := p.classify(junk); msgType != MessageUnknownType {
++		t.Fatalf("junk classified as %d", msgType)
++	}
++
++	// without random trailers, a handshake message with bytes after it is not one
++	buffer, message := p.newMessageBuffer(awgInit, 1)
++	binary.LittleEndian.PutUint32(message, p.headers[awgInit].Lo())
++	if msgType, _, _ := p.classify(buffer[MessageEncapsulatingTransportSize:]); msgType == MessageInitiationType {
++		t.Fatal("initiation with a trailer accepted without random trailers")
++	}
++}
++
++func TestAWGValidate(t *testing.T) {
++	for _, lines := range []string{
++		"h1=1-10\nh2=10-20",
++		"h4=1",
++		"jc=4\njmin=100\njmax=50",
++		"jc=4\njmin=10\njmax=65500",
++		"s1=11\ns2=20\ns3=20\ns4=20\nheader_protection_key=" + randomKeyHex(t),
++		"s4=0\ns1=20\ns2=20\ns3=20\nheader_protection_key=" + randomKeyHex(t),
++	} {
++		p := newAWGParams()
++		for _, line := range strings.Split(lines, "\n") {
++			key, value, _ := strings.Cut(line, "=")
++			if err := p.set(key, value); err != nil {
++				t.Fatalf("%s: %v", line, err)
++			}
++		}
++		if err := p.validate(); err == nil {
++			t.Fatalf("%q: no error", lines)
++		}
++	}
++	for _, line := range []string{
++		"jc=1001", "jc=-1", "s1=65536", "h1=5-1", "i1=<x>", "j1=<r", "itime=x",
++		"header_protection_key=00", "content_padding_addition=a", "max_handshake_attempts=2-1",
++		"random_trailers=2", "disable_cookies=yes",
++	} {
++		key, value, _ := strings.Cut(line, "=")
++		if err := newAWGParams().set(key, value); err == nil {
++			t.Fatalf("%q: no error", line)
++		}
++	}
++}
++
++func TestAWGContentPadding(t *testing.T) {
++	// content of 1300 bytes in a datagram of 1332 (S4 0)
++	p := testAWGParams(t, "content_padding_addition=0-100")
++	both := testAWGParams(t, "content_padding_addition=50-60\nrandom_trailers=1")
++	for range 1000 {
++		if size := p.contentPaddingSize(1500, 1332, 1300, 1420); size < 0 || size > 100 {
++			t.Fatalf("padding %d", size)
++		}
++		if size := p.contentPaddingSize(1352, 1332, 1300, 1420); size > 20 {
++			t.Fatalf("padding %d over the UDP window", size)
++		}
++		if size := both.contentPaddingSize(1500, 1332, 1300, 1420); size < 50 || size > 60 {
++			t.Fatalf("padding %d, want ContentPaddingAddition", size)
++		}
++	}
++	if size := p.contentPaddingSize(1000, 1332, 1300, 1420); size != 0 {
++		t.Fatalf("padding %d beyond the UDP window", size)
++	}
++
++	trailers := testAWGParams(t, "random_trailers=1")
++	seen := map[int]bool{}
++	for range 1000 {
++		size := trailers.contentPaddingSize(500, 100, 68, 1420)
++		if size < 0 || size >= 400 {
++			t.Fatalf("trailer %d", size)
++		}
++		seen[size] = true
++	}
++	if len(seen) < 100 {
++		t.Fatalf("trailers of %d sizes only", len(seen))
++	}
++	if size := trailers.contentPaddingSize(500, 600, 568, 1420); size != 0 {
++		t.Fatalf("trailer %d beyond the UDP window", size)
++	}
++
++	plain := testAWGParams(t, "s4=10")
++	if size := plain.contentPaddingSize(500, 59, 17, 1420); size != 15 {
++		t.Fatalf("padding %d, want 15", size)
++	}
++}
+diff --git a/device/awg_tunnel_test.go b/device/awg_tunnel_test.go
+new file mode 100644
+index 0000000..191ecfc
+--- /dev/null
++++ b/device/awg_tunnel_test.go
+@@ -0,0 +1,347 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
++ */
++
++package device_test
++
++import (
++	"bytes"
++	"context"
++	"crypto/rand"
++	"encoding/binary"
++	"encoding/hex"
++	"fmt"
++	"net"
++	"net/netip"
++	"os"
++	"strings"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/sagernet/wireguard-go/conn"
++	"github.com/sagernet/wireguard-go/device"
++	"github.com/sagernet/wireguard-go/tun"
++)
++
++// TestAWGTunnel runs two devices over localhost UDP with AmneziaWG settings of each
++// generation and checks that packets of every size get through both ways, through
++// the TUN and through InputPacket, and that mismatched settings do not connect.
++func TestAWGTunnel(t *testing.T) {
++	headerKey := make([]byte, 32)
++	if _, err := rand.Read(headerKey); err != nil {
++		t.Fatal(err)
++	}
++	shared := map[string]string{
++		"plain":     "",
++		"junk-only": "jc=5\njmin=10\njmax=50",
++		"awg1.0":    "jc=4\njmin=40\njmax=70\ns1=15\ns2=40\nh1=1020325451\nh2=3288052141\nh3=1766607858\nh4=2528465083",
++		"awg1.5":    "jc=4\njmin=40\njmax=70\ns1=15\ns2=40\ns3=21\ns4=7\nh1=1020325451\nh2=3288052141\nh3=1766607858\nh4=2528465083",
++		"awg2.0":    "jc=4\njmin=40\njmax=70\ns1=15\ns2=40\ns3=21\ns4=7\nh1=100000-200000\nh2=300000-400000\nh3=500000-600000\nh4=700000-800000",
++		"awg3":      "s1=24\ns2=12\ns3=16\ns4=13\nh1=100000-200000\nh2=300000-400000\nh3=500000-600000\nh4=700000-800000\nheader_protection_key=" + hex.EncodeToString(headerKey),
++		"awg3.1":    "s1=24\ns2=12\ns3=16\ns4=13\nh1=100000-200000\nh2=300000-400000\nh3=500000-600000\nh4=700000-800000\nheader_protection_key=" + hex.EncodeToString(headerKey) + "\nrandom_trailers=1",
++	}
++	clientOnly := map[string]string{
++		"awg1.5": "i1=<b 0xc70000000108><r 16><t>\ni2=<rc 10>\ni3=<rd 4>\nj1=<r 30>\nitime=120",
++		"awg2.0": "i1=<b 0x0102><r 100>\ni5=<t><c>",
++		"awg3":   "jc=6\njmin=10\njmax=1000\ni1=<b 0xff><r 30>\ncontent_padding_addition=0-64\nrekey_after_time=100-110\nrekey_timeout=4-6\nreject_after_time=170-180\nkeepalive_timeout=8-12\nmax_handshake_attempts=10-20",
++		// the server pads with random trailers, the client with ContentPaddingAddition
++		"awg3.1": "jc=3\njmin=10\njmax=100\ni1=<b 0xff><r 30>\ncontent_padding_addition=0-64\ndisable_cookies=1",
++	}
++	for name, sharedLines := range shared {
++		t.Run(name, func(t *testing.T) {
++			t.Parallel()
++			client, server := startAWGPair(t, sharedLines+"\n"+clientOnly[name], sharedLines)
++			checkAWGTraffic(t, client, server)
++		})
++	}
++
++	t.Run("mismatch", func(t *testing.T) {
++		t.Parallel()
++		client, server := startAWGPair(t, shared["awg2.0"], strings.Replace(shared["awg2.0"], "h4=700000-800000", "h4=900000-900100", 1))
++		client.tun.inbound <- testIPv4Packet("10.0.0.2", "10.0.0.1", []byte("lost"))
++		select {
++		case packet := <-server.tun.outbound:
++			t.Fatalf("a packet got through mismatched settings: %x", packet)
++		case <-time.After(2 * time.Second):
++		}
++	})
++
++	t.Run("plain-to-awg", func(t *testing.T) {
++		t.Parallel()
++		client, server := startAWGPair(t, "", shared["awg1.0"])
++		client.tun.inbound <- testIPv4Packet("10.0.0.2", "10.0.0.1", []byte("lost"))
++		select {
++		case packet := <-server.tun.outbound:
++			t.Fatalf("a packet got through mismatched settings: %x", packet)
++		case <-time.After(2 * time.Second):
++		}
++	})
++}
++
++type awgTestDevice struct {
++	*device.Device
++	tun *awgTestTUN
++}
++
++func startAWGPair(t *testing.T, clientAWG string, serverAWG string) (client *awgTestDevice, server *awgTestDevice) {
++	serverPrivate, serverPublic := generateTestKeyPair(t)
++	clientPrivate, clientPublic := generateTestKeyPair(t)
++	serverPort := freeUDPPort(t)
++	server = startAWGDevice(t, "server", serverPrivate+"\nlisten_port="+fmt.Sprint(serverPort), serverAWG,
++		"public_key="+clientPublic+"\nallowed_ip=10.0.0.2/32")
++	client = startAWGDevice(t, "client", clientPrivate, clientAWG,
++		"public_key="+serverPublic+"\nendpoint=127.0.0.1:"+fmt.Sprint(serverPort)+"\nallowed_ip=10.0.0.1/32")
++	return client, server
++}
++
++func startAWGDevice(t *testing.T, name string, private string, awg string, peer string) *awgTestDevice {
++	return startAWGDeviceWithLog(t, name, private, awg, peer, nil)
++}
++
++// startAWGDeviceWithLog also passes the verbose log lines of the device to logf.
++func startAWGDeviceWithLog(t *testing.T, name string, private string, awg string, peer string, logf func(line string)) *awgTestDevice {
++	tunDevice := &awgTestTUN{
++		name:     name,
++		inbound:  make(chan []byte, 64),
++		outbound: make(chan []byte, 1024),
++		events:   make(chan tun.Event, 1),
++		done:     make(chan struct{}),
++		reading:  make(chan struct{}),
++	}
++	logger := &device.Logger{
++		Verbosef: func(format string, args ...any) {
++			if logf != nil {
++				logf(fmt.Sprintf(format, args...))
++			}
++			if os.Getenv("AWG_TEST_VERBOSE") != "" {
++				t.Logf(name+": "+format, args...)
++			}
++		},
++		Errorf: func(format string, args ...any) {
++			t.Logf(name+": "+format, args...)
++		},
++	}
++	wgDevice := device.NewDevice(context.Background(), tunDevice, conn.NewStdNetBind(nil), logger, 0)
++	t.Cleanup(wgDevice.Close)
++	// The TUN reader places its next packet before the configuration sets S4,
++	// as it can in sing-box: the packet has to move.
++	<-tunDevice.reading
++	var lines []string
++	for _, line := range strings.Split("private_key="+private+"\n"+awg+"\n"+peer, "\n") {
++		if line != "" {
++			lines = append(lines, line)
++		}
++	}
++	if err := wgDevice.IpcSet(strings.Join(lines, "\n")); err != nil {
++		t.Fatal(err)
++	}
++	if err := wgDevice.Up(); err != nil {
++		t.Fatal(err)
++	}
++	return &awgTestDevice{Device: wgDevice, tun: tunDevice}
++}
++
++func checkAWGTraffic(t *testing.T, client *awgTestDevice, server *awgTestDevice) {
++	for _, size := range []int{0, 1, 15, 16, 17, 100, 500, 1000, 1380} {
++		payload := make([]byte, size)
++		if _, err := rand.Read(payload); err != nil {
++			t.Fatal(err)
++		}
++		request := testIPv4Packet("10.0.0.2", "10.0.0.1", payload)
++		client.tun.inbound <- request
++		expectPacket(t, server.tun, request)
++
++		reply := testIPv4Packet("10.0.0.1", "10.0.0.2", payload)
++		server.tun.inbound <- reply
++		expectPacket(t, client.tun, reply)
++
++		injected := testIPv4Packet("10.0.0.2", "10.0.0.1", append([]byte("injected"), payload...))
++		half := len(injected) / 2
++		client.InputPacket(netip.MustParseAddr("10.0.0.1").AsSlice(), [][]byte{injected[:half], injected[half:]})
++		expectPacket(t, server.tun, injected)
++	}
++	config, err := client.IpcGet()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if strings.Contains(config, "last_handshake_time_sec=0\n") {
++		t.Fatal("no handshake: ", config)
++	}
++}
++
++func expectPacket(t *testing.T, tunDevice *awgTestTUN, want []byte) {
++	t.Helper()
++	select {
++	case got := <-tunDevice.outbound:
++		if !bytes.Equal(got, want) {
++			t.Fatalf("%s got %x, want %x", tunDevice.name, got, want)
++		}
++	case <-time.After(10 * time.Second):
++		t.Fatalf("%s got nothing", tunDevice.name)
++	}
++}
++
++func testIPv4Packet(source string, destination string, payload []byte) []byte {
++	packet := make([]byte, 28+len(payload))
++	packet[0] = 4<<4 | 5
++	binary.BigEndian.PutUint16(packet[2:], uint16(len(packet)))
++	packet[8] = 64
++	packet[9] = 17
++	copy(packet[12:16], netip.MustParseAddr(source).AsSlice())
++	copy(packet[16:20], netip.MustParseAddr(destination).AsSlice())
++	binary.BigEndian.PutUint16(packet[20:], 1000)
++	binary.BigEndian.PutUint16(packet[22:], 1001)
++	binary.BigEndian.PutUint16(packet[24:], uint16(8+len(payload)))
++	copy(packet[28:], payload)
++	return packet
++}
++
++func freeUDPPort(t *testing.T) int {
++	udpConn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer udpConn.Close()
++	return udpConn.LocalAddr().(*net.UDPAddr).Port
++}
++
++// TestAWGIpc checks that AmneziaWG keys are read and reported by the configuration protocol.
++func TestAWGIpc(t *testing.T) {
++	private, _ := generateTestKeyPair(t)
++	headerKey := make([]byte, 32)
++	if _, err := rand.Read(headerKey); err != nil {
++		t.Fatal(err)
++	}
++	headerKeyHex := hex.EncodeToString(headerKey)
++	awg := "jc=4\njmin=40\njmax=70\ns1=15\ns2=40\ns3=21\ns4=13\nh1=100-200\nh2=300\nh3=400-500\nh4=600-700\n" +
++		"i1=<b 0x01><r 4>\nj2=<t>\nitime=60\nheader_protection_key=" + headerKeyHex + "\n" +
++		"content_padding_addition=0-16\nrekey_after_time=100\nrekey_timeout=4-6\nreject_after_time=170-180\n" +
++		"keepalive_timeout=8-12\nmax_handshake_attempts=10-20\nrandom_trailers=1\ndisable_cookies=1"
++	wgDevice := startAWGDevice(t, "ipc", private, awg, "public_key="+hex.EncodeToString(make([]byte, 31))+"01\nallowed_ip=10.0.0.9/32\npersistent_keepalive_interval=20-30")
++	config, err := wgDevice.IpcGet()
++	if err != nil {
++		t.Fatal(err)
++	}
++	for _, line := range append(strings.Split(awg, "\n"), "persistent_keepalive_interval=20-30") {
++		if !strings.Contains(config, line+"\n") {
++			t.Fatalf("missing %q in\n%s", line, config)
++		}
++	}
++
++	for _, bad := range []string{"h1=1-10\nh2=5", "jc=5\njmin=10\njmax=5", "s4=4\nheader_protection_key=" + headerKeyHex, "i1=<q>"} {
++		other := startAWGDevice(t, "bad", private, "", "")
++		if err := other.IpcSet(bad); err == nil {
++			t.Fatalf("%q: no error", bad)
++		}
++		otherConfig, _ := other.IpcGet()
++		if strings.Contains(otherConfig, "h1=") {
++			t.Fatalf("%q: settings applied in part:\n%s", bad, otherConfig)
++		}
++	}
++}
++
++// TestAWGPaddedKeepalive checks that keepalives padded with ContentPaddingAddition
++// (AmneziaWG 3) are taken as keepalives, not as packets with a wrong IP version.
++func TestAWGPaddedKeepalive(t *testing.T) {
++	serverPrivate, serverPublic := generateTestKeyPair(t)
++	clientPrivate, clientPublic := generateTestKeyPair(t)
++	serverPort := freeUDPPort(t)
++	var access sync.Mutex
++	var keepalives, invalid int
++	logf := func(line string) {
++		access.Lock()
++		defer access.Unlock()
++		if strings.Contains(line, "Receiving keepalive packet") {
++			keepalives++
++		}
++		if strings.Contains(line, "invalid IP version") {
++			invalid++
++		}
++	}
++	shared := "s4=13\nh4=700-800\nrandom_trailers=1"
++	startAWGDeviceWithLog(t, "server", serverPrivate+"\nlisten_port="+fmt.Sprint(serverPort), shared,
++		"public_key="+clientPublic+"\nallowed_ip=10.0.0.2/32", logf)
++	startAWGDevice(t, "client", clientPrivate, shared+"\ncontent_padding_addition=16-64",
++		"public_key="+serverPublic+"\nendpoint=127.0.0.1:"+fmt.Sprint(serverPort)+"\nallowed_ip=10.0.0.1/32\npersistent_keepalive_interval=1")
++	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
++		access.Lock()
++		done := keepalives >= 3
++		access.Unlock()
++		if done {
++			break
++		}
++	}
++	access.Lock()
++	defer access.Unlock()
++	if keepalives < 3 || invalid > 0 {
++		t.Fatalf("%d keepalives, %d packets with an invalid IP version", keepalives, invalid)
++	}
++}
++
++// TestAWGKeepaliveRange checks that a keepalive range never picks zero.
++func TestAWGKeepaliveRange(t *testing.T) {
++	private, _ := generateTestKeyPair(t)
++	wgDevice := startAWGDevice(t, "keepalive", private, "", "public_key="+hex.EncodeToString(make([]byte, 31))+"02\nallowed_ip=10.0.0.9/32\npersistent_keepalive_interval=0-30")
++	config, err := wgDevice.IpcGet()
++	if err != nil {
++		t.Fatal(err)
++	}
++	if !strings.Contains(config, "persistent_keepalive_interval=1-30\n") {
++		t.Fatalf("keepalive not clamped:\n%s", config)
++	}
++	if err := wgDevice.IpcSet("public_key=" + hex.EncodeToString(make([]byte, 31)) + "02\npersistent_keepalive_interval=70000"); err == nil {
++		t.Fatal("keepalive over 65535 accepted")
++	}
++}
++
++type awgTestTUN struct {
++	name     string
++	inbound  chan []byte
++	outbound chan []byte
++	events   chan tun.Event
++	done     chan struct{}
++	reading  chan struct{}
++	once     sync.Once
++}
++
++func (t *awgTestTUN) File() *os.File { return nil }
++
++func (t *awgTestTUN) Read(bufs [][]byte, sizes []int, offset int) (int, error) {
++	t.once.Do(func() { close(t.reading) })
++	select {
++	case packet := <-t.inbound:
++		sizes[0] = copy(bufs[0][offset:], packet)
++		return 1, nil
++	case <-t.done:
++		return 0, os.ErrClosed
++	}
++}
++
++func (t *awgTestTUN) Write(bufs [][]byte, offset int) (int, error) {
++	for _, buf := range bufs {
++		select {
++		case t.outbound <- bytes.Clone(buf[offset:]):
++		default:
++		}
++	}
++	return len(bufs), nil
++}
++
++func (t *awgTestTUN) MTU() (int, error) { return 1420, nil }
++
++func (t *awgTestTUN) Name() (string, error) { return t.name, nil }
++
++func (t *awgTestTUN) Events() <-chan tun.Event { return t.events }
++
++func (t *awgTestTUN) Close() error {
++	select {
++	case <-t.done:
++	default:
++		close(t.done)
++	}
++	return nil
++}
++
++func (t *awgTestTUN) BatchSize() int { return 1 }
+diff --git a/device/awg_uapi.go b/device/awg_uapi.go
+new file mode 100644
+index 0000000..e4d5478
+--- /dev/null
++++ b/device/awg_uapi.go
+@@ -0,0 +1,207 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * Copyright (C) 2017-2025 WireGuard LLC. All Rights Reserved.
++ *
++ * AmneziaWG keys of the configuration protocol, as amneziawg-go names them.
++ */
++
++package device
++
++import (
++	"fmt"
++	"strconv"
++
++	"github.com/sagernet/wireguard-go/ipc"
++)
++
++var awgKeys = map[string]bool{
++	"jc": true, "jmin": true, "jmax": true,
++	"s1": true, "s2": true, "s3": true, "s4": true,
++	"h1": true, "h2": true, "h3": true, "h4": true,
++	"i1": true, "i2": true, "i3": true, "i4": true, "i5": true,
++	"j1": true, "j2": true, "j3": true, "itime": true,
++	"header_protection_key": true, "content_padding_addition": true,
++	"rekey_after_time": true, "rekey_timeout": true, "reject_after_time": true,
++	"keepalive_timeout": true, "max_handshake_attempts": true,
++	"random_trailers": true, "disable_cookies": true,
++}
++
++// handleAWGLine applies an AmneziaWG device key of a "set" operation to *next,
++// the pending AmneziaWG settings (created from the current ones on the first
++// key). It reports whether key is an AmneziaWG key.
++func (device *Device) handleAWGLine(next **awgParams, key, value string) (bool, error) {
++	if !awgKeys[key] {
++		return false, nil
++	}
++	if *next == nil {
++		if current := device.awg.Load(); current != nil {
++			*next = current.clone()
++		} else {
++			*next = newAWGParams()
++		}
++	}
++	if err := (*next).set(key, value); err != nil {
++		return true, ipcErrorf(ipc.IpcErrorInvalid, "failed to set %s: %w", key, err)
++	}
++	return true, nil
++}
++
++// commitAWG validates the pending AmneziaWG settings and makes them current.
++func (device *Device) commitAWG(next *awgParams) error {
++	if next == nil {
++		return nil
++	}
++	if err := next.validate(); err != nil {
++		return ipcErrorf(ipc.IpcErrorInvalid, "invalid AmneziaWG settings: %w", err)
++	}
++	device.log.Verbosef("UAPI: Updating AmneziaWG settings")
++	// AmneziaWG datagrams carry data in bytes 1-3, which binds clear for Cloudflare WARP
++	device.net.RLock()
++	bind := device.net.bind
++	device.net.RUnlock()
++	if bind, ok := bind.(interface{ SetPreserveReservedBytes() }); ok {
++		bind.SetPreserveReservedBytes()
++	}
++	device.awg.Store(next)
++	return nil
++}
++
++func (p *awgParams) set(key, value string) error {
++	parse := func(bits int) (uint32, error) {
++		number, err := strconv.ParseUint(value, 10, bits)
++		return uint32(number), err
++	}
++	parseRange := func(r *UintRange) error {
++		return r.FromString(value)
++	}
++	parseChain := func(chain **obfChain) error {
++		parsed, err := newObfChain(value)
++		if err != nil {
++			return err
++		}
++		*chain = parsed
++		return nil
++	}
++	var err error
++	switch key {
++	case "jc":
++		p.junkCount, err = parse(32)
++		if err == nil && p.junkCount > 1000 {
++			err = fmt.Errorf("%d junk packets is too many", p.junkCount)
++		}
++	case "jmin":
++		p.junkMin, err = parse(32)
++	case "jmax":
++		p.junkMax, err = parse(32)
++	case "s1":
++		p.paddings[awgInit], err = parse(16)
++	case "s2":
++		p.paddings[awgResponse], err = parse(16)
++	case "s3":
++		p.paddings[awgCookie], err = parse(16)
++	case "s4":
++		p.paddings[awgTransport], err = parse(16)
++	case "h1":
++		err = parseRange(&p.headers[awgInit])
++	case "h2":
++		err = parseRange(&p.headers[awgResponse])
++	case "h3":
++		err = parseRange(&p.headers[awgCookie])
++	case "h4":
++		err = parseRange(&p.headers[awgTransport])
++	case "i1", "i2", "i3", "i4", "i5":
++		err = parseChain(&p.ipackets[key[1]-'1'])
++	case "j1", "j2", "j3":
++		err = parseChain(&p.jpackets[key[1]-'1'])
++	case "itime":
++		p.itime, err = parse(32)
++	case "header_protection_key":
++		var headerKey HeaderCipherKey
++		err = headerKey.FromHex(value)
++		if err == nil {
++			p.headerKey = nil
++			if !headerKey.IsZero() {
++				p.headerKey = &headerKey
++			}
++		}
++	case "content_padding_addition":
++		err = parseRange(&p.contentPadding)
++	case "rekey_after_time":
++		err = parseRange(&p.rekeyAfterTime)
++	case "rekey_timeout":
++		err = parseRange(&p.rekeyTimeout)
++	case "reject_after_time":
++		err = parseRange(&p.rejectAfterTime)
++	case "keepalive_timeout":
++		err = parseRange(&p.keepaliveTimeout)
++	case "max_handshake_attempts":
++		err = parseRange(&p.maxHandshakeAttempts)
++	case "random_trailers":
++		p.randomTrailers, err = strconv.ParseBool(value)
++	case "disable_cookies":
++		p.disableCookies, err = strconv.ParseBool(value)
++	}
++	return err
++}
++
++// ipcGet writes the AmneziaWG settings for a "get" operation.
++func (p *awgParams) ipcGet(sendf func(format string, args ...any), keyf func(prefix string, key *[32]byte)) {
++	if p == nil {
++		return
++	}
++	if p.junkCount != 0 {
++		sendf("jc=%d", p.junkCount)
++	}
++	if p.junkMin != 0 {
++		sendf("jmin=%d", p.junkMin)
++	}
++	if p.junkMax != 0 {
++		sendf("jmax=%d", p.junkMax)
++	}
++	for kind, padding := range p.paddings {
++		if padding != 0 {
++			sendf("s%d=%d", kind+1, padding)
++		}
++	}
++	for kind, header := range p.headers {
++		sendf("h%d=%s", kind+1, header.String())
++	}
++	for i, chain := range p.ipackets {
++		if chain != nil {
++			sendf("i%d=%s", i+1, chain.Spec)
++		}
++	}
++	for i, chain := range p.jpackets {
++		if chain != nil {
++			sendf("j%d=%s", i+1, chain.Spec)
++		}
++	}
++	if p.itime != 0 {
++		sendf("itime=%d", p.itime)
++	}
++	if p.headerKey != nil {
++		keyf("header_protection_key", (*[32]byte)(p.headerKey))
++	}
++	ranges := []struct {
++		key   string
++		value UintRange
++	}{
++		{"content_padding_addition", p.contentPadding},
++		{"rekey_after_time", p.rekeyAfterTime},
++		{"rekey_timeout", p.rekeyTimeout},
++		{"reject_after_time", p.rejectAfterTime},
++		{"keepalive_timeout", p.keepaliveTimeout},
++		{"max_handshake_attempts", p.maxHandshakeAttempts},
++	}
++	for _, r := range ranges {
++		if !r.value.IsZero() {
++			sendf("%s=%s", r.key, r.value.String())
++		}
++	}
++	if p.randomTrailers {
++		sendf("random_trailers=1")
++	}
++	if p.disableCookies {
++		sendf("disable_cookies=1")
++	}
++}
+diff --git a/device/device.go b/device/device.go
+index cdfec89..7ecf10a 100644
+--- a/device/device.go
++++ b/device/device.go
+@@ -101,6 +101,16 @@ type Device struct {
+ 	closed       chan struct{}
+ 	log          *Logger
+ 	pauseManager pause.Manager
++
++	// awg is the AmneziaWG settings, nil for plain WireGuard (see awg.go).
++	awg atomic.Pointer[awgParams]
++
++	// awgSignature tracks AmneziaWG 1.5 Itime: when signature packets were sent.
++	awgSignature struct {
++		sync.Mutex
++		sent bool
++		next time.Time
++	}
+ }
+ 
+ // deviceState represents the state of a Device.
+@@ -203,7 +213,7 @@ func (device *Device) upLocked() error {
+ 	device.peers.RUnlock()
+ 	for _, peer := range peers {
+ 		peer.Start()
+-		if peer.persistentKeepaliveInterval.Load() > 0 {
++		if !peer.persistentKeepaliveInterval.Load().IsZero() {
+ 			peer.SendKeepalive()
+ 		}
+ 	}
+@@ -669,10 +679,11 @@ func (device *Device) SendKeepalivesToPeersWithCurrentKeypair() {
+ 	// peers.RLock across that path would invert the
+ 	// staticIdentity < peers hierarchy (see lock-ordering.md).
+ 	var peers []*Peer
++	expireTime := device.keychainExpireTime()
+ 	device.peers.RLock()
+ 	for _, peer := range device.peers.keyMap {
+ 		peer.keypairs.RLock()
+-		sendKeepalive := peer.keypairs.current != nil && !peer.keypairs.current.created.Add(RejectAfterTime).Before(time.Now())
++		sendKeepalive := peer.keypairs.current != nil && !peer.keypairs.current.created.Add(expireTime).Before(time.Now())
+ 		peer.keypairs.RUnlock()
+ 		if sendKeepalive {
+ 			peers = append(peers, peer)
+diff --git a/device/noise-protocol.go b/device/noise-protocol.go
+index d72bb25..cb49e50 100644
+--- a/device/noise-protocol.go
++++ b/device/noise-protocol.go
+@@ -54,6 +54,7 @@ const (
+ )
+ 
+ const (
++	MessageUnknownType     = 0 // AmneziaWG: junk, signature packets and garbage
+ 	MessageInitiationType  = 1
+ 	MessageResponseType    = 2
+ 	MessageCookieReplyType = 3
+diff --git a/device/peer.go b/device/peer.go
+index 1606eeb..f0b6931 100644
+--- a/device/peer.go
++++ b/device/peer.go
+@@ -57,6 +57,7 @@ type Peer struct {
+ 		zeroKeyMaterial         *Timer
+ 		persistentKeepalive     *Timer
+ 		handshakeAttempts       atomic.Uint32
++		maxHandshakeAttempts    atomic.Uint32
+ 		needAnotherKeepalive    atomic.Bool
+ 		sentLastMinuteHandshake atomic.Bool
+ 	}
+@@ -80,7 +81,8 @@ type Peer struct {
+ 
+ 	cookieGenerator             CookieGenerator
+ 	trieEntries                 list.List
+-	persistentKeepaliveInterval atomic.Uint32
++	persistentKeepaliveInterval AtomicUintRange // seconds; AmneziaWG allows a range
++	udpWindow                   atomic.Uint32   // AmneziaWG 3.1: the largest datagram seen, see awgUDPWindow
+ }
+ 
+ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
+@@ -103,6 +105,7 @@ func (device *Device) NewPeer(pk NoisePublicKey) (*Peer, error) {
+ 	// create peer
+ 	peer := new(Peer)
+ 
++	peer.udpWindow.Store(awgUDPWindow)
+ 	peer.cookieGenerator.Init(pk)
+ 	peer.device = device
+ 	peer.queue.outbound = newAutodrainingOutboundQueue(device)
+@@ -244,7 +247,7 @@ func (peer *Peer) Start() {
+ 	peer.queuedOutboundPackets.Store(0)
+ 
+ 	peer.handshake.mutex.Lock()
+-	peer.handshake.lastSentHandshake = time.Now().Add(-(RekeyTimeout + time.Second))
++	peer.handshake.lastSentHandshake = time.Now().Add(-(peer.device.rekeyMinTimeout() + time.Second))
+ 	peer.handshake.mutex.Unlock()
+ 
+ 	peer.device.queue.encryption.wg.Add(1) // keep encryption queue open for our writes
+@@ -267,7 +270,7 @@ func (peer *Peer) Start() {
+ 	// it's reclaimed after RejectAfterTime*3 of no session and is guaranteed to
+ 	// be torn down by a matching Stop. A completed handshake re-Mods it.
+ 	if peer.deleteOnIdle {
+-		peer.timers.zeroKeyMaterial.Mod(RejectAfterTime * 3)
++		peer.timers.zeroKeyMaterial.Mod(device.keychainExpireTime() * 3)
+ 	}
+ }
+ 
+@@ -310,7 +313,7 @@ func (peer *Peer) ExpireCurrentKeypairs() {
+ 	handshake.mutex.Lock()
+ 	peer.device.indexTable.Delete(handshake.localIndex)
+ 	handshake.Clear()
+-	peer.handshake.lastSentHandshake = time.Now().Add(-(RekeyTimeout + time.Second))
++	peer.handshake.lastSentHandshake = time.Now().Add(-(peer.device.rekeyMinTimeout() + time.Second))
+ 	handshake.mutex.Unlock()
+ 
+ 	keypairs := &peer.keypairs
+@@ -400,6 +403,10 @@ func (peer *Peer) SetEndpointFromPacket(endpoint conn.Endpoint) {
+ 	if peer.endpoint.disableRoaming {
+ 		return
+ 	}
++	if peer.endpoint.val != endpoint && peer.device.awg.Load() != nil {
++		// AmneziaWG 3.1: another path, the UDP window starts over
++		peer.udpWindow.Store(awgUDPWindow)
++	}
+ 	peer.endpoint.clearSrcOnTx = false
+ 	peer.endpoint.val = endpoint
+ }
+diff --git a/device/receive.go b/device/receive.go
+index aa66125..973ecde 100644
+--- a/device/receive.go
++++ b/device/receive.go
+@@ -33,6 +33,7 @@ type QueueInboundElement struct {
+ 	counter  uint64
+ 	keypair  *Keypair
+ 	endpoint conn.Endpoint
++	padding  int // AmneziaWG S4: random bytes before the transport header
+ }
+ 
+ type QueueInboundElementsContainer struct {
+@@ -65,7 +66,7 @@ func (peer *Peer) keepKeyFreshReceiving() {
+ 		return
+ 	}
+ 	keypair := peer.keypairs.Current()
+-	if keypair != nil && keypair.isInitiator && time.Since(keypair.created) > (RejectAfterTime-KeepaliveTimeout-RekeyTimeout) {
++	if keypair != nil && keypair.isInitiator && time.Since(keypair.created) > peer.device.keyRefreshTimeoutReceiving() {
+ 		peer.timers.sentLastMinuteHandshake.Store(true)
+ 		peer.SendHandshakeInitiation(false)
+ 	}
+@@ -136,6 +137,9 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
+ 		}
+ 		deathSpiral = 0
+ 
++		awg := device.awg.Load()
++		expireTime := device.keychainExpireTime()
++
+ 		// handle each packet in the batch
+ 		for i, size := range sizes[:count] {
+ 			if size < MinMessageSize {
+@@ -146,6 +150,12 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
+ 
+ 			packet := bufsArrs[i][:size]
+ 			msgType := binary.LittleEndian.Uint32(packet[:4])
++			padding := 0
++			if awg != nil {
++				var length int
++				msgType, padding, length = awg.classify(packet)
++				packet = packet[padding : padding+length]
++			}
+ 
+ 			switch msgType {
+ 
+@@ -172,7 +182,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
+ 
+ 				// check keypair expiry
+ 
+-				if keypair.created.Add(RejectAfterTime).Before(time.Now()) {
++				if keypair.created.Add(expireTime).Before(time.Now()) {
+ 					continue
+ 				}
+ 
+@@ -184,6 +194,7 @@ func (device *Device) RoutineReceiveIncoming(maxBatchSize int, recv conn.Receive
+ 				elem.keypair = keypair
+ 				elem.endpoint = endpoints[i]
+ 				elem.counter = 0
++				elem.padding = padding
+ 
+ 				elemsForPeer, ok := elemsByPeer[peer]
+ 				if !ok {
+@@ -333,7 +344,7 @@ func (device *Device) RoutineHandshake(id int) {
+ 
+ 			// endpoints destination address is the source of the datagram
+ 
+-			if device.IsUnderLoad() {
++			if !device.cookiesDisabled() && device.IsUnderLoad() {
+ 
+ 				// verify MAC2 field
+ 
+@@ -367,6 +378,7 @@ func (device *Device) RoutineHandshake(id int) {
+ 				device.log.Errorf("Failed to decode initiation message")
+ 				goto skip
+ 			}
++			msg.Type = elem.msgType // AmneziaWG sends H1 instead
+ 
+ 			// consume initiation
+ 
+@@ -399,6 +411,7 @@ func (device *Device) RoutineHandshake(id int) {
+ 				device.log.Errorf("Failed to decode response message")
+ 				goto skip
+ 			}
++			msg.Type = elem.msgType // AmneziaWG sends H2 instead
+ 
+ 			// consume response
+ 
+@@ -484,6 +497,7 @@ func (peer *Peer) processInboundContainer(elemsContainer *QueueInboundElementsCo
+ 	validTailPacket := -1
+ 	dataPacketReceived := false
+ 	rxBytesLen := uint64(0)
++	awg := device.awg.Load()
+ 	for i, elem := range elems {
+ 		if elem.packet == nil {
+ 			// decryption failed
+@@ -505,8 +519,12 @@ func (peer *Peer) processInboundContainer(elemsContainer *QueueInboundElementsCo
+ 			ep.FromPeer(peer.handshake.remoteStatic)
+ 		}
+ 		rxBytesLen += uint64(len(elem.packet) + MinMessageSize)
++		if awg != nil {
++			peer.raiseUDPWindow(uint32(elem.padding + MessageTransportHeaderSize + len(elem.packet)))
++		}
+ 
+-		if len(elem.packet) == 0 {
++		if len(elem.packet) == 0 || awg != nil && elem.packet[0] == 0 {
++			// AmneziaWG pads keepalives too: zero bytes, not an IP packet
+ 			device.log.Verbosef("%v - Receiving keepalive packet", peer)
+ 			continue
+ 		}
+@@ -553,7 +571,7 @@ func (peer *Peer) processInboundContainer(elemsContainer *QueueInboundElementsCo
+ 			continue
+ 		}
+ 
+-		scratch = append(scratch, elem.buffer[:MessageTransportOffsetContent+len(elem.packet)])
++		scratch = append(scratch, elem.buffer[elem.padding:elem.padding+MessageTransportOffsetContent+len(elem.packet)])
+ 	}
+ 
+ 	peer.rxBytes.Add(rxBytesLen)
+diff --git a/device/send.go b/device/send.go
+index e3fbeba..edadf64 100644
+--- a/device/send.go
++++ b/device/send.go
+@@ -50,12 +50,14 @@ type QueueOutboundElement struct {
+ 	buffer []byte // sing-allocated buffer holding the packet data
+ 	// packet is always a slice of "buffer". The starting offset in buffer
+ 	// is either:
+-	//  a) MessageEncapsulatingTransportSize+MessageTransportHeaderSize (plaintext)
++	//  a) MessageEncapsulatingTransportSize+padding+MessageTransportHeaderSize (plaintext)
+ 	//  b) 0 (post-encryption)
+-	packet  []byte
+-	nonce   uint64   // nonce for encryption
+-	keypair *Keypair // keypair for encryption
+-	peer    *Peer    // related peer
++	packet    []byte
++	nonce     uint64   // nonce for encryption
++	keypair   *Keypair // keypair for encryption
++	peer      *Peer    // related peer
++	padding   uint32   // AmneziaWG S4: random bytes before the transport header
++	keepalive bool     // set by encryption: the packet carries no data
+ }
+ 
+ type QueueOutboundElementsContainer struct {
+@@ -72,6 +74,7 @@ func (device *Device) NewOutboundElement() *QueueOutboundElement {
+ 	elem := device.GetOutboundElement()
+ 	elem.buffer = device.GetOutboundBuffer(MaxMessageSize)
+ 	elem.nonce = 0
++	elem.padding = device.transportPadding()
+ 	// keypair and peer were cleared (if necessary) by clearPointers.
+ 	return elem
+ }
+@@ -116,7 +119,7 @@ func (peer *Peer) SendPriorityMessage() {
+ 		return
+ 	}
+ 	keypair := peer.keypairs.Current()
+-	if keypair == nil || keypair.sendNonce.Load() >= RejectAfterMessages || time.Since(keypair.created) >= RejectAfterTime {
++	if keypair == nil || keypair.sendNonce.Load() >= RejectAfterMessages || time.Since(keypair.created) >= peer.device.keychainExpireTime() {
+ 		// SendStagedPackets initializes a handshake when the keypair is invalid,
+ 		// but we explicitly avoid that here. A priority message is only intended
+ 		// to flow around symmetric session establishment, but it should never
+@@ -150,7 +153,7 @@ func (peer *Peer) SendPriorityMessage() {
+ 	}()
+ 
+ 	// initialize outbound element
+-	const offset = MessageEncapsulatingTransportSize + MessageTransportHeaderSize
++	offset := MessageEncapsulatingTransportSize + int(elem.padding) + MessageTransportHeaderSize
+ 	n := copy(elem.buffer[offset:], msg)
+ 	elem.packet = elem.buffer[offset : offset+n]
+ 	elem.peer = peer
+@@ -174,17 +177,20 @@ func (peer *Peer) SendPriorityMessage() {
+ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
+ 	if !isRetry {
+ 		peer.timers.handshakeAttempts.Store(0)
++		peer.timers.maxHandshakeAttempts.Store(peer.device.maxHandshakeAttempts())
+ 	}
+ 
++	timeout := peer.device.rekeyMinTimeout()
++
+ 	peer.handshake.mutex.RLock()
+-	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
++	if time.Since(peer.handshake.lastSentHandshake) < timeout {
+ 		peer.handshake.mutex.RUnlock()
+ 		return nil
+ 	}
+ 	peer.handshake.mutex.RUnlock()
+ 
+ 	peer.handshake.mutex.Lock()
+-	if time.Since(peer.handshake.lastSentHandshake) < RekeyTimeout {
++	if time.Since(peer.handshake.lastSentHandshake) < timeout {
+ 		peer.handshake.mutex.Unlock()
+ 		return nil
+ 	}
+@@ -201,18 +207,32 @@ func (peer *Peer) SendHandshakeInitiation(isRetry bool) error {
+ 		return err
+ 	}
+ 
+-	buf := make([]byte, MessageEncapsulatingTransportSize+MessageInitiationSize)
+-	packet := buf[MessageEncapsulatingTransportSize:]
+-	_ = msg.marshal(packet)
+-	peer.cookieGenerator.AddMacs(packet)
++	var buffers [][]byte
++	if p := peer.device.awg.Load(); p != nil {
++		// signature and junk packets go first
++		buffers = peer.device.prefixPackets(p)
++		msg.Type = p.headers[awgInit].PickOne()
++		trailer := p.randomTrailer(peer.udpWindow.Load(), int(p.paddings[awgInit])+MessageInitiationSize)
++		buf, packet := p.newMessageBuffer(awgInit, trailer)
++		_ = msg.marshal(packet)
++		peer.cookieGenerator.AddMacs(packet)
++		p.protect(buf, packet)
++		buffers = append(buffers, buf)
++	} else {
++		buf := make([]byte, MessageEncapsulatingTransportSize+MessageInitiationSize)
++		packet := buf[MessageEncapsulatingTransportSize:]
++		_ = msg.marshal(packet)
++		peer.cookieGenerator.AddMacs(packet)
++		buffers = [][]byte{buf}
++	}
+ 
+ 	peer.timersAnyAuthenticatedPacketTraversal()
+ 	peer.timersAnyAuthenticatedPacketSent()
+ 
+ 	if len(candidates) > 0 {
+-		err = peer.sendHandshakeBuffers([][]byte{buf}, candidates)
++		err = peer.sendHandshakeBuffers(buffers, candidates)
+ 	} else {
+-		err = peer.SendBuffers([][]byte{buf})
++		err = peer.SendBuffers(buffers)
+ 	}
+ 	if err != nil {
+ 		peer.device.log.Errorf("%v - Failed to send handshake initiation: %v", peer, err)
+@@ -235,10 +255,21 @@ func (peer *Peer) SendHandshakeResponse() error {
+ 		return err
+ 	}
+ 
+-	buf := make([]byte, MessageEncapsulatingTransportSize+MessageResponseSize)
+-	packet := buf[MessageEncapsulatingTransportSize:]
+-	_ = response.marshal(packet)
+-	peer.cookieGenerator.AddMacs(packet)
++	var buf []byte
++	if p := peer.device.awg.Load(); p != nil {
++		response.Type = p.headers[awgResponse].PickOne()
++		trailer := p.randomTrailer(peer.udpWindow.Load(), int(p.paddings[awgResponse])+MessageResponseSize)
++		var packet []byte
++		buf, packet = p.newMessageBuffer(awgResponse, trailer)
++		_ = response.marshal(packet)
++		peer.cookieGenerator.AddMacs(packet)
++		p.protect(buf, packet)
++	} else {
++		buf = make([]byte, MessageEncapsulatingTransportSize+MessageResponseSize)
++		packet := buf[MessageEncapsulatingTransportSize:]
++		_ = response.marshal(packet)
++		peer.cookieGenerator.AddMacs(packet)
++	}
+ 
+ 	err = peer.BeginSymmetricSession()
+ 	if err != nil {
+@@ -268,9 +299,21 @@ func (device *Device) SendHandshakeCookie(initiatingElem *QueueHandshakeElement)
+ 		return err
+ 	}
+ 
+-	buf := make([]byte, MessageEncapsulatingTransportSize+MessageCookieReplySize)
+-	packet := buf[MessageEncapsulatingTransportSize:]
+-	_ = reply.marshal(packet)
++	var buf []byte
++	if p := device.awg.Load(); p != nil {
++		// the type is not authenticated
++		reply.Type = p.headers[awgCookie].PickOne()
++		// no peer: the initial UDP window
++		trailer := p.randomTrailer(awgUDPWindow, int(p.paddings[awgCookie])+MessageCookieReplySize)
++		var packet []byte
++		buf, packet = p.newMessageBuffer(awgCookie, trailer)
++		_ = reply.marshal(packet)
++		p.protect(buf, packet)
++	} else {
++		buf = make([]byte, MessageEncapsulatingTransportSize+MessageCookieReplySize)
++		packet := buf[MessageEncapsulatingTransportSize:]
++		_ = reply.marshal(packet)
++	}
+ 	// TODO: allocation could be avoided
+ 	device.net.bind.Send([][]byte{buf}, initiatingElem.endpoint, MessageEncapsulatingTransportSize)
+ 
+@@ -283,7 +326,7 @@ func (peer *Peer) keepKeyFreshSending() {
+ 		return
+ 	}
+ 	nonce := keypair.sendNonce.Load()
+-	if nonce > RekeyAfterMessages || (keypair.isInitiator && time.Since(keypair.created) > RekeyAfterTime) {
++	if nonce > RekeyAfterMessages || (keypair.isInitiator && time.Since(keypair.created) > peer.device.keyRefreshTimeoutSending()) {
+ 		peer.SendHandshakeInitiation(false)
+ 	}
+ }
+@@ -305,7 +348,6 @@ func (device *Device) RoutineReadFromTUN() {
+ 		elemsByPeer = make(map[*Peer]*QueueOutboundElementsContainer, batchSize)
+ 		count       = 0
+ 		sizes       = make([]int, batchSize)
+-		offset      = MessageEncapsulatingTransportSize + MessageTransportHeaderSize
+ 	)
+ 
+ 	for i := range elems {
+@@ -323,6 +365,9 @@ func (device *Device) RoutineReadFromTUN() {
+ 	}()
+ 
+ 	for {
++		padding := device.transportPadding()
++		offset := MessageEncapsulatingTransportSize + int(padding) + MessageTransportHeaderSize
++
+ 		// read packets
+ 		count, readErr = device.tun.device.Read(bufs, sizes, offset)
+ 		for i := 0; i < count; i++ {
+@@ -332,6 +377,7 @@ func (device *Device) RoutineReadFromTUN() {
+ 
+ 			elem := elems[i]
+ 			elem.packet = bufs[i][offset : offset+sizes[i]]
++			elem.padding = padding
+ 
+ 			// lookup peer
+ 			var peer *Peer
+@@ -464,14 +510,15 @@ func (device *Device) InputPacket(destination []byte, packetSlices [][]byte) {
+ 	for _, packetSlice := range packetSlices {
+ 		totalLength += len(packetSlice)
+ 	}
+-	allocLength := MessageEncapsulatingTransportSize + MessageTransportHeaderSize + totalLength + PaddingMultiple + chacha20poly1305.Overhead
++	padding, allocLength := device.inputPacketLength(totalLength)
+ 	if allocLength > MaxMessageSize {
+ 		return
+ 	}
+ 	elem := device.GetOutboundElement()
+ 	elem.buffer = device.GetOutboundBuffer(allocLength)
+ 	elem.nonce = 0
+-	packet := elem.buffer[MessageEncapsulatingTransportSize+MessageTransportHeaderSize:]
++	elem.padding = padding
++	packet := elem.buffer[MessageEncapsulatingTransportSize+int(padding)+MessageTransportHeaderSize:]
+ 	var n int
+ 	for _, packetSlice := range packetSlices {
+ 		n += copy(packet[n:], packetSlice)
+@@ -510,14 +557,15 @@ func (device *Device) InputPackets(packets []*InputPacketRef) []*InputPacketRef
+ 		for _, packetSlice := range packetRef.PacketSlices {
+ 			totalLength += len(packetSlice)
+ 		}
+-		allocLength := MessageEncapsulatingTransportSize + MessageTransportHeaderSize + totalLength + PaddingMultiple + chacha20poly1305.Overhead
++		padding, allocLength := device.inputPacketLength(totalLength)
+ 		if allocLength > MaxMessageSize {
+ 			continue
+ 		}
+ 		elem := device.GetOutboundElement()
+ 		elem.buffer = device.GetOutboundBuffer(allocLength)
+ 		elem.nonce = 0
+-		packet := elem.buffer[MessageEncapsulatingTransportSize+MessageTransportHeaderSize:]
++		elem.padding = padding
++		packet := elem.buffer[MessageEncapsulatingTransportSize+int(padding)+MessageTransportHeaderSize:]
+ 		var n int
+ 		for _, packetSlice := range packetRef.PacketSlices {
+ 			n += copy(packet[n:], packetSlice)
+@@ -578,7 +626,7 @@ top:
+ 	}
+ 
+ 	keypair := peer.keypairs.Current()
+-	if keypair == nil || keypair.sendNonce.Load() >= RejectAfterMessages || time.Since(keypair.created) >= RejectAfterTime {
++	if keypair == nil || keypair.sendNonce.Load() >= RejectAfterMessages || time.Since(keypair.created) >= peer.device.keychainExpireTime() {
+ 		peer.SendHandshakeInitiation(false)
+ 		return
+ 	}
+@@ -686,6 +734,12 @@ func (device *Device) RoutineEncryption(id int) {
+ 
+ 	for elemsContainer := range device.queue.encryption.c {
+ 		for _, elem := range elemsContainer.elems {
++			elem.keepalive = len(elem.packet) == 0
++			if p := device.awg.Load(); p != nil {
++				device.sealAWG(p, elem, &nonce)
++				continue
++			}
++
+ 			// populate header fields
+ 			header := elem.buffer[MessageEncapsulatingTransportSize : MessageEncapsulatingTransportSize+MessageTransportHeaderSize]
+ 
+@@ -778,7 +832,7 @@ func (peer *Peer) processOutboundContainer(elemsContainer *QueueOutboundElements
+ 
+ 	dataSent := false
+ 	for _, elem := range elemsContainer.elems {
+-		if len(elem.packet[MessageEncapsulatingTransportSize:]) != MessageKeepaliveSize {
++		if !elem.keepalive {
+ 			dataSent = true
+ 		}
+ 		scratch = append(scratch, elem.packet)
+diff --git a/device/timers.go b/device/timers.go
+index d30f26b..22c4fbe 100644
+--- a/device/timers.go
++++ b/device/timers.go
+@@ -80,8 +80,12 @@ func (peer *Peer) timersActive() bool {
+ }
+ 
+ func expiredRetransmitHandshake(peer *Peer) {
+-	if peer.timers.handshakeAttempts.Load() > MaxTimerHandshakes {
+-		peer.device.log.Verbosef("%s - Handshake did not complete after %d attempts, giving up", peer, MaxTimerHandshakes+2)
++	maxAttempts := peer.timers.maxHandshakeAttempts.Load()
++	if maxAttempts == 0 {
++		maxAttempts = MaxTimerHandshakes
++	}
++	if peer.timers.handshakeAttempts.Load() > maxAttempts {
++		peer.device.log.Verbosef("%s - Handshake did not complete after %d attempts, giving up", peer, maxAttempts+2)
+ 
+ 		if peer.timersActive() {
+ 			peer.timers.sendKeepalive.Del()
+@@ -96,7 +100,7 @@ func expiredRetransmitHandshake(peer *Peer) {
+ 		 * of a partial exchange.
+ 		 */
+ 		if peer.timersActive() && !peer.timers.zeroKeyMaterial.IsPending() {
+-			peer.timers.zeroKeyMaterial.Mod(RejectAfterTime * 3)
++			peer.timers.zeroKeyMaterial.Mod(peer.device.keychainExpireTime() * 3)
+ 		}
+ 		peer.noteSessionHandshakeStopped()
+ 	} else {
+@@ -115,7 +119,7 @@ func expiredSendKeepalive(peer *Peer) {
+ 	if peer.timers.needAnotherKeepalive.Load() {
+ 		peer.timers.needAnotherKeepalive.Store(false)
+ 		if peer.timersActive() {
+-			peer.timers.sendKeepalive.Mod(KeepaliveTimeout)
++			peer.timers.sendKeepalive.Mod(peer.device.sendKeepaliveTimeout())
+ 		}
+ 	}
+ }
+@@ -151,7 +155,7 @@ func expiredSession(peer *Peer) {
+ }
+ 
+ func expiredPersistentKeepalive(peer *Peer) {
+-	if peer.persistentKeepaliveInterval.Load() > 0 {
++	if !peer.persistentKeepaliveInterval.Load().IsZero() {
+ 		peer.SendKeepalive()
+ 	}
+ }
+@@ -159,7 +163,7 @@ func expiredPersistentKeepalive(peer *Peer) {
+ /* Should be called after an authenticated data packet is sent. */
+ func (peer *Peer) timersDataSent() {
+ 	if peer.timersActive() && !peer.timers.newHandshake.IsPending() {
+-		peer.timers.newHandshake.Mod(KeepaliveTimeout + RekeyTimeout + time.Millisecond*time.Duration(fastrandn(RekeyTimeoutJitterMaxMs)))
++		peer.timers.newHandshake.Mod(peer.device.newHandshakeTimeout() + time.Millisecond*time.Duration(fastrandn(RekeyTimeoutJitterMaxMs)))
+ 	}
+ }
+ 
+@@ -167,7 +171,7 @@ func (peer *Peer) timersDataSent() {
+ func (peer *Peer) timersDataReceived() {
+ 	if peer.timersActive() {
+ 		if !peer.timers.sendKeepalive.IsPending() {
+-			peer.timers.sendKeepalive.Mod(KeepaliveTimeout)
++			peer.timers.sendKeepalive.Mod(peer.device.sendKeepaliveTimeout())
+ 		} else {
+ 			peer.timers.needAnotherKeepalive.Store(true)
+ 		}
+@@ -191,7 +195,7 @@ func (peer *Peer) timersAnyAuthenticatedPacketReceived() {
+ /* Should be called after a handshake initiation message is sent. */
+ func (peer *Peer) timersHandshakeInitiated() {
+ 	if peer.timersActive() {
+-		peer.timers.retransmitHandshake.Mod(RekeyTimeout + time.Millisecond*time.Duration(fastrandn(RekeyTimeoutJitterMaxMs)))
++		peer.timers.retransmitHandshake.Mod(peer.device.retransmitHandshakeTimeout() + time.Millisecond*time.Duration(fastrandn(RekeyTimeoutJitterMaxMs)))
+ 	}
+ 	peer.noteSessionHandshakeStarted()
+ }
+@@ -202,6 +206,7 @@ func (peer *Peer) timersHandshakeComplete() {
+ 		peer.timers.retransmitHandshake.Del()
+ 	}
+ 	peer.timers.handshakeAttempts.Store(0)
++	peer.timers.maxHandshakeAttempts.Store(peer.device.maxHandshakeAttempts())
+ 	peer.timers.sentLastMinuteHandshake.Store(false)
+ 	peer.lastHandshakeNano.Store(time.Now().UnixNano())
+ }
+@@ -209,12 +214,13 @@ func (peer *Peer) timersHandshakeComplete() {
+ /* Should be called after an ephemeral key is created, which is before sending a handshake response or after receiving a handshake response. */
+ func (peer *Peer) timersSessionDerived() {
+ 	if peer.timersActive() {
++		expireTime := peer.device.keychainExpireTime()
+ 		peer.sessionState.Lock()
+-		peer.sessionState.sessionExpires = time.Now().Add(RejectAfterTime)
++		peer.sessionState.sessionExpires = time.Now().Add(expireTime)
+ 		peer.noteSessionStateLocked(PeerSessionEstablished)
+ 		peer.sessionState.Unlock()
+-		peer.timers.sessionExpired.Mod(RejectAfterTime)
+-		peer.timers.zeroKeyMaterial.Mod(RejectAfterTime * 3)
++		peer.timers.sessionExpired.Mod(expireTime)
++		peer.timers.zeroKeyMaterial.Mod(expireTime * 3)
+ 	} else {
+ 		peer.noteSessionState(PeerSessionEstablished)
+ 	}
+@@ -223,8 +229,8 @@ func (peer *Peer) timersSessionDerived() {
+ /* Should be called before a packet with authentication -- keepalive, data, or handshake -- is sent, or after one is received. */
+ func (peer *Peer) timersAnyAuthenticatedPacketTraversal() {
+ 	keepalive := peer.persistentKeepaliveInterval.Load()
+-	if keepalive > 0 && peer.timersActive() {
+-		peer.timers.persistentKeepalive.Mod(time.Duration(keepalive) * time.Second)
++	if !keepalive.IsZero() && peer.timersActive() {
++		peer.timers.persistentKeepalive.Mod(time.Duration(keepalive.PickOne()) * time.Second)
+ 	}
+ }
+ 
+@@ -239,6 +245,7 @@ func (peer *Peer) timersInit() {
+ 
+ func (peer *Peer) timersStart() {
+ 	peer.timers.handshakeAttempts.Store(0)
++	peer.timers.maxHandshakeAttempts.Store(peer.device.maxHandshakeAttempts())
+ 	peer.timers.sentLastMinuteHandshake.Store(false)
+ 	peer.timers.needAnotherKeepalive.Store(false)
+ }
+diff --git a/device/uapi.go b/device/uapi.go
+index cba371d..f041745 100644
+--- a/device/uapi.go
++++ b/device/uapi.go
+@@ -97,6 +97,8 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
+ 			sendf("fwmark=%d", device.net.fwmark)
+ 		}
+ 
++		device.awg.Load().ipcGet(sendf, keyf)
++
+ 		for _, peer := range device.peers.keyMap {
+ 			// Serialize peer state.
+ 			peer.handshake.mutex.RLock()
+@@ -118,7 +120,7 @@ func (device *Device) IpcGetOperation(w io.Writer) error {
+ 			sendf("last_handshake_time_nsec=%d", nano)
+ 			sendf("tx_bytes=%d", peer.txBytes.Load())
+ 			sendf("rx_bytes=%d", peer.rxBytes.Load())
+-			sendf("persistent_keepalive_interval=%d", peer.persistentKeepaliveInterval.Load())
++			sendf("persistent_keepalive_interval=%s", peer.persistentKeepaliveInterval.Load().String())
+ 
+ 			device.allowedips.EntriesForPeer(peer, func(prefix netip.Prefix) bool {
+ 				sendf("allowed_ip=%s", prefix.String())
+@@ -149,12 +151,16 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
+ 
+ 	peer := new(ipcSetPeer)
+ 	deviceConfig := true
++	var awgNext *awgParams // AmneziaWG settings, applied when the device section ends
+ 
+ 	scanner := bufio.NewScanner(r)
+ 	for scanner.Scan() {
+ 		line := scanner.Text()
+ 		if line == "" {
+ 			// Blank line means terminate operation.
++			if err := device.commitAWG(awgNext); err != nil {
++				return err
++			}
+ 			peer.handlePostConfig()
+ 			return nil
+ 		}
+@@ -166,6 +172,10 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
+ 		if key == "public_key" {
+ 			if deviceConfig {
+ 				deviceConfig = false
++				if err := device.commitAWG(awgNext); err != nil {
++					return err
++				}
++				awgNext = nil
+ 			}
+ 			peer.handlePostConfig()
+ 			// Load/create the peer we are now configuring.
+@@ -178,7 +188,11 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
+ 
+ 		var err error
+ 		if deviceConfig {
+-			err = device.handleDeviceLine(key, value)
++			if isAWG, awgErr := device.handleAWGLine(&awgNext, key, value); isAWG {
++				err = awgErr
++			} else {
++				err = device.handleDeviceLine(key, value)
++			}
+ 		} else {
+ 			err = device.handlePeerLine(peer, key, value)
+ 		}
+@@ -186,6 +200,9 @@ func (device *Device) IpcSetOperation(r io.Reader) (err error) {
+ 			return err
+ 		}
+ 	}
++	if err := device.commitAWG(awgNext); err != nil {
++		return err
++	}
+ 	peer.handlePostConfig()
+ 
+ 	if err := scanner.Err(); err != nil {
+@@ -350,15 +367,24 @@ func (device *Device) handlePeerLine(peer *ipcSetPeer, key, value string) error
+ 	case "persistent_keepalive_interval":
+ 		device.log.Verbosef("%v - UAPI: Updating persistent keepalive interval", peer.Peer)
+ 
+-		secs, err := strconv.ParseUint(value, 10, 16)
++		// AmneziaWG: a range "a-b" picks a random interval each time.
++		var secs UintRange
++		err := secs.FromString(value)
++		if err == nil && secs.Hi() > 65535 {
++			err = errors.New("value out of range")
++		}
+ 		if err != nil {
+ 			return ipcErrorf(ipc.IpcErrorInvalid, "failed to set persistent keepalive interval: %w", err)
+ 		}
++		if secs.Lo() == 0 && secs.Hi() != 0 {
++			// a zero interval would send keepalives back to back
++			secs.FromUint32(1, secs.Hi())
++		}
+ 
+-		old := peer.persistentKeepaliveInterval.Swap(uint32(secs))
++		old := peer.persistentKeepaliveInterval.Swap(secs)
+ 
+ 		// Send immediate keepalive if we're turning it on and before it wasn't on.
+-		peer.pkaOn = old == 0 && secs != 0
++		peer.pkaOn = old.IsZero() && !secs.IsZero()
+ 
+ 	case "replace_allowed_ips":
+ 		device.log.Verbosef("%v - UAPI: Removing all allowedips", peer.Peer)

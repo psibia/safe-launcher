@@ -1,5 +1,7 @@
 using System;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Threading;
 using KillSwitchLauncher.Models;
 using KillSwitchLauncher.Services;
@@ -182,6 +184,43 @@ public class MainViewModelTests : IDisposable
     }
 
     [Fact]
+    public void UpdateSettings_AreADraft_UntilApplied()
+    {
+        WithViewModel((vm, _) =>
+        {
+            vm.AutoUpdate = false;
+            vm.UpdateViaConnection = true;
+            Assert.True(vm.HasPendingChanges);
+            Assert.True(Storage.Load().Updates.Auto);
+            Assert.Equal(UpdateRoute.Direct, Storage.Load().Updates.Route);
+
+            vm.CancelSettingsCommand.Execute(null);
+            Assert.True(vm.AutoUpdate);
+            Assert.True(vm.UpdateDirect);
+            Assert.False(vm.HasPendingChanges);
+
+            vm.AutoUpdate = false;
+            vm.ApplySettingsCommand.Execute(null);
+            Assert.False(vm.HasPendingChanges);
+            Assert.False(Storage.Load().Updates.Auto);
+        });
+    }
+
+    [Fact]
+    public void UpdateViaConnection_WithoutConnections_IsNotApplied()
+    {
+        WithViewModel((vm, _) =>
+        {
+            vm.UpdateViaConnection = true;
+            vm.ApplySettingsCommand.Execute(null);
+
+            Assert.True(vm.HasPendingChanges);
+            Assert.Contains("сначала добавьте подключение", Assert.Single(_dialogs.Warnings));
+            Assert.Equal(UpdateRoute.Direct, Storage.Load().Updates.Route);
+        });
+    }
+
+    [Fact]
     public void SettingsClosedWithoutApply_DiscardsDraft()
     {
         WithViewModel((vm, _) =>
@@ -281,6 +320,74 @@ public class MainViewModelTests : IDisposable
             Assert.Equal(VpnRuleMode.AllOfSelected, Storage.Load().RuleMode);
             Assert.StartsWith("Новое правило: VPN: все выбранные", log.Snapshot()[^1].Text);
         });
+    }
+
+    [Fact]
+    public void OutsideCopies_ViaLauncher_IsSavedAndLogged()
+    {
+        WithViewModel((vm, log) =>
+        {
+            vm.OutsideCopies = OutsideCopies.Launcher;
+            Assert.True(vm.HasPendingChanges);
+
+            vm.ApplySettingsCommand.Execute(null);
+
+            Assert.Equal(OutsideCopies.Launcher, Storage.Load().OutsideCopies);
+            Assert.Contains(log.Snapshot(), e => e.Text == "Приложения, открытые не из лаунчера: через лаунчер");
+        });
+    }
+
+    [Fact]
+    public void ViaLauncher_FiltersActBeforeTheAppIsLaunched()
+    {
+        // Копия, открытая не из лаунчера, ещё до того, как он возьмёт её под контроль, выходит в сеть только через VPN приложения.
+        Preset(s =>
+        {
+            s.Apps.Add(new AppEntry { Name = "Тестовое приложение", ExePath = TestAppProcess.ExePath });
+            s.OutsideCopies = OutsideCopies.Launcher;
+        });
+        var guard = new RecordingGuard();
+        Sta.Run(() =>
+        {
+            var vm = new MainViewModel(Storage, _dialogs, Dispatcher.CurrentDispatcher, Log,
+                new UpdateService(_dir.File("update-pending.json"), _dir.File("download")), guardBackend: () => guard, systemProxy: () => null);
+            try
+            {
+                Assert.True(Wait.Until(() => guard.Last?.Apps.Any(r => r.Paths.Any(p =>
+                    p.EndsWith(TestAppProcess.ProcessName + ".exe", StringComparison.OrdinalIgnoreCase))) == true, TimeSpan.FromSeconds(5)),
+                    "Фильтр для программы приложения должен действовать, хотя из лаунчера ничего не запущено");
+            }
+            finally
+            {
+                vm.Dispose();
+            }
+        });
+    }
+
+    /// <summary>Фильтры без службы: запоминает последний отправленный набор.</summary>
+    private sealed class RecordingGuard : IGuardBackend
+    {
+        private GuardRequest? _last;
+
+        public GuardRequest? Last => Volatile.Read(ref _last);
+
+        public bool IsConnected => true;
+
+        public event Action? Lost
+        {
+            add { }
+            remove { }
+        }
+
+        public Task<GuardReply> ApplyAsync(GuardRequest request, CancellationToken cancellation)
+        {
+            Volatile.Write(ref _last, request);
+            return Task.FromResult(GuardReply.Empty);
+        }
+
+        public void Dispose()
+        {
+        }
     }
 
     // ---------------------------------------------------------------- журнал

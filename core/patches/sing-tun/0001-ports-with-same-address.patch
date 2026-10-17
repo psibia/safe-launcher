@@ -1,0 +1,285 @@
+diff --git a/flow_dispatch.go b/flow_dispatch.go
+index c8562a6..b83ec86 100644
+--- a/flow_dispatch.go
++++ b/flow_dispatch.go
+@@ -177,18 +177,18 @@ func (d *ForwardDispatcher) Close() {
+ 			flows = append(flows, entry.flow)
+ 		}
+ 	}
+-	ports := make([]Port, 0, len(d.ports))
+-	for port, nat := range d.ports {
++	nats := make([]*portNAT, 0, len(d.ports))
++	for _, nat := range d.ports {
+ 		if nat != nil {
+-			ports = append(ports, port)
++			nats = append(nats, nat)
+ 		}
+ 	}
+ 	d.access.Unlock()
+ 	for _, flow := range flows {
+ 		flow.close(FlowCloseReset)
+ 	}
+-	for _, port := range ports {
+-		port.DetachReturn(&d.returnPath)
++	for _, nat := range nats {
++		nat.port.DetachReturn(nat.returnPath)
+ 	}
+ }
+ 
+@@ -469,12 +469,17 @@ func (d *ForwardDispatcher) natFor(port Port) *portNAT {
+ 	if loaded {
+ 		return nat
+ 	}
+-	err := port.AttachReturn(&d.returnPath)
++	nat = newPortNAT(port)
++	// Safe Launcher: the port's own return path, so that replies coming back through a port are matched only
++	// against its flows. Ports may share an address (WireGuard servers that all give 10.0.0.2), and so may
++	// the reverse keys of their flows: with one return path for all ports, replies of one port went to the
++	// clients of another.
++	nat.returnPath = &portReturn{dispatcher: d, nats: []*portNAT{nat}}
++	err := port.AttachReturn(nat.returnPath)
+ 	if err != nil {
+ 		d.logger.Trace(E.Cause(err, "attach return path"))
+ 		return nil
+ 	}
+-	nat = newPortNAT(port)
+ 	d.ports[port] = nat
+ 	var natList []*portNAT
+ 	current := d.natList.Load()
+@@ -732,11 +737,33 @@ func (r *forwardReturn) ReturnPackets(packets [][]byte) [][]byte {
+ 	if natListPtr == nil {
+ 		return packets
+ 	}
+-	natList := *natListPtr
+ 	var revMap map[netip.Addr]*portNAT
+ 	if revPtr := r.dispatcher.revNAT.Load(); revPtr != nil {
+ 		revMap = *revPtr
+ 	}
++	return r.returnPackets(packets, *natListPtr, revMap)
++}
++
++var _ Return = (*portReturn)(nil)
++
++// portReturn is the return path of one port (Safe Launcher): it looks up only the flows of that port.
++type portReturn struct {
++	dispatcher *ForwardDispatcher
++	nats       []*portNAT
++}
++
++func (r *portReturn) ReturnHeadroom() int {
++	return r.dispatcher.returnPath.ReturnHeadroom()
++}
++
++func (r *portReturn) ReturnPackets(packets [][]byte) [][]byte {
++	if r.dispatcher.returnPath.closed.Load() {
++		return packets
++	}
++	return r.dispatcher.returnPath.returnPackets(packets, r.nats, nil)
++}
++
++func (r *forwardReturn) returnPackets(packets [][]byte, natList []*portNAT, revMap map[netip.Addr]*portNAT) [][]byte {
+ 	headroom := r.dispatcher.writeback.ReturnHeadroom()
+ 	now := r.dispatcher.now()
+ 
+diff --git a/flow_dispatch_ports_test.go b/flow_dispatch_ports_test.go
+new file mode 100644
+index 0000000..916c785
+--- /dev/null
++++ b/flow_dispatch_ports_test.go
+@@ -0,0 +1,184 @@
++package tun
++
++import (
++	"context"
++	"net"
++	"net/netip"
++	"testing"
++
++	"github.com/sagernet/sing-tun/gtcpip"
++	"github.com/sagernet/sing-tun/gtcpip/checksum"
++	"github.com/sagernet/sing-tun/gtcpip/header"
++	E "github.com/sagernet/sing/common/exceptions"
++	"github.com/sagernet/sing/common/logger"
++	M "github.com/sagernet/sing/common/metadata"
++	N "github.com/sagernet/sing/common/network"
++
++	"github.com/stretchr/testify/require"
++)
++
++// Safe Launcher: WireGuard servers commonly give all their clients the same tunnel address, so the endpoints of one
++// core are ports with equal addresses, and their flows get equal reverse keys. Replies coming back through a port
++// must reach the clients of that port.
++func TestForwardDispatcherPortsWithSameAddress(t *testing.T) {
++	portAddress := netip.MustParseAddr("10.66.0.2")
++	server := netip.MustParseAddrPort("10.66.0.1:7")
++	client := netip.MustParseAddr("172.31.250.1")
++	ports := []*testFlowPort{{address: portAddress}, {address: portAddress}}
++	// flows are judged by the client port (UDP) or the echo identifier (ICMP)
++	handler := &testFlowHandler{ports: map[uint16]Port{40000: ports[0], 40001: ports[1], 1: ports[0], 2: ports[1]}}
++	writeback := &testFlowWriteback{}
++	dispatcher := NewForwardDispatcher(handler, writeback, logger.NOP(), 0, 0)
++
++	// UDP: the client ports are outside the selector range, so both flows get the first selector of their port
++	for i := range ports {
++		source := netip.AddrPortFrom(client, uint16(40000+i))
++		require.True(t, dispatcher.Dispatch(testUDPPacket(source, server, "request")))
++	}
++	dispatcher.Flush()
++	for i, port := range ports {
++		require.Len(t, port.written, 1)
++		require.NotNil(t, port.returnPath)
++		forwarded := header.IPv4(port.written[0])
++		selector := header.UDP(forwarded.Payload()).SourcePort()
++		reply := testUDPPacket(server, netip.AddrPortFrom(portAddress, selector), "reply")
++		require.Empty(t, port.returnPath.ReturnPackets([][]byte{reply}))
++		require.Len(t, writeback.packets, i+1)
++		returned := header.IPv4(writeback.packets[i])
++		require.True(t, returned.IsChecksumValid())
++		udpHdr := header.UDP(returned.Payload())
++		require.Equal(t, netip.AddrPortFrom(client, uint16(40000+i)), netip.AddrPortFrom(returned.DestinationAddr(), udpHdr.DestinationPort()))
++		require.Equal(t, server, netip.AddrPortFrom(returned.SourceAddr(), udpHdr.SourcePort()))
++		require.True(t, udpHdr.IsChecksumValid(returned.SourceAddress(), returned.DestinationAddress(), checksum.Checksum(udpHdr.Payload(), 0)))
++	}
++	require.Equal(t, header.UDP(header.IPv4(ports[0].written[0]).Payload()).SourcePort(), header.UDP(header.IPv4(ports[1].written[0]).Payload()).SourcePort())
++
++	// ICMP echo: the identifiers are outside the selector range too
++	writeback.packets = nil
++	for i := range ports {
++		require.True(t, dispatcher.Dispatch(testEchoPacket(client, server.Addr(), header.ICMPv4Echo, uint16(1+i))))
++	}
++	dispatcher.Flush()
++	for i, port := range ports {
++		require.Len(t, port.written, 2)
++		selector := header.ICMPv4(header.IPv4(port.written[1]).Payload()).Ident()
++		reply := testEchoPacket(server.Addr(), portAddress, header.ICMPv4EchoReply, selector)
++		require.Empty(t, port.returnPath.ReturnPackets([][]byte{reply}))
++		require.Len(t, writeback.packets, i+1)
++		returned := header.IPv4(writeback.packets[i])
++		require.Equal(t, client, returned.DestinationAddr())
++		require.Equal(t, uint16(1+i), header.ICMPv4(returned.Payload()).Ident())
++	}
++
++	dispatcher.Close()
++	for _, port := range ports {
++		require.Nil(t, port.returnPath)
++	}
++}
++
++type testFlowPort struct {
++	address    netip.Addr
++	returnPath Return
++	written    [][]byte
++}
++
++func (p *testFlowPort) PortAddresses() (netip.Addr, netip.Addr) {
++	return p.address, netip.Addr{}
++}
++
++func (p *testFlowPort) PortMTU() uint32 {
++	return 0
++}
++
++// AttachReturn accepts one return path, as WireGuard endpoints do.
++func (p *testFlowPort) AttachReturn(returnPath Return) error {
++	if p.returnPath != nil && p.returnPath != returnPath {
++		return E.New("return path already attached")
++	}
++	p.returnPath = returnPath
++	return nil
++}
++
++func (p *testFlowPort) DetachReturn(returnPath Return) error {
++	if p.returnPath == returnPath {
++		p.returnPath = nil
++	}
++	return nil
++}
++
++func (p *testFlowPort) WritePackets(packets [][]byte) error {
++	for _, packet := range packets {
++		p.written = append(p.written, append([]byte(nil), packet...))
++	}
++	return nil
++}
++
++type testFlowHandler struct {
++	ports map[uint16]Port
++}
++
++func (h *testFlowHandler) JudgeFlow(network uint8, source netip.AddrPort, destination netip.AddrPort, firstPacket []byte) FlowVerdict {
++	return FlowVerdict{Action: ActionFlow, Port: h.ports[source.Port()]}
++}
++
++func (h *testFlowHandler) NewDNSPacket(payload []byte, source M.Socksaddr, destination M.Socksaddr, writer N.PacketWriter) {
++}
++
++func (h *testFlowHandler) NewConnectionEx(ctx context.Context, conn net.Conn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
++}
++
++func (h *testFlowHandler) NewPacketConnectionEx(ctx context.Context, conn N.PacketConn, source M.Socksaddr, destination M.Socksaddr, onClose N.CloseHandlerFunc) {
++}
++
++type testFlowWriteback struct {
++	packets [][]byte
++}
++
++func (w *testFlowWriteback) ReturnHeadroom() int {
++	return 0
++}
++
++func (w *testFlowWriteback) WriteReturnPackets(packets [][]byte) error {
++	for _, packet := range packets {
++		w.packets = append(w.packets, append([]byte(nil), packet...))
++	}
++	return nil
++}
++
++func testIPv4Packet(source, destination netip.Addr, protocol tcpip.TransportProtocolNumber, payloadLength int) header.IPv4 {
++	packet := header.IPv4(make([]byte, header.IPv4MinimumSize+payloadLength))
++	packet.Encode(&header.IPv4Fields{
++		TotalLength: uint16(len(packet)),
++		TTL:         64,
++		Protocol:    uint8(protocol),
++		SrcAddr:     source,
++		DstAddr:     destination,
++	})
++	packet.SetChecksum(^packet.CalculateChecksum())
++	return packet
++}
++
++func testUDPPacket(source, destination netip.AddrPort, payload string) []byte {
++	packet := testIPv4Packet(source.Addr(), destination.Addr(), header.UDPProtocolNumber, header.UDPMinimumSize+len(payload))
++	udpHdr := header.UDP(packet.Payload())
++	udpHdr.Encode(&header.UDPFields{
++		SrcPort: source.Port(),
++		DstPort: destination.Port(),
++		Length:  uint16(len(udpHdr)),
++	})
++	copy(udpHdr.Payload(), payload)
++	xsum := header.PseudoHeaderChecksum(header.UDPProtocolNumber, source.Addr().AsSlice(), destination.Addr().AsSlice(), uint16(len(udpHdr)))
++	xsum = checksum.Checksum(udpHdr.Payload(), xsum)
++	udpHdr.SetChecksum(^udpHdr.CalculateChecksum(xsum))
++	return packet
++}
++
++func testEchoPacket(source, destination netip.Addr, echoType header.ICMPv4Type, identifier uint16) []byte {
++	packet := testIPv4Packet(source, destination, header.ICMPv4ProtocolNumber, header.ICMPv4MinimumSize)
++	icmpHdr := header.ICMPv4(packet.Payload())
++	icmpHdr.SetType(echoType)
++	icmpHdr.SetIdent(identifier)
++	icmpHdr.SetSequence(1)
++	icmpHdr.SetChecksum(header.ICMPv4Checksum(icmpHdr, 0))
++	return packet
++}
+diff --git a/flow_nat.go b/flow_nat.go
+index 4d2bca3..b358575 100644
+--- a/flow_nat.go
++++ b/flow_nat.go
+@@ -16,6 +16,7 @@ const (
+ 
+ type portNAT struct {
+ 	port          Port
++	returnPath    *portReturn
+ 	hasher        maphash.Hasher[flowKey]
+ 	shardMask     uint32
+ 	shards        []natShard

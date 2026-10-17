@@ -1,6 +1,8 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using System.Windows.Threading;
 using KillSwitchLauncher.Models;
 using KillSwitchLauncher.Services;
@@ -17,6 +19,7 @@ public class PagesTests : IDisposable
 {
     private readonly TempDir _dir = new();
     private readonly FakeDialogs _dialogs = new();
+    private IReadOnlyList<StartMenuApp> _startMenu = Array.Empty<StartMenuApp>();
 
     public void Dispose() => _dir.Dispose();
 
@@ -34,7 +37,8 @@ public class PagesTests : IDisposable
         Sta.Run(() =>
         {
             var vm = new MainViewModel(Storage, _dialogs, Dispatcher.CurrentDispatcher, new ActivityLog(_dir.File("events.log")),
-                new UpdateService(_dir.File("update-pending.json"), _dir.File("download")), guardBackend: QuietGuard.Create, systemProxy: () => null);
+                new UpdateService(_dir.File("update-pending.json"), _dir.File("download")), guardBackend: QuietGuard.Create, systemProxy: () => null,
+                startMenuApps: () => Task.FromResult(_startMenu));
             try
             {
                 test(vm);
@@ -232,6 +236,109 @@ public class PagesTests : IDisposable
         Assert.Empty(Storage.Load().Apps);
     }
 
+    // ---------------------------------------------------------------- «Добавить приложение»
+
+    [Fact]
+    public void AddApp_ShowsStartMenu_AddedOnesCheckedAndLocked()
+    {
+        var telegram = FakeExe("Telegram");
+        var discord = FakeExe("Discord");
+        Preset(s =>
+        {
+            s.WelcomeDone = true;
+            s.Apps.Add(new AppEntry { Name = "Мой Telegram", ExePath = telegram });
+        });
+        _startMenu = new[] { new StartMenuApp("Discord", discord, discord), new StartMenuApp("Telegram", telegram, telegram.ToUpperInvariant()) };
+
+        WithViewModel(vm =>
+        {
+            vm.AddAppCommand.Execute(null);
+
+            Assert.True(vm.IsAddAppsPage);
+            var list = vm.AddApps!.List;
+            var added = list.Apps.Single(a => a.Name == "Telegram");
+            Assert.True(added.IsAdded);
+            Assert.True(added.IsSelected);
+            Assert.False(added.CanSelect);
+            added.IsSelected = false;
+            Assert.True(added.IsSelected); // убрать можно только в меню плитки
+
+            Assert.False(list.Apps.Single(a => a.Name == "Discord").IsSelected);
+            Assert.Equal(0, list.SelectedCount);
+            Assert.False(vm.AddApps.AddCommand.CanExecute(null));
+        });
+    }
+
+    [Fact]
+    public void AddApp_CheckedPrograms_AddedAtOnce()
+    {
+        var discord = FakeExe("Discord");
+        var slack = FakeExe("Slack");
+        Preset(s => s.WelcomeDone = true);
+        _startMenu = new[] { new StartMenuApp("Discord", discord, discord), new StartMenuApp("Slack", slack, slack) };
+
+        WithViewModel(vm =>
+        {
+            vm.AddAppCommand.Execute(null);
+            vm.AddApps!.List.Apps[0].IsSelected = true;
+            Assert.Equal("Добавить (1)", vm.AddApps.AddText);
+
+            vm.AddApps.AddCommand.Execute(null);
+
+            Assert.True(vm.IsAppsPage);
+            Assert.Null(vm.AddApps);
+            Assert.Equal("Discord", Assert.Single(vm.Apps).Name);
+            Assert.Equal(0, _dialogs.AskSaveCalls);
+        });
+
+        Assert.Single(Storage.Load().Apps);
+    }
+
+    [Fact]
+    public void AddApp_LeavingWithCheckedPrograms_AsksFirst()
+    {
+        var discord = FakeExe("Discord");
+        Preset(s => s.WelcomeDone = true);
+        _startMenu = new[] { new StartMenuApp("Discord", discord, discord) };
+        _dialogs.SaveAnswer = null;
+
+        WithViewModel(vm =>
+        {
+            vm.AddAppCommand.Execute(null);
+            Assert.True(vm.GoBack()); // ничего не отмечено: без вопроса
+            Assert.Equal(0, _dialogs.AskSaveCalls);
+
+            vm.AddAppCommand.Execute(null);
+            vm.AddApps!.List.Apps[0].IsSelected = true;
+
+            Assert.False(vm.GoBack()); // «остаться»
+            Assert.True(vm.IsAddAppsPage);
+
+            _dialogs.SaveAnswer = false;
+            Assert.True(vm.GoBack());
+            Assert.Empty(vm.Apps);
+            Assert.Null(vm.AddApps);
+        });
+    }
+
+    [Fact]
+    public void AddApp_ChooseInExplorer_OneProgram_OpensItsPage()
+    {
+        Preset(s => s.WelcomeDone = true);
+        _dialogs.PickedProgram = FakeExe("Tool");
+
+        WithViewModel(vm =>
+        {
+            vm.AddAppCommand.Execute(null);
+            vm.AddApps!.BrowseCommand.Execute(null);
+
+            Assert.True(vm.IsAppPage);
+            Assert.True(vm.AppPage!.IsNew);
+            Assert.Equal("Tool", vm.AppPage.Name);
+            Assert.Null(vm.AddApps);
+        });
+    }
+
     [Fact]
     public void SameProgramTwice_IsNotAdded()
     {
@@ -249,6 +356,46 @@ public class PagesTests : IDisposable
             Assert.True(vm.IsAppsPage);
             Assert.Single(vm.Apps);
         });
+    }
+
+    [Fact]
+    public void SameProgram_WithOtherArguments_IsNotAdded_SaysWhichIsThere()
+    {
+        var exe = FakeExe("Tool");
+        Preset(s =>
+        {
+            s.WelcomeDone = true;
+            s.Apps.Add(new AppEntry { Name = "Tool Work", ExePath = exe, Arguments = "--profile=Work" });
+        });
+
+        WithViewModel(vm =>
+        {
+            vm.AddFromPaths(new[] { exe });
+
+            Assert.True(vm.IsAppsPage);
+            Assert.Single(vm.Apps);
+            Assert.Contains("Эта программа уже добавлена: «Tool Work». Одну программу можно добавить только один раз", Assert.Single(_dialogs.Warnings));
+        });
+    }
+
+    [Fact]
+    public void ProgramAddedTwiceBefore_IsKept_AndLauncherWarns()
+    {
+        var exe = FakeExe("Tool");
+        Preset(s =>
+        {
+            s.WelcomeDone = true;
+            s.Apps.Add(new AppEntry { Name = "Tool Work", ExePath = exe, Arguments = "--profile=Work" });
+            s.Apps.Add(new AppEntry { Name = "Tool Home", ExePath = exe.ToUpperInvariant(), Arguments = "--profile=Home" });
+            s.Apps.Add(new AppEntry { Name = "Other", ExePath = FakeExe("Other") });
+        });
+
+        WithViewModel(vm => Assert.Equal(3, vm.Apps.Count));
+
+        var warning = Assert.Single(new ActivityLog(_dir.File("events.log")).Snapshot(), e => e.Text.Contains("добавлена несколько раз"));
+        Assert.Contains("«Tool Work», «Tool Home»", warning.Text);
+        Assert.DoesNotContain("Other", warning.Text);
+        Assert.Equal(3, Storage.Load().Apps.Count);
     }
 
     [Fact]
@@ -319,7 +466,8 @@ public class PagesTests : IDisposable
             page.Name = "Мой Tool";
             page.Mode = AppNetworkMode.OwnAdapters;
             page.RuleMode = VpnRuleMode.AnyVpn;
-            page.RequireVpn = ProtectionOverride.On;
+            page.CloseOnDrop = ProtectionOverride.On;
+            page.OutsideCopies = OutsideCopiesOverride.Block;
             page.DomainsText = "kaspi.kz\nhttps://www.Gosuslugi.ru/help";
             Assert.True(page.HasChanges);
 
@@ -333,8 +481,39 @@ public class PagesTests : IDisposable
         var app = Storage.Load().Apps[0];
         Assert.Equal("Мой Tool", app.Name);
         Assert.Equal(AppNetworkMode.OwnAdapters, app.Network.Mode);
-        Assert.Equal(ProtectionOverride.On, app.Network.RequireVpn);
+        Assert.Equal(ProtectionOverride.On, app.Network.CloseOnDrop);
+        Assert.Equal(OutsideCopiesOverride.Block, app.Network.OutsideCopies);
         Assert.Equal(2, app.Network.DirectDomains.Count);
+    }
+
+    [Fact]
+    public void AppPage_Offline_HidesProtection_AndIsSaved()
+    {
+        var exe = FakeExe("Tool");
+        Preset(s =>
+        {
+            s.WelcomeDone = true;
+            s.Apps.Add(new AppEntry { Name = "Tool", ExePath = exe });
+        });
+
+        WithViewModel(vm =>
+        {
+            vm.Apps[0].OpenSettingsCommand.Execute(null);
+            var page = vm.AppPage!;
+            Assert.False(page.IsOffline);
+
+            page.Mode = AppNetworkMode.Offline;
+            Assert.True(page.IsOffline);
+            Assert.False(page.UsesLauncherCore);
+            page.SaveCommand.Execute(null);
+
+            Assert.Null(page.Error);
+            Assert.True(vm.Apps[0].IsOfflineMode);
+            Assert.True(vm.Apps[0].IsOffline);
+            Assert.Equal("Без сети", vm.Apps[0].Subtitle);
+        });
+
+        Assert.Equal(AppNetworkMode.Offline, Storage.Load().Apps[0].Network.Mode);
     }
 
     [Fact]

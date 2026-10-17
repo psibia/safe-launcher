@@ -6,3 +6,5 @@ installer/publish/
 installer/publish-core/
 installer/Output/
 installer/launcher-core.exe
+installer/license-hashes.txt
+installer/update-signing-key.pem

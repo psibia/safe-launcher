@@ -19,9 +19,6 @@ public sealed class AppSettings
     /// <summary>«Закрывать при обрыве» для приложений, у которых это не задано отдельно (Kill-Switch).</summary>
     public bool KillSwitchEnabled { get; set; } = true;
 
-    /// <summary>«Не запускать без VPN» для приложений, у которых это не задано отдельно.</summary>
-    public bool RequireVpn { get; set; } = true;
-
     /// <summary>Как лаунчер понимает, что VPN есть: адаптеры другой программы или своё подключение.</summary>
     public GlobalNetworkMode NetworkMode { get; set; } = GlobalNetworkMode.SystemVpn;
 
@@ -50,11 +47,10 @@ public sealed class AppSettings
     public List<KnownAdapter> KnownAdapters { get; set; } = new();
 
     /// <summary>
-    /// «Блокировать трафик мимо VPN»: фильтры Windows пускают программы приложения в сеть только через его VPN
-    /// (адаптер ядра лаунчера или адаптеры системного VPN), даже если программа сама выберет обычный адаптер.
-    /// Действует на программы приложения, пока оно работает; см. VpnGuard.
+    /// «Приложения, открытые не из лаунчера» (приложения через подключение лаунчера): через VPN, без сети или
+    /// напрямую. Ядро узнаёт их по exe-файлам приложения, см. CorePlan.Programs.
     /// </summary>
-    public bool BlockBypass { get; set; } = true;
+    public OutsideCopies OutsideCopies { get; set; } = OutsideCopies.Vpn;
 
     /// <summary>
     /// «Скрывать DNS-запросы от провайдера» — настройка на весь компьютер, пока работает приложение лаунчера:
@@ -71,4 +67,39 @@ public sealed class AppSettings
     /// По умолчанию: в файлах, 7 дней, адреса не скрываются (см. notes/logging).
     /// </summary>
     public LogSettings Logs { get; set; } = new();
+
+    /// <summary>Обновления лаунчера (раздел «Обновления»).</summary>
+    public UpdateSettings Updates { get; set; } = new();
+}
+
+/// <summary>Откуда скачивать обновления.</summary>
+public enum UpdateRoute
+{
+    /// <summary>Напрямую через интернет (по умолчанию).</summary>
+    Direct,
+
+    /// <summary>Через подключение лаунчера (<see cref="UpdateSettings.ConnectionId"/>), если GitHub напрямую недоступен.</summary>
+    Connection
+}
+
+/// <summary>Обновления лаунчера: автоматическая проверка и загрузка, маршрут, о чём уже сообщили.</summary>
+public sealed class UpdateSettings
+{
+    /// <summary>
+    /// Проверять обновления при запуске и каждые 4 часа и сразу скачивать найденное. Ставится обновление только по кнопке
+    /// «Обновить». Выключено — только кнопка «Проверить».
+    /// </summary>
+    public bool Auto { get; set; } = true;
+
+    /// <summary>Откуда скачивать (скрытая настройка в «Дополнительно»).</summary>
+    public UpdateRoute Route { get; set; } = UpdateRoute.Direct;
+
+    /// <summary>Подключение лаунчера для маршрута <see cref="UpdateRoute.Connection"/>.</summary>
+    public Guid? ConnectionId { get; set; }
+
+    /// <summary>О какой версии уже сообщили уведомлением: о каждой версии сообщаем один раз.</summary>
+    public string? NotifiedVersion { get; set; }
+
+    /// <summary>Для какой версии настройки уже открывались сразу на странице «Обновления»: один раз на версию.</summary>
+    public string? OpenedVersion { get; set; }
 }

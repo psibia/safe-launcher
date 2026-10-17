@@ -229,14 +229,14 @@
                     <Border HorizontalAlignment="Right" VerticalAlignment="Top" Margin="0,-6,-6,0" Width="20" Height="20"
                             CornerRadius="10" Background="{StaticResource AccentGradient}" BorderBrush="{StaticResource WindowBg}"
                             BorderThickness="2" IsHitTestVisible="False"
-                            Visibility="{Binding IsUpdateAvailable, Converter={StaticResource BoolToVis}}">
+                            Visibility="{Binding IsUpdateFound, Converter={StaticResource BoolToVis}}">
                         <TextBlock Text="1" Foreground="White" FontSize="10" FontWeight="Bold"
                                    HorizontalAlignment="Center" VerticalAlignment="Center" Margin="0,-1,0,0" />
                     </Border>
                 </Grid>
 
                 <Button Style="{StaticResource PrimaryButton}" Padding="18,10" Margin="12,0,0,0" Command="{Binding AddAppCommand}"
-                        ToolTip="Выбрать программу (.exe) или ярлык. Можно и перетащить их в окно."
+                        ToolTip="Выбрать программы из меню «Пуск» или в проводнике. Можно и перетащить .exe или ярлык в окно."
                         Visibility="{Binding IsAppsPage, Converter={StaticResource BoolToVis}}">
                     <StackPanel Orientation="Horizontal">
                         <views:GlyphIcon Glyph="&#xE710;" Size="12" Margin="0,0,9,0" VerticalAlignment="Center" />
@@ -263,13 +263,13 @@
         <!-- ===================== Страница «Приложения» ===================== -->
         <Border Grid.Row="2" Margin="20,0,20,0" CornerRadius="28" Background="{StaticResource PanelBg}"
                 Visibility="{Binding IsAppsPage, Converter={StaticResource BoolToVis}}">
-            <Grid>
+            <Grid x:Name="HomeArea" Background="Transparent">
                 <!-- Плитки. Отступы стоят внутри прокрутки, чтобы тени плиток не обрезались. -->
-                <ScrollViewer Margin="0,10,6,10" Focusable="False" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-                    <ItemsControl ItemsSource="{Binding Apps}" Margin="10,0,4,10">
+                <ScrollViewer x:Name="HomeScroll" Margin="0,10,6,10" Focusable="False" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                    <ItemsControl x:Name="HomeTiles" ItemsSource="{Binding Apps}" Margin="10,0,4,10">
                         <ItemsControl.ItemsPanel>
                             <ItemsPanelTemplate>
-                                <WrapPanel />
+                                <views:AnimatedWrapPanel />
                             </ItemsPanelTemplate>
                         </ItemsControl.ItemsPanel>
                         <ItemsControl.ItemTemplate>
@@ -281,6 +281,12 @@
                                             <MenuItem Style="{StaticResource AppMenuItem}" Header="Запустить" Command="{Binding LaunchCommand}" FontWeight="SemiBold">
                                                 <MenuItem.Icon>
                                                     <TextBlock Text="&#xE768;" FontFamily="{StaticResource IconFont}" FontSize="13" />
+                                                </MenuItem.Icon>
+                                            </MenuItem>
+                                            <MenuItem Style="{StaticResource AppMenuItem}" Header="Запустить без сети" Command="{Binding LaunchOfflineCommand}"
+                                                      Visibility="{Binding IsOfflineMode, Converter={StaticResource InverseBoolToVis}}">
+                                                <MenuItem.Icon>
+                                                    <TextBlock Text="&#xE709;" FontFamily="{StaticResource IconFont}" FontSize="13" />
                                                 </MenuItem.Icon>
                                             </MenuItem>
                                             <MenuItem Style="{StaticResource AppMenuItem}" Header="Перезапустить под защитой" Command="{Binding RestartProtectedCommand}"
@@ -443,6 +449,10 @@
                                     <Trigger SourceName="Tile" Property="IsMouseOver" Value="True">
                                         <Setter TargetName="IconCircle" Property="Background" Value="{StaticResource AccentSoft}" />
                                     </Trigger>
+                                    <!-- Плитку перетаскивают: на её месте пустая ячейка, за курсором идёт её копия -->
+                                    <DataTrigger Binding="{Binding IsDragSource}" Value="True">
+                                        <Setter TargetName="Tile" Property="Opacity" Value="0" />
+                                    </DataTrigger>
                                 </DataTemplate.Triggers>
                             </DataTemplate>
                         </ItemsControl.ItemTemplate>
@@ -468,6 +478,8 @@
                                Visibility="{Binding DataContext.IsAppPage, RelativeSource={RelativeSource AncestorType=Window}, Converter={StaticResource BoolToVis}}" />
         <views:WelcomePage Grid.Row="2" Grid.RowSpan="2" DataContext="{Binding Welcome}"
                            Visibility="{Binding DataContext.IsWelcomePage, RelativeSource={RelativeSource AncestorType=Window}, Converter={StaticResource BoolToVis}}" />
+        <views:AddAppsPage Grid.Row="2" Grid.RowSpan="2" DataContext="{Binding AddApps}"
+                           Visibility="{Binding DataContext.IsAddAppsPage, RelativeSource={RelativeSource AncestorType=Window}, Converter={StaticResource BoolToVis}}" />
 
         <!-- ===================== Строка состояния (только на странице приложений) ===================== -->
         <Grid Grid.Row="3" Margin="40,12,40,14" Visibility="{Binding IsAppsPage, Converter={StaticResource BoolToVis}}">

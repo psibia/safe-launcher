@@ -1,0 +1,333 @@
+diff --git a/option/wireguard.go b/option/wireguard.go
+index d25d0d2..5da1ed6 100644
+--- a/option/wireguard.go
++++ b/option/wireguard.go
+@@ -19,9 +19,46 @@ type WireGuardEndpointOptions struct {
+ 	UDPFiltering UDPNATBehavior                   `json:"udp_filtering,omitempty"`
+ 	UDPNATMax    uint32                           `json:"udp_nat_max,omitempty"`
+ 	Workers      int                              `json:"workers,omitempty"`
++	// Safe Launcher: AmneziaWG obfuscation, see transport/wireguard/amnezia.go
++	Amnezia *WireGuardAmneziaOptions `json:"amnezia,omitempty"`
+ 	DialerOptions
+ }
+ 
++// WireGuardAmneziaOptions are the AmneziaWG settings of the [Interface] section of an
++// AmneziaWG configuration, named as in its configuration protocol. Ranges ("a-b" or "a")
++// are strings; the header protection key is base64, as in the configuration file.
++type WireGuardAmneziaOptions struct {
++	JC                     uint32 `json:"jc,omitempty"`
++	JMin                   uint32 `json:"jmin,omitempty"`
++	JMax                   uint32 `json:"jmax,omitempty"`
++	S1                     uint32 `json:"s1,omitempty"`
++	S2                     uint32 `json:"s2,omitempty"`
++	S3                     uint32 `json:"s3,omitempty"`
++	S4                     uint32 `json:"s4,omitempty"`
++	H1                     string `json:"h1,omitempty"`
++	H2                     string `json:"h2,omitempty"`
++	H3                     string `json:"h3,omitempty"`
++	H4                     string `json:"h4,omitempty"`
++	I1                     string `json:"i1,omitempty"`
++	I2                     string `json:"i2,omitempty"`
++	I3                     string `json:"i3,omitempty"`
++	I4                     string `json:"i4,omitempty"`
++	I5                     string `json:"i5,omitempty"`
++	J1                     string `json:"j1,omitempty"`
++	J2                     string `json:"j2,omitempty"`
++	J3                     string `json:"j3,omitempty"`
++	ITime                  uint32 `json:"itime,omitempty"`
++	HeaderProtectionKey    string `json:"header_protection_key,omitempty"`
++	ContentPaddingAddition string `json:"content_padding_addition,omitempty"`
++	RekeyAfterTime         string `json:"rekey_after_time,omitempty"`
++	RekeyTimeout           string `json:"rekey_timeout,omitempty"`
++	RejectAfterTime        string `json:"reject_after_time,omitempty"`
++	KeepaliveTimeout       string `json:"keepalive_timeout,omitempty"`
++	MaxHandshakeAttempts   string `json:"max_handshake_attempts,omitempty"`
++	RandomTrailers         bool   `json:"random_trailers,omitempty"`
++	DisableCookies         bool   `json:"disable_cookies,omitempty"`
++}
++
+ type WireGuardPeer struct {
+ 	Address                     string                           `json:"address,omitempty"`
+ 	Port                        uint16                           `json:"port,omitempty"`
+@@ -30,4 +67,6 @@ type WireGuardPeer struct {
+ 	AllowedIPs                  badoption.Listable[netip.Prefix] `json:"allowed_ips,omitempty"`
+ 	PersistentKeepaliveInterval uint16                           `json:"persistent_keepalive_interval,omitempty"`
+ 	Reserved                    []uint8                          `json:"reserved,omitempty"`
++	// Safe Launcher: an AmneziaWG interval range in seconds, "a-b", instead of persistent_keepalive_interval
++	PersistentKeepaliveRange string `json:"persistent_keepalive_range,omitempty"`
+ }
+diff --git a/protocol/wireguard/endpoint.go b/protocol/wireguard/endpoint.go
+index c80cf86..2b3433d 100644
+--- a/protocol/wireguard/endpoint.go
++++ b/protocol/wireguard/endpoint.go
+@@ -123,9 +123,11 @@ func NewEndpoint(ctx context.Context, router adapter.Router, logger log.ContextL
+ 				AllowedIPs:                  it.AllowedIPs,
+ 				PersistentKeepaliveInterval: it.PersistentKeepaliveInterval,
+ 				Reserved:                    it.Reserved,
++				PersistentKeepaliveRange:    it.PersistentKeepaliveRange,
+ 			}
+ 		}),
+ 		Workers: options.Workers,
++		Amnezia: (*wireguard.AmneziaOptions)(options.Amnezia),
+ 	})
+ 	if err != nil {
+ 		return nil, err
+diff --git a/transport/wireguard/amnezia.go b/transport/wireguard/amnezia.go
+new file mode 100644
+index 0000000..bcf5d7c
+--- /dev/null
++++ b/transport/wireguard/amnezia.go
+@@ -0,0 +1,115 @@
++package wireguard
++
++import (
++	"encoding/base64"
++	"encoding/hex"
++	"strings"
++
++	E "github.com/sagernet/sing/common/exceptions"
++	F "github.com/sagernet/sing/common/format"
++)
++
++// Safe Launcher: AmneziaWG (https://github.com/amnezia-vpn/amneziawg-go) is WireGuard with
++// obfuscated packets. The core's wireguard-go implements it (core/patches/wireguard-go of the
++// launcher); the settings reach it as keys of the device section of the configuration protocol.
++// Received datagrams then keep their bytes 1-3, which carry AmneziaWG data, so a peer of such an
++// endpoint cannot have reserved bytes.
++
++// AmneziaOptions are option.WireGuardAmneziaOptions, field for field.
++type AmneziaOptions struct {
++	JC                     uint32
++	JMin                   uint32
++	JMax                   uint32
++	S1                     uint32
++	S2                     uint32
++	S3                     uint32
++	S4                     uint32
++	H1                     string
++	H2                     string
++	H3                     string
++	H4                     string
++	I1                     string
++	I2                     string
++	I3                     string
++	I4                     string
++	I5                     string
++	J1                     string
++	J2                     string
++	J3                     string
++	ITime                  uint32
++	HeaderProtectionKey    string
++	ContentPaddingAddition string
++	RekeyAfterTime         string
++	RekeyTimeout           string
++	RejectAfterTime        string
++	KeepaliveTimeout       string
++	MaxHandshakeAttempts   string
++	RandomTrailers         bool
++	DisableCookies         bool
++}
++
++// ipcLines returns the set settings as configuration protocol lines, each led by "\n".
++// The device checks the values; an empty result means plain WireGuard.
++func (o *AmneziaOptions) ipcLines() (string, error) {
++	var lines strings.Builder
++	for _, number := range []struct {
++		key   string
++		value uint32
++	}{
++		{"jc", o.JC}, {"jmin", o.JMin}, {"jmax", o.JMax},
++		{"s1", o.S1}, {"s2", o.S2}, {"s3", o.S3}, {"s4", o.S4},
++		{"itime", o.ITime},
++	} {
++		if number.value != 0 {
++			lines.WriteString("\n" + number.key + "=" + F.ToString(number.value))
++		}
++	}
++	for _, text := range []struct {
++		key   string
++		value string
++	}{
++		{"h1", o.H1}, {"h2", o.H2}, {"h3", o.H3}, {"h4", o.H4},
++		{"i1", o.I1}, {"i2", o.I2}, {"i3", o.I3}, {"i4", o.I4}, {"i5", o.I5},
++		{"j1", o.J1}, {"j2", o.J2}, {"j3", o.J3},
++		{"content_padding_addition", o.ContentPaddingAddition},
++		{"rekey_after_time", o.RekeyAfterTime},
++		{"rekey_timeout", o.RekeyTimeout},
++		{"reject_after_time", o.RejectAfterTime},
++		{"keepalive_timeout", o.KeepaliveTimeout},
++		{"max_handshake_attempts", o.MaxHandshakeAttempts},
++	} {
++		value, err := ipcValue("amnezia "+text.key, text.value)
++		if err != nil {
++			return "", err
++		}
++		if value != "" {
++			lines.WriteString("\n" + text.key + "=" + value)
++		}
++	}
++	if o.HeaderProtectionKey != "" {
++		key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(o.HeaderProtectionKey))
++		if err != nil {
++			return "", E.Cause(err, "decode amnezia header_protection_key")
++		}
++		if len(key) != 32 {
++			return "", E.New("invalid amnezia header_protection_key: required 32 bytes, got ", len(key))
++		}
++		lines.WriteString("\nheader_protection_key=" + hex.EncodeToString(key))
++	}
++	if o.RandomTrailers {
++		lines.WriteString("\nrandom_trailers=true")
++	}
++	if o.DisableCookies {
++		lines.WriteString("\ndisable_cookies=true")
++	}
++	return lines.String(), nil
++}
++
++// ipcValue trims value; a line break would start another key of the configuration protocol.
++func ipcValue(name string, value string) (string, error) {
++	value = strings.TrimSpace(value)
++	if strings.ContainsAny(value, "\r\n") {
++		return "", E.New("invalid ", name, ": line break")
++	}
++	return value, nil
++}
+diff --git a/transport/wireguard/client_bind.go b/transport/wireguard/client_bind.go
+index b423558..98e08d8 100644
+--- a/transport/wireguard/client_bind.go
++++ b/transport/wireguard/client_bind.go
+@@ -5,6 +5,7 @@ import (
+ 	"net"
+ 	"net/netip"
+ 	"sync"
++	"sync/atomic"
+ 	"time"
+ 
+ 	"github.com/sagernet/sing/common"
+@@ -35,6 +36,7 @@ type ClientBind struct {
+ 	isConnect           bool
+ 	connectAddr         netip.AddrPort
+ 	reserved            [3]uint8
++	preserveReserved    atomic.Bool
+ }
+ 
+ func NewClientBind(ctx context.Context, logger logger.Logger, dialer N.Dialer, isConnect bool, connectAddr netip.AddrPort, reserved [3]uint8) *ClientBind {
+@@ -135,7 +137,7 @@ func (c *ClientBind) receive(packets [][]byte, sizes []int, eps []conn.Endpoint)
+ 		return
+ 	}
+ 	sizes[0] = n
+-	if n > 3 {
++	if n > 3 && !c.preserveReserved.Load() {
+ 		b := packets[0]
+ 		clear(b[1:4])
+ 	}
+@@ -175,7 +177,7 @@ func (c *ClientBind) Send(bufs [][]byte, ep conn.Endpoint, offset int) error {
+ 		if offset > 0 {
+ 			buf = buf[offset:]
+ 		}
+-		if len(buf) > 3 {
++		if len(buf) > 3 && !c.preserveReserved.Load() {
+ 			c.reservedAccess.RLock()
+ 			reserved, loaded := c.reservedForEndpoint[destination]
+ 			c.reservedAccess.RUnlock()
+@@ -205,6 +207,13 @@ func (c *ClientBind) BatchSize() int {
+ 	return 1
+ }
+ 
++// SetPreserveReservedBytes leaves bytes 1-3 of datagrams as they are, in both directions:
++// AmneziaWG datagrams carry data there. wireguard-go calls it when AmneziaWG is configured.
++// Safe Launcher.
++func (c *ClientBind) SetPreserveReservedBytes() {
++	c.preserveReserved.Store(true)
++}
++
+ func (c *ClientBind) SetReservedForEndpoint(destination netip.AddrPort, reserved [3]byte) {
+ 	c.reservedAccess.Lock()
+ 	c.reservedForEndpoint[destination] = reserved
+diff --git a/transport/wireguard/endpoint.go b/transport/wireguard/endpoint.go
+index eabfc06..5c10624 100644
+--- a/transport/wireguard/endpoint.go
++++ b/transport/wireguard/endpoint.go
+@@ -53,6 +53,15 @@ func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
+ 	if options.ListenPort != 0 {
+ 		ipcConf += "\nlisten_port=" + F.ToString(options.ListenPort)
+ 	}
++	var amnezia bool
++	if options.Amnezia != nil {
++		amneziaConf, err := options.Amnezia.ipcLines()
++		if err != nil {
++			return nil, err
++		}
++		ipcConf += amneziaConf
++		amnezia = amneziaConf != ""
++	}
+ 	var peers []peerConfig
+ 	for peerIndex, rawPeer := range options.Peers {
+ 		peer := peerConfig{
+@@ -85,6 +94,18 @@ func NewEndpoint(options EndpointOptions) (*Endpoint, error) {
+ 			}
+ 			copy(peer.reserved[:], rawPeer.Reserved[:])
+ 		}
++		if amnezia && peer.reserved != [3]uint8{} {
++			return nil, E.New("reserved value for peer ", peerIndex, " is not supported with amnezia")
++		}
++		if rawPeer.PersistentKeepaliveRange != "" {
++			if rawPeer.PersistentKeepaliveInterval != 0 {
++				return nil, E.New("both persistent_keepalive_interval and persistent_keepalive_range for peer ", peerIndex)
++			}
++			peer.keepaliveRange, err = ipcValue("persistent_keepalive_range for peer "+F.ToString(peerIndex), rawPeer.PersistentKeepaliveRange)
++			if err != nil {
++				return nil, err
++			}
++		}
+ 		peers = append(peers, peer)
+ 	}
+ 	var allowedPrefixBuilder netipx.IPSetBuilder
+@@ -251,7 +272,8 @@ func (e *Endpoint) Start(postStart bool) error {
+ 	err = wgDevice.IpcSet(ipcConf.String())
+ 	if err != nil {
+ 		wgDevice.Close()
+-		return E.Cause(err, "setup wireguard: \n", ipcConf.String())
++		// Safe Launcher: not the configuration itself, it holds the private key
++		return E.Cause(err, "setup wireguard")
+ 	}
+ 	e.device = wgDevice
+ 	e.pause = service.FromContext[pause.Manager](e.options.Context)
+@@ -324,6 +346,7 @@ type peerConfig struct {
+ 	preSharedKeyHex string
+ 	allowedIPs      []netip.Prefix
+ 	keepalive       uint16
++	keepaliveRange  string
+ 	reserved        [3]uint8
+ }
+ 
+@@ -339,7 +362,9 @@ func (c peerConfig) GenerateIpcLines() string {
+ 	for _, allowedIP := range c.allowedIPs {
+ 		ipcLines.WriteString("\nallowed_ip=" + allowedIP.String())
+ 	}
+-	if c.keepalive > 0 {
++	if c.keepaliveRange != "" {
++		ipcLines.WriteString("\npersistent_keepalive_interval=" + c.keepaliveRange)
++	} else if c.keepalive > 0 {
+ 		ipcLines.WriteString("\npersistent_keepalive_interval=" + F.ToString(c.keepalive))
+ 	}
+ 	return ipcLines.String()
+diff --git a/transport/wireguard/endpoint_options.go b/transport/wireguard/endpoint_options.go
+index 006010a..ccdb604 100644
+--- a/transport/wireguard/endpoint_options.go
++++ b/transport/wireguard/endpoint_options.go
+@@ -36,6 +36,7 @@ type EndpointOptions struct {
+ 	ResolvePeer       func(domain string) ([]netip.Addr, error)
+ 	Peers             []PeerOptions
+ 	Workers           int
++	Amnezia           *AmneziaOptions
+ }
+ 
+ type PeerOptions struct {
+@@ -45,4 +46,5 @@ type PeerOptions struct {
+ 	AllowedIPs                  []netip.Prefix
+ 	PersistentKeepaliveInterval uint16
+ 	Reserved                    []uint8
++	PersistentKeepaliveRange    string
+ }

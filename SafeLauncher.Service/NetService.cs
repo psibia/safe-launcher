@@ -1,5 +1,6 @@
 using System;
 using System.Diagnostics;
+using System.IO;
 using System.ServiceProcess;
 
 namespace SafeLauncher.Service;
@@ -27,7 +28,9 @@ internal sealed class NetService : ServiceBase
         ServiceLog.Initialize(log);
         _core = new CoreRunner(AppContext.BaseDirectory);
         _core.KillLeftovers();
-        _guard = new NetworkGuard(log);
+        _guard = new NetworkGuard(log, Path.Combine(AppContext.BaseDirectory, "run", "guard.json"));
+        // Фильтры, оставшиеся после сбоя прежней службы, — до того, как к ней подключатся лаунчеры.
+        _guard.Restore();
         _server = new ControlServer(_core, _guard, log);
         _server.Start();
         log("Служба запущена");
@@ -42,7 +45,7 @@ internal sealed class NetService : ServiceBase
     {
         _server?.Dispose();
         _core?.Dispose();
-        _guard?.Dispose(); // фильтры Windows удаляются вместе с сеансом
+        _guard?.Dispose(); // снимает фильтры Windows: остановка службы — не сбой
         _server = null;
         _core = null;
         _guard = null;

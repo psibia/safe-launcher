@@ -100,6 +100,14 @@
                                            Text="Приложение пойдёт через выбранное подключение лаунчера, что бы ни было выбрано в общих настройках." />
                             </StackPanel>
                         </RadioButton>
+                        <RadioButton Style="{StaticResource ChoiceCard}"
+                                     IsChecked="{Binding Mode, Converter={StaticResource EnumToBool}, ConverterParameter=Offline}">
+                            <StackPanel>
+                                <TextBlock Text="Без сети" FontWeight="Bold" FontSize="13.5" />
+                                <TextBlock Style="{StaticResource Caption}" Margin="0,2,0,0"
+                                           Text="Приложение запускается без интернета, VPN не нужен. Работает только связь внутри компьютера." />
+                            </StackPanel>
+                        </RadioButton>
                     </StackPanel>
 
                     <!-- Свои адаптеры -->
@@ -157,61 +165,69 @@
                         </StackPanel>
                     </Border>
 
-                    <!-- ===== Защита ===== -->
-                    <TextBlock Text="Защита" Style="{StaticResource BlockTitle}" />
-                    <TextBlock Style="{StaticResource Caption}" Margin="0,0,0,12" Text="По умолчанию — как в общих настройках." />
+                    <!-- ===== Защита и исключения: без сети не нужны ===== -->
+                    <StackPanel Visibility="{Binding IsOffline, Converter={StaticResource InverseBoolToVis}}">
+                        <TextBlock Text="Защита" Style="{StaticResource BlockTitle}" />
+                        <TextBlock Style="{StaticResource Caption}" Margin="0,0,0,12" Text="По умолчанию как в общих настройках." />
 
-                    <Border Style="{StaticResource SettingRow}">
-                        <StackPanel>
-                            <Grid>
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <TextBlock Grid.Column="0" Text="Не запускать без VPN" FontWeight="Bold" FontSize="13.5" VerticalAlignment="Center" />
-                                <Border Grid.Column="1" Background="{StaticResource SubtleBg}" CornerRadius="14" Padding="4" Margin="12,0,0,0">
-                                    <StackPanel Orientation="Horizontal">
-                                        <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="140" Content="{Binding RequireVpnInheritText}"
-                                                     IsChecked="{Binding RequireVpn, Converter={StaticResource EnumToBool}, ConverterParameter=Inherit}" />
-                                        <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="56" Content="Вкл"
-                                                     IsChecked="{Binding RequireVpn, Converter={StaticResource EnumToBool}, ConverterParameter=On}" />
-                                        <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="56" Content="Выкл"
-                                                     IsChecked="{Binding RequireVpn, Converter={StaticResource EnumToBool}, ConverterParameter=Off}" />
-                                    </StackPanel>
+                        <Border Style="{StaticResource SettingRow}" Margin="0,0,0,10">
+                            <StackPanel>
+                                <TextBlock Text="Если открыто не из лаунчера" FontWeight="Bold" FontSize="13.5" />
+                                <TextBlock Style="{StaticResource Caption}" Margin="0,1,0,8" Text="С ярлыка, из автозагрузки или другой программы." />
+                                <Border Background="{StaticResource SubtleBg}" CornerRadius="14" Padding="4">
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="1.7*" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="*" />
+                                        </Grid.ColumnDefinitions>
+                                        <RadioButton Grid.Column="0" Style="{StaticResource SegmentRadio}" Content="{Binding OutsideCopiesInheritText}"
+                                                     IsChecked="{Binding OutsideCopies, Converter={StaticResource EnumToBool}, ConverterParameter=Inherit}" />
+                                        <RadioButton Grid.Column="1" Style="{StaticResource SegmentRadio}" Content="Через лаунчер"
+                                                     IsChecked="{Binding OutsideCopies, Converter={StaticResource EnumToBool}, ConverterParameter=Launcher}" />
+                                        <RadioButton Grid.Column="2" Style="{StaticResource SegmentRadio}" Content="Через VPN"
+                                                     IsChecked="{Binding OutsideCopies, Converter={StaticResource EnumToBool}, ConverterParameter=Vpn}" />
+                                        <RadioButton Grid.Column="3" Style="{StaticResource SegmentRadio}" Content="Без интернета"
+                                                     IsChecked="{Binding OutsideCopies, Converter={StaticResource EnumToBool}, ConverterParameter=Block}" />
+                                        <RadioButton Grid.Column="4" Style="{StaticResource SegmentRadio}" Content="Напрямую"
+                                                     IsChecked="{Binding OutsideCopies, Converter={StaticResource EnumToBool}, ConverterParameter=Allow}" />
+                                    </Grid>
                                 </Border>
-                            </Grid>
-                            <TextBlock Text="{Binding RequireVpnHint}" Style="{StaticResource Caption}" Margin="0,6,0,0" />
-                        </StackPanel>
-                    </Border>
+                                <TextBlock Text="{Binding OutsideCopiesHint}" Style="{StaticResource Caption}" Margin="0,6,0,0" />
+                            </StackPanel>
+                        </Border>
 
-                    <Border Style="{StaticResource SettingRow}" Margin="0,8,0,0">
-                        <StackPanel>
-                            <Grid>
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <TextBlock Grid.Column="0" Text="Закрывать при обрыве" FontWeight="Bold" FontSize="13.5" VerticalAlignment="Center" />
-                                <Border Grid.Column="1" Background="{StaticResource SubtleBg}" CornerRadius="14" Padding="4" Margin="12,0,0,0">
-                                    <StackPanel Orientation="Horizontal">
-                                        <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="140" Content="{Binding CloseOnDropInheritText}"
-                                                     IsChecked="{Binding CloseOnDrop, Converter={StaticResource EnumToBool}, ConverterParameter=Inherit}" />
-                                        <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="56" Content="Вкл"
-                                                     IsChecked="{Binding CloseOnDrop, Converter={StaticResource EnumToBool}, ConverterParameter=On}" />
-                                        <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="56" Content="Выкл"
-                                                     IsChecked="{Binding CloseOnDrop, Converter={StaticResource EnumToBool}, ConverterParameter=Off}" />
-                                    </StackPanel>
-                                </Border>
-                            </Grid>
-                            <TextBlock Text="{Binding CloseOnDropHint}" Style="{StaticResource Caption}" Margin="0,6,0,0" />
-                        </StackPanel>
-                    </Border>
+                        <Border Style="{StaticResource SettingRow}">
+                            <StackPanel>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="Закрывать при обрыве" FontWeight="Bold" FontSize="13.5" VerticalAlignment="Center" />
+                                    <Border Grid.Column="1" Background="{StaticResource SubtleBg}" CornerRadius="14" Padding="4" Margin="12,0,0,0">
+                                        <StackPanel Orientation="Horizontal">
+                                            <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="140" Content="{Binding CloseOnDropInheritText}"
+                                                         IsChecked="{Binding CloseOnDrop, Converter={StaticResource EnumToBool}, ConverterParameter=Inherit}" />
+                                            <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="56" Content="Вкл"
+                                                         IsChecked="{Binding CloseOnDrop, Converter={StaticResource EnumToBool}, ConverterParameter=On}" />
+                                            <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="56" Content="Выкл"
+                                                         IsChecked="{Binding CloseOnDrop, Converter={StaticResource EnumToBool}, ConverterParameter=Off}" />
+                                        </StackPanel>
+                                    </Border>
+                                </Grid>
+                                <TextBlock Text="{Binding CloseOnDropHint}" Style="{StaticResource Caption}" Margin="0,6,0,0" />
+                            </StackPanel>
+                        </Border>
 
-                    <!-- ===== Исключения ===== -->
-                    <TextBlock Text="Исключения" Style="{StaticResource BlockTitle}" />
-                    <TextBlock Text="{Binding DomainsHint}" Style="{StaticResource Caption}" Margin="0,0,0,10" />
-                    <TextBox Style="{StaticResource InputArea}" Tag="kaspi.kz&#x0a;gosuslugi.ru"
-                             Text="{Binding DomainsText, UpdateSourceTrigger=PropertyChanged}" />
+                        <!-- ===== Исключения ===== -->
+                        <TextBlock Text="Исключения" Style="{StaticResource BlockTitle}" />
+                        <TextBlock Text="{Binding DomainsHint}" Style="{StaticResource Caption}" Margin="0,0,0,10" />
+                        <TextBox Style="{StaticResource InputArea}" Tag="kaspi.kz&#x0a;gosuslugi.ru"
+                                 Text="{Binding DomainsText, UpdateSourceTrigger=PropertyChanged}" />
+                    </StackPanel>
 
                     <!-- ===== Журнал DNS ===== -->
                     <TextBlock Text="Журнал DNS" Style="{StaticResource BlockTitle}" Margin="0,26,0,10" />

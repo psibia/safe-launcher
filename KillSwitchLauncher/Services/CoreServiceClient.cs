@@ -39,6 +39,9 @@ public sealed class CoreStartRequest
 
     /// <summary>DNS-сервер внутри подключения (tag → IP), например из файла WireGuard.</summary>
     public Dictionary<string, string>? OutboundDns { get; set; }
+
+    /// <summary>При <see cref="HideDns"/>: подключение (tag) для DNS-запросов, на которые ядро не отвечает подменным адресом; null — DNS компьютера.</summary>
+    public string? DnsOutbound { get; set; }
 }
 
 /// <summary>Какие программы пускать в сеть только через VPN (см. SafeLauncher.Service/Protocol.cs, GuardRequest).</summary>
@@ -76,7 +79,10 @@ public sealed record GuardReply(string? Notice, IReadOnlyList<string> Unguarded)
     public static readonly GuardReply Empty = new(null, Array.Empty<string>());
 }
 
-/// <summary>Приложение: процессы с меткой Tag идут через подключение Outbound, кроме доменов DirectDomains.</summary>
+/// <summary>
+/// Приложение: процессы с меткой Tag идут через подключение Outbound, кроме доменов DirectDomains. Процессы программ
+/// Programs без метки (копия, запущенная мимо лаунчера) идут так же, а с BlockOutside остаются без сети.
+/// </summary>
 public sealed class CoreAppRoute
 {
     public string Tag { get; set; } = string.Empty;
@@ -84,6 +90,32 @@ public sealed class CoreAppRoute
     public string Outbound { get; set; } = string.Empty;
 
     public List<string> DirectDomains { get; set; } = new();
+
+    /// <summary>Программы приложения для процессов без метки; null — такие процессы идут напрямую (служба до ревизии 8 так и делает).</summary>
+    public List<CoreProgram>? Programs { get; set; }
+
+    public bool BlockOutside { get; set; }
+}
+
+/// <summary>Программа приложения: exe с этим именем в папке и, если Subfolders, во вложенных папках.</summary>
+public sealed class CoreProgram
+{
+    public string Folder { get; set; } = string.Empty;
+
+    public string Name { get; set; } = string.Empty;
+
+    public bool Subfolders { get; set; }
+}
+
+/// <summary>Обновление лаунчера через службу (SafeLauncher.Service/Protocol.cs, UpdateRequest): скачанные установщик и подпись.</summary>
+public sealed class ServiceUpdateRequest
+{
+    public string SetupPath { get; set; } = string.Empty;
+
+    public string SignaturePath { get; set; } = string.Empty;
+
+    /// <summary>Для updateStarted: номер обновления из status.json.</summary>
+    public string? JobId { get; set; }
 }
 
 /// <summary>Запрос к журналам службы (SafeLauncher.Service/Protocol.cs, LogRequest).</summary>
@@ -145,7 +177,8 @@ public sealed class ServiceLogFile
 }
 
 /// <summary>Ядро запущено: его PID и управление на 127.0.0.1 (порт и ключ, свои на каждый запуск).</summary>
-public sealed record CoreStarted(int Pid, int? ApiPort, string? ApiSecret);
+/// <param name="CheckPort">Прокси для проверки подключений через ядро (служба с протоколом 7), иначе null.</param>
+public sealed record CoreStarted(int Pid, int? ApiPort, string? ApiSecret, int? CheckPort = null);
 
 /// <summary>Состояние ядра по словам службы.</summary>
 /// <param name="Protocol">Что умеет служба (см. <see cref="CoreServiceClient.RequiredProtocol"/>); у служб до него — 1.</param>
@@ -171,6 +204,12 @@ public sealed class CoreServiceClient : IDisposable
     private static readonly TimeSpan StartTimeout = TimeSpan.FromSeconds(60);
     private static readonly TimeSpan CommandTimeout = TimeSpan.FromSeconds(30);
 
+    /// <summary>Сколько ждать ответа на update: служба копирует и проверяет установщик и сохраняет текущую версию для отката.</summary>
+    private static readonly TimeSpan UpdateTimeout = TimeSpan.FromMinutes(3);
+
+    /// <summary>С какой ревизии служба ставит обновления сама (команда update).</summary>
+    public const int UpdateProtocol = 9;
+
     internal static readonly JsonSerializerOptions JsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -192,10 +231,10 @@ public sealed class CoreServiceClient : IDisposable
     }
 
     /// <summary>
-    /// Самая старая служба, с которой работает этот лаунчер (ControlProtocol.Revision в службе): 4 — блокировка трафика
-    /// мимо VPN, которая сообщает о непроверенных программах, и скрытие DNS только для службы DNS Windows и приложений.
+    /// Самая старая служба, с которой работает этот лаунчер (ControlProtocol.Revision в службе): 8 — ядро узнаёт копии
+    /// приложений мимо лаунчера (Programs, BlockOutside). Служба старше молча пропустила бы эти поля, и копии шли бы напрямую.
     /// </summary>
-    public const int RequiredProtocol = 4;
+    public const int RequiredProtocol = 8;
 
     public const string OutdatedServiceMessage =
         "Установлена старая версия службы «Безопасный лаунчер — сеть»: она не умеет защищать приложения так, как нужно " +
@@ -205,8 +244,11 @@ public sealed class CoreServiceClient : IDisposable
     public static string InstallDirectory =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "SafeLauncher", "core");
 
-    /// <summary>Ядро завершилось само: код выхода и последние строки журнала. Вызывается из фонового потока.</summary>
-    public event Action<int, IReadOnlyList<string>>? CoreExited;
+    /// <summary>
+    /// Ядро завершилось само: код выхода, последние строки журнала и PID ядра (null — служба его не сообщает). Вызывается из
+    /// фонового потока.
+    /// </summary>
+    public event Action<int, IReadOnlyList<string>, int?>? CoreExited;
 
     /// <summary>Связь со службой пропала (служба остановлена или упала); ядро при этом тоже остановлено.</summary>
     public event Action? Disconnected;
@@ -275,7 +317,7 @@ public sealed class CoreServiceClient : IDisposable
         var reply = await SendAsync(new Message { Op = "start", OwnerPipe = ownerPipe, Request = request }, StartTimeout, cancellation)
             .ConfigureAwait(false);
         var pid = reply.CorePid ?? throw new CoreServiceException("Служба не сообщила, запущено ли ядро.");
-        return new CoreStarted(pid, reply.ApiPort, reply.ApiSecret);
+        return new CoreStarted(pid, reply.ApiPort, reply.ApiSecret, reply.CheckPort);
     }
 
     /// <summary>Остановить ядро. true — оно закрылось само и убрало за собой адаптер и маршруты.</summary>
@@ -304,6 +346,26 @@ public sealed class CoreServiceClient : IDisposable
         var reply = await SendAsync(new Message { Op = op, Logs = request, Cid = cid }, CommandTimeout, cancellation).ConfigureAwait(false);
         return reply.Logs ?? new ServiceLogReply();
     }
+
+    /// <summary>
+    /// Передать службе обновление (служба Revision 9): она проверит подпись и версию, сохранит текущую версию для отката
+    /// и начнёт установку, когда лаунчер закроется. Возвращает устанавливаемую версию. Отказ — <see cref="CoreServiceException"/>
+    /// с объяснением службы; при этом ничего не изменено.
+    /// </summary>
+    public async Task<string> UpdateAsync(string setupPath, string signaturePath, CancellationToken cancellation = default)
+    {
+        var reply = await SendAsync(new Message { Op = "update", Update = new ServiceUpdateRequest { SetupPath = setupPath, SignaturePath = signaturePath } },
+            UpdateTimeout, cancellation).ConfigureAwait(false);
+        return reply.Version ?? throw new CoreServiceException("Служба не сообщила, какую версию ставит.");
+    }
+
+    /// <summary>
+    /// Сообщить службе (ревизия 10), что эта версия запустилась после обновления: помощник обновления ждёт этого и без
+    /// сообщения вернёт прежнюю версию. Отказ — <see cref="CoreServiceException"/> с объяснением службы.
+    /// </summary>
+    public async Task ConfirmUpdateStartedAsync(string jobId, CancellationToken cancellation = default) =>
+        await SendAsync(new Message { Op = "updateStarted", Update = new ServiceUpdateRequest { JobId = jobId } }, CommandTimeout, cancellation)
+            .ConfigureAwait(false);
 
     public async Task<CoreStatus> StatusAsync(CancellationToken cancellation = default)
     {
@@ -387,7 +449,7 @@ public sealed class CoreServiceClient : IDisposable
                 if (reply is null)
                     continue;
                 if (reply.Event == "coreExited")
-                    CoreExited?.Invoke(reply.ExitCode ?? -1, reply.Log ?? new List<string>());
+                    CoreExited?.Invoke(reply.ExitCode ?? -1, reply.Log ?? new List<string>(), reply.CorePid);
                 else if (reply.Id is { } id && _pending.TryGetValue(id, out var waiter))
                     waiter.TrySetResult(reply);
             }
@@ -463,6 +525,8 @@ public sealed class CoreServiceClient : IDisposable
         public string? Cid { get; set; }
 
         public ServiceLogRequest? Logs { get; set; }
+
+        public ServiceUpdateRequest? Update { get; set; }
     }
 
     internal sealed class Reply
@@ -490,6 +554,8 @@ public sealed class CoreServiceClient : IDisposable
         public int? ApiPort { get; set; }
 
         public string? ApiSecret { get; set; }
+
+        public int? CheckPort { get; set; }
 
         public List<string>? Log { get; set; }
 

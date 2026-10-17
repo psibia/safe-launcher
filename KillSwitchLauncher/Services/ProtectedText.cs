@@ -18,11 +18,12 @@ public static class ProtectedText
     // Привязывает шифр к лаунчеру: другая программа того же пользователя без этой строки его не расшифрует.
     private static readonly byte[] Entropy = Encoding.UTF8.GetBytes("SafeLauncher.Settings.v1");
     private const int CryptProtectUiForbidden = 0x1;
+    private const int CryptProtectLocalMachine = 0x4;
 
     public static string Protect(string text)
     {
         var data = Encoding.UTF8.GetBytes(text);
-        return Prefix + Convert.ToBase64String(Transform(data, protect: true));
+        return Prefix + Convert.ToBase64String(Transform(data, Entropy, protect: true, CryptProtectUiForbidden));
     }
 
     /// <summary>
@@ -37,7 +38,7 @@ public static class ProtectedText
         try
         {
             var data = Convert.FromBase64String(stored[Prefix.Length..]);
-            return Encoding.UTF8.GetString(Transform(data, protect: false));
+            return Encoding.UTF8.GetString(Transform(data, Entropy, protect: false, CryptProtectUiForbidden));
         }
         catch (Exception ex) when (ex is FormatException or CryptographicFailure)
         {
@@ -45,18 +46,38 @@ public static class ProtectedText
         }
     }
 
-    private static byte[] Transform(byte[] input, bool protect)
+    /// <summary>
+    /// Шифрование для компьютера, а не для пользователя: расшифровать может любой пользователь этого компьютера,
+    /// на другом компьютере нельзя. Не зависит от пароля пользователя и от сети (см. License).
+    /// </summary>
+    internal static byte[] ProtectForMachine(byte[] data, byte[] entropy) =>
+        Transform(data, entropy, protect: true, CryptProtectUiForbidden | CryptProtectLocalMachine);
+
+    /// <summary>Расшифровка <see cref="ProtectForMachine"/>. Null — не удалось (например, данные с другого компьютера).</summary>
+    internal static byte[]? UnprotectForMachine(byte[] data, byte[] entropy)
+    {
+        try
+        {
+            return Transform(data, entropy, protect: false, CryptProtectUiForbidden);
+        }
+        catch (CryptographicFailure)
+        {
+            return null;
+        }
+    }
+
+    private static byte[] Transform(byte[] input, byte[] entropy, bool protect, int flags)
     {
         var inHandle = GCHandle.Alloc(input, GCHandleType.Pinned);
-        var entropyHandle = GCHandle.Alloc(Entropy, GCHandleType.Pinned);
+        var entropyHandle = GCHandle.Alloc(entropy, GCHandleType.Pinned);
         try
         {
             var inBlob = new DataBlob { Size = input.Length, Data = inHandle.AddrOfPinnedObject() };
-            var entropyBlob = new DataBlob { Size = Entropy.Length, Data = entropyHandle.AddrOfPinnedObject() };
+            var entropyBlob = new DataBlob { Size = entropy.Length, Data = entropyHandle.AddrOfPinnedObject() };
             DataBlob outBlob;
             var ok = protect
-                ? CryptProtectData(ref inBlob, null, ref entropyBlob, IntPtr.Zero, IntPtr.Zero, CryptProtectUiForbidden, out outBlob)
-                : CryptUnprotectData(ref inBlob, IntPtr.Zero, ref entropyBlob, IntPtr.Zero, IntPtr.Zero, CryptProtectUiForbidden, out outBlob);
+                ? CryptProtectData(ref inBlob, null, ref entropyBlob, IntPtr.Zero, IntPtr.Zero, flags, out outBlob)
+                : CryptUnprotectData(ref inBlob, IntPtr.Zero, ref entropyBlob, IntPtr.Zero, IntPtr.Zero, flags, out outBlob);
             if (!ok)
                 throw new CryptographicFailure(Marshal.GetLastWin32Error());
 

@@ -60,6 +60,13 @@
             <CheckBox x:Name="OptionCheck" Grid.Row="1" Grid.Column="1" Margin="0,16,0,0" Style="{StaticResource SoftCheckBox}"
                       Visibility="Collapsed" />
 
+            <!-- Необязательное поле ввода под текстом (ключ лицензии) и строка ошибки под ним -->
+            <StackPanel x:Name="InputHost" Grid.Row="1" Grid.Column="1" Margin="0,16,0,0" Visibility="Collapsed">
+                <TextBox x:Name="InputText" Style="{StaticResource InputBox}" />
+                <TextBlock x:Name="InputError" Foreground="{StaticResource Danger}" Margin="2,8,0,0" TextWrapping="Wrap"
+                           Visibility="Collapsed" />
+            </StackPanel>
+
             <StackPanel x:Name="ButtonsHost" Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2"
                         Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,24,0,0" />
         </Grid>

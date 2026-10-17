@@ -22,11 +22,12 @@ public readonly record struct DnsQueryEvent(DateTime TimeUtc, int ProcessId, str
 ///
 /// Берутся два события: 3006 — приложение вызвало DNS-запрос, 3008 — запрос завершён. Оба пишутся
 /// библиотекой DNS внутри самого приложения, поэтому PID в заголовке события — это PID приложения.
-/// Сессия у системы одна на имя; если лаунчер упал и оставил её, следующий запуск её закрывает.
+/// Сессия у системы одна на имя; если лаунчер упал и оставил её, следующий запуск её закрывает. Имя своё у каждого
+/// сеанса Windows: лаунчер другого пользователя на этом же компьютере не должен останавливать чужую сессию.
 /// </summary>
 internal sealed class DnsEtwSession : IDisposable
 {
-    public const string DefaultSessionName = "SafeLauncher-DNS";
+    public static readonly string DefaultSessionName = "SafeLauncher-DNS-" + System.Diagnostics.Process.GetCurrentProcess().SessionId;
     public const ushort EventQueryStarted = 3006;
     public const ushort EventQueryCompleted = 3008;
 
@@ -56,9 +57,9 @@ internal sealed class DnsEtwSession : IDisposable
     public event EventHandler? Stopped;
 
     /// <summary>Создаёт сессию и начинает получать события в фоновом потоке.</summary>
-    public static DnsEtwSession Start(Action<DnsQueryEvent> onEvent, string name = DefaultSessionName)
+    public static DnsEtwSession Start(Action<DnsQueryEvent> onEvent, string? name = null)
     {
-        var session = new DnsEtwSession(name, onEvent);
+        var session = new DnsEtwSession(name ?? DefaultSessionName, onEvent);
         try
         {
             session.Open();
@@ -72,7 +73,7 @@ internal sealed class DnsEtwSession : IDisposable
     }
 
     /// <summary>Останавливает сессию с этим именем, если она осталась от прошлого запуска.</summary>
-    public static void StopStale(string name = DefaultSessionName) => Control(0, name, EventTraceControlStop);
+    public static void StopStale(string? name = null) => Control(0, name ?? DefaultSessionName, EventTraceControlStop);
 
     private void Open()
     {

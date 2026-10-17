@@ -1,8 +1,11 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Threading.Tasks;
 using KillSwitchLauncher.Models;
 using KillSwitchLauncher.Services;
+using KillSwitchLauncher.ViewModels;
 using Xunit;
 
 namespace KillSwitchLauncher.Tests;
@@ -66,6 +69,42 @@ public class ConnectionFactoryTests
         var c = ConnectionFactory.FromText(SampleConnections.Trojan, existing);
 
         Assert.Equal("Trojan 3", c.Name);
+    }
+
+    [Fact]
+    public void SameConnection_Found_WhateverTheName()
+    {
+        var none = Array.Empty<VpnConnection>();
+        var link = ConnectionFactory.FromText(SampleConnections.VlessReality, none);
+        var wireGuard = ConnectionFactory.FromText(SampleConnections.WireGuard, none);
+        var subscription = ConnectionFactory.FromText("https://sub.example.com/api/v1/client/abc", none);
+        var proxy = ConnectionFactory.LocalProxy("127.0.0.1", "10808", ProxyProtocol.Socks5, none);
+        var existing = new[] { link, wireGuard, subscription, proxy };
+
+        var renamed = SampleConnections.VlessReality[..SampleConnections.VlessReality.IndexOf('#')] + "#Другое";
+        Assert.Same(link, ConnectionFactory.FindSame(ConnectionFactory.FromText(renamed, existing), existing));
+        Assert.Same(wireGuard, ConnectionFactory.FindSame(ConnectionFactory.FromText(SampleConnections.WireGuard, existing, "копия"), existing));
+        Assert.Same(subscription, ConnectionFactory.FindSame(ConnectionFactory.FromText(" https://sub.example.com/api/v1/client/abc ", existing), existing));
+        Assert.Same(proxy, ConnectionFactory.FindSame(ConnectionFactory.LocalProxy(" 127.0.0.1", "10808", ProxyProtocol.Socks5, existing), existing));
+
+        Assert.Null(ConnectionFactory.FindSame(ConnectionFactory.FromText(SampleConnections.Trojan, existing), existing));
+        Assert.Null(ConnectionFactory.FindSame(ConnectionFactory.FromText("https://sub.example.com/api/v1/client/xyz", existing), existing));
+        Assert.Null(ConnectionFactory.FindSame(ConnectionFactory.LocalProxy("127.0.0.1", "10808", ProxyProtocol.Http, existing), existing));
+        Assert.Null(ConnectionFactory.FindSame(link, existing)); // само с собой не сравнивается
+    }
+
+    [Fact]
+    public async Task AddForm_SameConnection_NotAdded_SaysWhichIsThere()
+    {
+        var existing = new List<VpnConnection> { ConnectionFactory.FromText(SampleConnections.Trojan, Array.Empty<VpnConnection>()) };
+        existing[0].Name = "Мой сервер";
+        var added = 0;
+        var form = new AddConnectionViewModel(() => existing, _ => { added++; return Task.CompletedTask; }, new FakeDialogs());
+        form.Text = SampleConnections.Trojan.Replace("#Trojan", "#Другое название");
+
+        Assert.Null(await form.AddAsync());
+        Assert.Equal(0, added);
+        Assert.Equal("Такое подключение уже есть: «Мой сервер».", form.Error);
     }
 
     [Fact]

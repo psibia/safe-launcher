@@ -69,7 +69,10 @@ public sealed class FakeDialogs : IDialogService
     public int ErrorCalls { get; private set; }
     public ActivityLog? ShownLog { get; private set; }
 
-    public string? PickExecutableOrShortcut() => null;
+    /// <summary>Что «выбрано в проводнике» в «Добавить приложение»; null — окно закрыли.</summary>
+    public string? PickedProgram { get; set; }
+
+    public string? PickExecutableOrShortcut() => PickedProgram;
 
     public List<string> Warnings { get; } = new();
 

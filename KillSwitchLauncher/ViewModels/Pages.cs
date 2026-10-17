@@ -13,7 +13,10 @@ public enum MainPage
     App,
 
     /// <summary>Мастер первого запуска.</summary>
-    Welcome
+    Welcome,
+
+    /// <summary>«Добавить приложение»: программы из меню «Пуск» с галочками и выбор в проводнике.</summary>
+    AddApps
 }
 
 /// <summary>Разделы страницы настроек (список слева).</summary>
@@ -25,7 +28,7 @@ public enum SettingsSection
     Protection,
     Window,
     Log,
-    About
+    Updates
 }
 
 /// <summary>Цвет сводки в шапке.</summary>

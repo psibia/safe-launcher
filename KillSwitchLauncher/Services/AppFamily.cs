@@ -100,9 +100,51 @@ public sealed class AppFamily
     /// <summary>Быстрая проверка по имени файла из списка процессов, до открытия самого процесса.</summary>
     public bool HasName(string fileName) => _names.Contains(fileName);
 
+    /// <summary>Имена exe-файлов приложения.</summary>
+    public IReadOnlyCollection<string> Names => _names;
+
+    /// <summary>Папка приложения в разных записях (как задана, с длинными именами, итоговый путь), с завершающим «\».</summary>
+    public IReadOnlyList<string> Roots => _roots;
+
+    /// <summary>Общая программа-«движок» (java, cmd…): по её имени не понять, какое приложение в ней работает.</summary>
+    public static bool IsGenericHost(string fileName) => GenericHosts.Contains(fileName);
+
+    /// <summary>
+    /// Та же программа: общая папка приложения и общее имя exe-файла (например, Discord через Update.exe --processStart
+    /// и сам Discord.exe из папки app-x.y.z).
+    /// </summary>
+    public bool Overlaps(AppFamily other) =>
+        _names.Overlaps(other._names) && _roots.Any(r => other._roots.Contains(r, StringComparer.OrdinalIgnoreCase));
+
     /// <summary>Полный путь к образу процесса лежит в папке приложения.</summary>
     public bool ContainsPath(string imagePath) =>
         _roots.Any(r => imagePath.StartsWith(r, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>
+    /// Программа, которую запускает Squirrel-ярлык (Update.exe --processStart Discord.exe), в самой новой папке app-x.y.z
+    /// рядом с Update.exe. null — ярлык не такой или программы нет.
+    /// </summary>
+    public static string? SquirrelTarget(AppEntry entry)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(entry.ExePath) || GetProcessStartTarget(entry.Arguments) is not { } target)
+                return null;
+            var dir = Path.GetDirectoryName(Path.GetFullPath(entry.ExePath));
+            if (string.IsNullOrEmpty(dir) || !Directory.Exists(dir))
+                return null;
+            return Directory.EnumerateDirectories(dir, "app-*")
+                .Select(d => (Dir: d, Version: ParseSquirrelVersion(Path.GetFileName(d))))
+                .Where(x => x.Version is not null && File.Exists(Path.Combine(x.Dir, target)))
+                .OrderByDescending(x => x.Version)
+                .Select(x => Path.Combine(x.Dir, target))
+                .FirstOrDefault();
+        }
+        catch (Exception)
+        {
+            return null;
+        }
+    }
 
     /// <summary>
     /// Squirrel-программы (Discord, Slack, Teams classic…) при обновлении переезжают в новую папку app-x.y.z,

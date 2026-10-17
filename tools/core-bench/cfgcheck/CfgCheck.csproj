@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Настройки ядра, которые собирает сама служба (CoreConfigBuilder), для шага service-config стенда. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\..\..\SafeLauncher.Service\SafeLauncher.Service.csproj" />
+  </ItemGroup>
+</Project>

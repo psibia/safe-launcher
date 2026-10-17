@@ -224,6 +224,10 @@ internal static class NativeMethods
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool GetExitCodeProcess(SafeHandle hProcess, out uint exitCode);
 
+    /// <summary>Времена процесса (FILETIME, UTC): нужно время создания.</summary>
+    [DllImport("kernel32.dll", SetLastError = true)]
+    public static extern bool GetProcessTimes(SafeHandle hProcess, out long creationTime, out long exitTime, out long kernelTime, out long userTime);
+
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern bool QueryFullProcessImageNameW(SafeHandle hProcess, uint flags,
         [Out] char[] exeName, ref uint size);
@@ -262,4 +266,29 @@ internal static class NativeMethods
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern uint GetFinalPathNameByHandleW(SafeFileHandle file, StringBuilder path, uint bufferLength, uint flags);
+
+    // ---- окна (закрыть приложение, как крестиком)
+
+    public const int WmClose = 0x0010;
+    public const uint GwOwner = 4;
+
+    public delegate bool EnumWindowsProc(IntPtr hwnd, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool EnumWindows(EnumWindowsProc callback, IntPtr lParam);
+
+    [DllImport("user32.dll")]
+    public static extern uint GetWindowThreadProcessId(IntPtr hwnd, out uint processId);
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool IsWindowVisible(IntPtr hwnd);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetWindow(IntPtr hwnd, uint command);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool PostMessageW(IntPtr hwnd, int message, IntPtr wParam, IntPtr lParam);
 }

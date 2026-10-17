@@ -1,0 +1,6 @@
+# Скрипты стенда запускаются в Linux (или WSL2): с CRLF bash их не запустит
+*.sh text eol=lf
+*.py text eol=lf
+*.go text eol=lf
+go.mod text eol=lf
+go.sum text eol=lf

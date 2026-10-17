@@ -32,14 +32,10 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     // Приложения, для которых сейчас запускается журнал DNS перед стартом (повторный клик игнорируется).
     private readonly HashSet<Guid> _dnsLaunching = new();
 
-    // Обновления: результат последней проверки и состояние кнопок в настройках.
-    private UpdateCheckResult? _updateCheck;
     private Dictionary<string, string> _settingsSnapshot = new();
     private bool? _lastIpv6;
+    private string? _keepCoreError;
     private DispatcherTimer? _logTimer;
-    private bool _isUpdateBusy;
-    private string _updateStatusText = "Ещё не проверялось";
-    private bool _closingForUpdate;
 
     // Предупреждение «не удалось взять под полный контроль» показываем один раз на приложение за сеанс.
     private readonly HashSet<Guid> _warnedUncontained = new();
@@ -64,6 +60,10 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     // Приложения, которые сейчас запускаются (подключение, проверка сервера): повторный клик игнорируется.
     private readonly HashSet<Guid> _launching = new();
 
+    // Запущены разово без сети («Запустить без сети»): пока работают, сети у них нет, что бы ни стояло в настройках.
+    private readonly HashSet<Guid> _offlineRuns = new();
+    private readonly CoreAppProcesses _coreProcesses;
+
     // Приложения под системным VPN: их правила адаптеров и защита. Снимок для фонового потока монитора.
     private volatile IReadOnlyList<AdapterApp> _adapterApps = Array.Empty<AdapterApp>();
 
@@ -73,6 +73,11 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
     private sealed record AdapterApp(Guid Id, string Name, VpnRule Rule, bool CloseOnDrop);
 
+    // Приложения с «Через лаунчер»: их условия запуска. Снимок для потока наблюдения трекера (CheckOutsideLaunch).
+    private volatile IReadOnlyDictionary<Guid, OutsideLaunch> _outsideLaunches = new Dictionary<Guid, OutsideLaunch>();
+
+    private sealed record OutsideLaunch(NetworkPlanKind Kind, VpnRule? Rule, string? ConnectionName);
+
     // Проверка подключений: отдельная копия ядра с правами пользователя. Тесты подставляют свою.
     private readonly Func<VpnConnection, Task<ConnectionCheck>> _checkConnection;
 
@@ -81,6 +86,8 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     private SettingsSection _section = SettingsSection.Connection;
     private AppSettingsViewModel? _appPage;
     private WelcomeViewModel? _welcome;
+    private AddAppsViewModel? _addApps;
+    private readonly Func<Task<IReadOnlyList<StartMenuApp>>> _findStartMenuApps;
 
     // Сводка в шапке.
     private string _summaryTitle = "Ничего не запущено";
@@ -107,36 +114,40 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
     // Черновик настроек: переключатели на странице меняют только его, а в силу он вступает по кнопке «Применить».
     private bool _draftKillSwitch;
-    private bool _draftRequireVpn;
-    private bool _draftBlockBypass;
     private bool _draftHideDns;
     private bool _draftStartWithWindows;
     private GlobalNetworkMode _draftNetworkMode;
     private Guid? _draftConnectionId;
     private VpnRuleMode _draftRuleMode;
     private HideBehavior _draftHideBehavior;
+    private OutsideCopies _draftOutsideCopies;
     private readonly List<string> _draftSelected = new();
 
     // Только вид списка, не сохраняется: при каждом запуске выключено.
     private bool _showAllAdapters;
     private bool _isRemovedExpanded;
+    private bool _isRefreshingAdapters;
 
     /// <param name="log">Журнал событий; по умолчанию — в папке настроек. Тесты передают свой.</param>
     /// <param name="updates">Обновления; по умолчанию — обычные пути. Тесты передают свои.</param>
     /// <param name="dnsSource">Источник событий журнала DNS; по умолчанию — Windows. Тесты передают свой.</param>
     /// <param name="coreBackend">Ядро VPN; по умолчанию — служба «Безопасный лаунчер — сеть». Тесты передают своё.</param>
-    /// <param name="checkConnection">Проверка подключения; по умолчанию — отдельной копией ядра. Тесты передают свою.</param>
+    /// <param name="checkConnection">
+    /// Проверка подключения; по умолчанию — отдельной копией ядра, а WireGuard, который уже работает в ядре, — через ядро.
+    /// Тесты передают свою.
+    /// </param>
     /// <param name="guardBackend">Фильтры Windows; по умолчанию — через службу. Тесты передают свои.</param>
     /// <param name="systemProxy">Чтение системного прокси; по умолчанию — из реестра. Тесты передают своё.</param>
+    /// <param name="startMenuApps">Программы из меню «Пуск»; по умолчанию — ярлыки обоих меню (в фоне). Тесты передают свои.</param>
     public MainViewModel(SettingsStorage storage, IDialogService dialogs, Dispatcher dispatcher,
         ActivityLog? log = null, UpdateService? updates = null,
         Func<Action<DnsQueryEvent>, Task<IDnsEventSource>>? dnsSource = null,
         Func<ICoreBackend>? coreBackend = null,
         Func<VpnConnection, Task<ConnectionCheck>>? checkConnection = null,
         Func<IGuardBackend>? guardBackend = null,
-        Func<LocalProxy?>? systemProxy = null)
+        Func<LocalProxy?>? systemProxy = null,
+        Func<Task<IReadOnlyList<StartMenuApp>>>? startMenuApps = null)
     {
-        _checkConnection = checkConnection ?? (c => new ConnectionTester().CheckAsync(ConnectionOutbound.Resolve(c).Outbound));
         _log = log ?? new ActivityLog();
         _updates = updates ?? new UpdateService();
         _dns = new DnsMonitor(_tracker.TryGetOwner, dnsSource);
@@ -144,8 +155,23 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         _dialogs = dialogs;
         _dispatcher = dispatcher;
         _settings = storage.Load();
+        if (storage.LoadProblem is { } loadProblem)
+        {
+            TechLog.Error(LogAreas.Settings, LogCodes.SettingsChange, $"Настройки не прочитаны ({storage.FilePath}): {loadProblem}. Сохранение отключено");
+            _dispatcher.BeginInvoke(() => _dialogs.ShowError(
+                $"Не удалось прочитать настройки: {loadProblem}\n\n{storage.FilePath}\n\n" +
+                "Файл занят другой программой или к нему нет доступа. Лаунчер открыт с пустыми настройками и не сохранит их, " +
+                "чтобы не затереть ваши. Закройте лаунчер и откройте его снова."));
+        }
+        _findStartMenuApps = startMenuApps ?? (() => Task.Run(StartMenuApps.Find));
         ApplyLogSettings();
-        _network = new LauncherNetwork(_tracker, coreBackend ?? (() => new ServiceCoreBackend(ResolveCoreTag)));
+        _coreProcesses = new CoreAppProcesses(_tracker);
+        _network = new LauncherNetwork(_coreProcesses, coreBackend ?? (() => new ServiceCoreBackend(ResolveCoreTag)));
+        _checkConnection = checkConnection ?? (c =>
+        {
+            var server = ConnectionOutbound.Resolve(c).Outbound;
+            return new ConnectionTester().CheckAsync(server, _network.CheckRouteFor(server));
+        });
         _guard = new VpnGuard(guardBackend ?? (() => new ServiceGuardBackend()));
         _proxy = new SystemProxyWatcher(systemProxy);
 
@@ -157,14 +183,14 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         AddConnection = new AddConnectionViewModel(() => _settings.Connections, c => AddConnectionAsync(c, makeDefault: false), _dialogs);
         RebuildConnections();
 
-        AddAppCommand = new RelayCommand(AddApp);
+        AddAppCommand = new RelayCommand(OpenAddApps);
         ApplySettingsCommand = new RelayCommand(() => ApplySettings());
         CancelSettingsCommand = new RelayCommand(() =>
         {
             ResetDraft();
             StatusMessage = "Изменения настроек отменены";
         });
-        RefreshAdaptersCommand = new RelayCommand(() => ApplySnapshot(_monitor!.Evaluate()));
+        RefreshAdaptersCommand = new RelayCommand(RefreshAdapters);
         OpenSettingsCommand = new RelayCommand(p => OpenSettings(p is string section && Enum.TryParse<SettingsSection>(section, out var s) ? s : null));
         BackCommand = new RelayCommand(() => GoBack());
         ShowSectionCommand = new RelayCommand(p =>
@@ -173,8 +199,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
                 Section = s;
         });
         ToggleSummaryCommand = new RelayCommand(() => IsSummaryOpen = !IsSummaryOpen);
-        UpdateActionCommand = new RelayCommand(OnUpdateAction);
-        ShowChangelogCommand = new RelayCommand(ShowChangelog);
+        CreateUpdateCommands();
         ShowLogCommand = new RelayCommand(() => _dialogs.ShowActivityLog(_log, this));
         CreateLogCommands();
         ShowHideDnsInfoCommand = new RelayCommand(() => _dialogs.ShowInfo(HideDnsExplanation, "Скрытие DNS-запросов"));
@@ -189,12 +214,15 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
                 _dns.SetTracking(entry.Id, entry.Name, true);
         }
 
+        // Перестановка плиток перетаскиванием: порядок сохраняется в settings.Apps.
+        Home = new HomeBoardViewModel(_settings, Apps, SaveSettings);
+
         _dns.StateChanged += (_, _) => _dispatcher.BeginInvoke(RefreshDnsState);
         _dns.SourceLost += (_, _) => _dispatcher.BeginInvoke(OnDnsSourceLost);
 
-        // Без лаунчера защита не работает: приложения, которые закрываются вместе с ним (ClosesWithLauncher),
-        // закроются и при его аварийном завершении.
-        ApplyNetworkSettings();
+        // Без лаунчера защита не работает: приложения закрываются вместе с ним, в том числе при его аварийном завершении.
+        _tracker.LaunchCheck = CheckOutsideLaunch;
+        ApplyNetworkSettings("открыт лаунчер");
         _tracker.Changed += (_, _) =>
         {
             _network.OnProcessesChanged();
@@ -214,7 +242,10 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             WarnAboutSystemProxy();
         });
         _tracker.RelaunchBlocked += (_, name) => _dispatcher.BeginInvoke(() => OnRelaunchBlocked(name));
+        _tracker.OutsideLaunched += (appId, contained) => _dispatcher.BeginInvoke(() => OnOutsideLaunched(appId, contained));
+        _tracker.OutsideRejected += (name, reason) => _dispatcher.BeginInvoke(() => OnOutsideRejected(name, reason));
         _network.CoreLost += (reason, report) => _dispatcher.BeginInvoke(() => OnCoreLost(reason, report));
+        _network.CoreRecovered += (reason, apps) => _dispatcher.BeginInvoke(() => OnCoreRecovered(reason, apps));
         _network.ConnectionDown += info => _dispatcher.BeginInvoke(() => OnConnectionDown(info));
         _network.ConnectionUp += (_, name) => _dispatcher.BeginInvoke(() => OnConnectionUp(name));
         _network.ProbeFailed += failure => _dispatcher.BeginInvoke(() => _ = OnProbeFailedAsync(failure));
@@ -226,6 +257,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         _monitor.StatusChanged += OnVpnStatusChanged;
         _monitor.Start();
         ApplySnapshot(_monitor.Current);
+        SubmitGuard(); // фильтры приложений с «Через лаунчер» действуют с открытия лаунчера, даже если ничего не запущено
 
         // Запись автозапуска указывает на эту копию лаунчера (после переустановки в другую папку — тоже).
         if (_settings.StartWithWindows)
@@ -238,6 +270,9 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         _log.Add(LogKind.Info, $"Лаунчер {UpdateService.Format(UpdateService.CurrentVersion)} запущен · " +
                                     (_monitor.Current.IsConnected ? $"VPN подключён ({DescribeActive(_monitor.Current)})" : "VPN не подключён") +
                                     (_settings.KillSwitchEnabled ? string.Empty : " · Kill-Switch выключен"));
+        foreach (var names in RepeatedApps())
+            _log.Add(LogKind.Info, $"Одна программа добавлена несколько раз: {names}. Ядро VPN узнаёт приложение по программе, поэтому " +
+                                   "её копия, открытая мимо лаунчера, пойдёт через подключение одного из них. Лишние удалите через меню плитки.");
         if (TechLog.Previous is { } previous)
             _log.Add(LogKind.Failed, $"Прошлый сеанс лаунчера завершился аварийно ({(previous.CrashUtc ?? previous.StartUtc).ToLocalTime():HH:mm}): " +
                                      (previous.CrashType ?? "лаунчер закрыли принудительно или выключилось питание"));
@@ -283,8 +318,6 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
     /// <summary>Форма «Добавить подключение» в настройках.</summary>
     public AddConnectionViewModel AddConnection { get; }
-    public ICommand UpdateActionCommand { get; }
-    public ICommand ShowChangelogCommand { get; }
     public ICommand ShowLogCommand { get; }
 
     /// <summary>«Как это работает и на что влияет» у «Скрывать DNS-запросы».</summary>
@@ -292,35 +325,6 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
     /// <summary>Окно должно закрыться (лаунчер обновляется). Всегда в UI-потоке.</summary>
     public event EventHandler? ShutdownRequested;
-
-    // ---------------------------------------------------------------- обновления: свойства
-
-    public string AppVersionText => $"v{UpdateService.Format(UpdateService.CurrentVersion)}";
-
-    public string UpdateStatusText
-    {
-        get => _updateStatusText;
-        private set => SetField(ref _updateStatusText, value);
-    }
-
-    public bool IsUpdateAvailable => _updateCheck?.IsUpdateAvailable == true;
-
-    /// <summary>Для кнопки «Проверить»: видна, пока обновления нет.</summary>
-    public bool IsUpdateNotAvailable => !IsUpdateAvailable;
-
-    /// <summary>Кнопки обновления недоступны, пока идёт проверка или загрузка.</summary>
-    public bool CanUseUpdates => !_isUpdateBusy;
-
-    private bool IsUpdateBusy
-    {
-        get => _isUpdateBusy;
-        set
-        {
-            if (_isUpdateBusy == value) return;
-            _isUpdateBusy = value;
-            OnPropertyChanged(nameof(CanUseUpdates));
-        }
-    }
 
     public bool IsVpnConnected
     {
@@ -361,6 +365,9 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
     public bool HasNoApps => Apps.Count == 0;
 
+    /// <summary>Перестановка плиток главного экрана.</summary>
+    public HomeBoardViewModel Home { get; }
+
     // ---------------------------------------------------------------- страницы
 
     public MainPage CurrentPage
@@ -373,6 +380,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             OnPropertyChanged(nameof(IsSettingsOpen));
             OnPropertyChanged(nameof(IsAppPage));
             OnPropertyChanged(nameof(IsWelcomePage));
+            OnPropertyChanged(nameof(IsAddAppsPage));
             IsSummaryOpen = false;
             if (value == MainPage.Settings && Section == SettingsSection.Connections)
                 AddConnection.OfferClipboard();
@@ -382,6 +390,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     public bool IsAppsPage => CurrentPage == MainPage.Apps;
     public bool IsAppPage => CurrentPage == MainPage.App;
     public bool IsWelcomePage => CurrentPage == MainPage.Welcome;
+    public bool IsAddAppsPage => CurrentPage == MainPage.AddApps;
 
     /// <summary>Открыта страница настроек. Закрытие с неприменёнными изменениями спрашивает, применить ли их.</summary>
     public bool IsSettingsOpen
@@ -390,7 +399,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         set
         {
             if (value)
-                Navigate(MainPage.Settings);
+                OpenSettings();
             else if (CurrentPage == MainPage.Settings)
                 Navigate(MainPage.Apps);
             OnPropertyChanged(); // кнопка-переключатель «Настройки» в шапке должна показывать настоящее состояние
@@ -408,6 +417,8 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
                 AddConnection.OfferClipboard();
             if (value == SettingsSection.Log)
                 _ = RefreshLogUsageAsync();
+            if (value == SettingsSection.Updates)
+                MarkUpdateSeen();
         }
     }
 
@@ -425,6 +436,13 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         private set => SetField(ref _welcome, value);
     }
 
+    /// <summary>Страница «Добавить приложения»; null — не открыта.</summary>
+    public AddAppsViewModel? AddApps
+    {
+        get => _addApps;
+        private set => SetField(ref _addApps, value);
+    }
+
     /// <summary>Вернуться к плиткам. false — пользователь решил остаться на странице.</summary>
     public bool GoBack() => Navigate(MainPage.Apps);
 
@@ -435,8 +453,8 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             return;
         if (section is { } s)
             Section = s;
-        else if (IsUpdateAvailable)
-            Section = SettingsSection.About; // есть обновление: сразу к нему
+        else if (TakeUpdatePageJump())
+            Section = SettingsSection.Updates; // обновление скачано и проверено: один раз на версию сразу к нему
     }
 
     private bool Navigate(MainPage target)
@@ -495,6 +513,22 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
                 FinishWelcome();
                 return true;
 
+            case MainPage.AddApps when AddApps is { } addApps:
+                var chosen = addApps.List.Selected;
+                if (chosen.Count > 0)
+                {
+                    var answer = _dialogs.AskSave("Добавить отмеченные приложения?", $"Отмечено: {chosen.Count}. Они ещё не добавлены в лаунчер.", "Добавить");
+                    if (answer is null)
+                        return false;
+                    AddApps = null;
+                    if (answer == true)
+                        AddStartMenuApps(chosen);
+                    return true;
+                }
+
+                AddApps = null;
+                return true;
+
             default:
                 return true;
         }
@@ -503,29 +537,16 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     /// <summary>На странице есть изменения, которые ещё не применены.</summary>
     public bool HasPendingChanges =>
         _draftKillSwitch != _settings.KillSwitchEnabled ||
-        _draftRequireVpn != _settings.RequireVpn ||
         _draftNetworkMode != _settings.NetworkMode ||
         _draftNetworkMode == GlobalNetworkMode.LauncherConnection && _draftConnectionId != _settings.ConnectionId ||
         _draftRuleMode != _settings.RuleMode ||
         _draftHideBehavior != _settings.HideBehavior ||
-        _draftBlockBypass != _settings.BlockBypass ||
+        _draftOutsideCopies != _settings.OutsideCopies ||
         _draftHideDns != _settings.HideDns ||
         _draftStartWithWindows != _settings.StartWithWindows ||
         !new HashSet<string>(_draftSelected, StringComparer.OrdinalIgnoreCase).SetEquals(_settings.SelectedAdapters) ||
-        HasLogDraftChanges;
-
-    /// <summary>«Не запускать без VPN» для приложений «как в общих» (черновик).</summary>
-    public bool RequireVpn
-    {
-        get => _draftRequireVpn;
-        set
-        {
-            if (_draftRequireVpn == value) return;
-            _draftRequireVpn = value;
-            OnPropertyChanged();
-            OnDraftChanged();
-        }
-    }
+        HasLogDraftChanges ||
+        HasUpdateDraftChanges;
 
     /// <summary>Общее условие запуска: системный VPN или подключение лаунчера (черновик).</summary>
     public GlobalNetworkMode NetworkMode
@@ -583,10 +604,8 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             // Выключение защиты — только после явного подтверждения, чтобы не выключить её случайным кликом.
             if (!value && _settings.KillSwitchEnabled && !_dialogs.Confirm(
                     "Выключить Kill-Switch?",
-                    _draftBlockBypass
-                        ? "При обрыве VPN запущенные приложения не будут закрываться. Пока VPN не вернётся, они останутся без сети: " +
-                          "это делает «Блокировать трафик мимо VPN»."
-                        : "При обрыве VPN запущенные приложения продолжат работать без защиты. Это может привести к утечке данных.",
+                    "При обрыве VPN запущенные приложения не будут закрываться: пока VPN не вернётся, они останутся без сети. " +
+                    "Запросы, которые за них делает Windows (имена сайтов, фоновые загрузки), в это время могут идти мимо VPN.",
                     "Выключить",
                     destructive: true))
             {
@@ -604,27 +623,14 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     /// <summary>Для заметного предупреждения на главном экране, раз сам переключатель спрятан в настройках.</summary>
     public bool IsKillSwitchOff => !_settings.KillSwitchEnabled;
 
-    /// <summary>«Блокировать трафик мимо VPN» (черновик). Выключение — только после подтверждения.</summary>
-    public bool BlockBypass
+    /// <summary>«Приложения, открытые не из лаунчера» (черновик): через лаунчер, через VPN, без интернета или напрямую.</summary>
+    public OutsideCopies OutsideCopies
     {
-        get => _draftBlockBypass;
+        get => _draftOutsideCopies;
         set
         {
-            if (_draftBlockBypass == value) return;
-            if (!value && _settings.BlockBypass && !_dialogs.Confirm(
-                    "Выключить блокировку трафика мимо VPN?",
-                    "Без неё программа приложения сможет сама выбрать обычное подключение к интернету в обход VPN. Так делают, " +
-                    "например, браузеры и мессенджеры для звонков (WebRTC): собеседник или сайт узнает ваш настоящий адрес.\n\n" +
-                    "Выключайте, только если из-за блокировки приложению не хватает сети: например, ему нужны принтер или другие " +
-                    "устройства в домашней сети.",
-                    "Выключить",
-                    destructive: true))
-            {
-                _dispatcher.BeginInvoke(() => OnPropertyChanged(nameof(BlockBypass)));
-                return;
-            }
-
-            _draftBlockBypass = value;
+            if (_draftOutsideCopies == value) return;
+            _draftOutsideCopies = value;
             OnPropertyChanged();
             OnDraftChanged();
         }
@@ -654,21 +660,26 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         "Зачем. Чтобы открыть сайт, программа сначала спрашивает его адрес по имени (DNS). В Windows эти вопросы за все " +
         "программы задаёт одна системная служба, поэтому по ним нельзя понять, какая программа спрашивает. Без этой " +
         "настройки трафик приложений идёт через VPN, но имена сайтов, которые они открывают, может видеть провайдер.\n\n" +
-        "Как работает. Пока работает приложение лаунчера:\n" +
-        "• с подключением лаунчера — на эти вопросы отвечает лаунчер условными адресами (198.18.x.x), а настоящий адрес " +
+        "Как работает:\n" +
+        "• с подключением лаунчера — пока работает его ядро VPN (а оно работает, пока открыт лаунчер, если хоть одно " +
+        "приложение идёт через подключение лаунчера), на эти вопросы отвечает лаунчер условными адресами (198.18.x.x), а настоящий адрес " +
         "ищется при соединении: для приложений лаунчера — через VPN, для остальных программ — как обычно;\n" +
-        "• с системным VPN — эти вопросы Windows и сами приложения лаунчера задают только через VPN (если у VPN указан " +
+        "• с системным VPN — пока работает приложение лаунчера, эти вопросы Windows и сами приложения лаунчера задают только через VPN (если у VPN указан " +
         "свой DNS-сервер). Другие программы, которые ищут адреса сами, не ограничиваются: так ваша VPN-программа " +
         "находит свой сервер.\n\n" +
         "На что влияет. Это настройка на весь компьютер, а не только на приложения лаунчера:\n" +
-        "• другие программы тоже получают условные адреса или ищут имена через VPN, пока работает приложение лаунчера, " +
+        "• другие программы тоже получают условные адреса или ищут имена через VPN, пока это действует, " +
         "если спрашивают их у Windows (так делает большинство программ);\n" +
         "• команды ping и nslookup покажут адреса 198.18.x.x — это нормально;\n" +
         "• если у VPN нет своего DNS-сервера, лаунчер DNS не ограничивает, чтобы имена не перестали находиться;\n" +
         "• с системным VPN: если связь VPN оборвалась, а его адаптер остался включённым, имена сайтов не будут находиться " +
         "на всём компьютере, пока работает приложение лаунчера. Если ваша VPN-программа после обрыва не может " +
-        "переподключиться, закройте это приложение или выключите настройку.\n\n" +
-        "После закрытия приложений лаунчер очищает кэш DNS Windows, и всё работает как без него.";
+        "переподключиться, закройте это приложение или выключите настройку;\n" +
+        "• если одновременно работают ядро лаунчера и приложение под системным VPN, это приложение может не открывать сайты: " +
+        "условный адрес 198.18.x.x ведёт в ядро, а ему разрешена сеть только через VPN. Тогда выключите настройку или " +
+        "переведите приложение на подключение лаунчера.\n\n" +
+        "Когда это перестаёт действовать (выключено ядро или закрыты приложения под системным VPN), лаунчер очищает " +
+        "кэш DNS Windows, и всё работает как без него.";
 
     /// <summary>«Запускать вместе с Windows» (черновик).</summary>
     public bool StartWithWindows
@@ -745,18 +756,22 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             if (!SetField(ref _showAllAdapters, value)) return;
             RememberAdapters(_monitor.Current);
             SyncAdapters(_monitor.Current);
-            OnPropertyChanged(nameof(ShowOtherGroup));
-            OnPropertyChanged(nameof(AllAdaptersToggleText));
+            OnPropertyChanged(nameof(OtherToggleText));
         }
     }
 
-    /// <summary>Группа «Другие адаптеры» видна только при «Показывать все адаптеры».</summary>
-    public bool ShowOtherGroup => ShowAllAdapters && OtherAdapters.Count > 0;
+    /// <summary>Есть адаптеры, не похожие на VPN: группа «Другие адаптеры» (список раскрывается <see cref="ShowAllAdapters"/>).</summary>
+    public bool HasOtherAdapters => OtherAdapters.Count > 0;
 
-    /// <summary>Кнопка под списком: «Развернуть: все адаптеры (ещё 5)» / «Свернуть».</summary>
-    public string AllAdaptersToggleText => ShowAllAdapters
-        ? "Свернуть"
-        : OtherAdapters.Count > 0 ? $"Развернуть: все адаптеры (ещё {OtherAdapters.Count})" : "Развернуть: все адаптеры";
+    /// <summary>Кнопка справа от «Другие адаптеры»: «Показать (5)» / «Скрыть (5)».</summary>
+    public string OtherToggleText => $"{(ShowAllAdapters ? "Скрыть" : "Показать")} ({OtherAdapters.Count})";
+
+    /// <summary>Идёт обновление списка адаптеров: значок кнопки крутится.</summary>
+    public bool IsRefreshingAdapters
+    {
+        get => _isRefreshingAdapters;
+        private set => SetField(ref _isRefreshingAdapters, value);
+    }
 
     public bool HasRemovedAdapters => RemovedAdapters.Count > 0;
 
@@ -787,21 +802,19 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     private void ResetDraft()
     {
         _draftKillSwitch = _settings.KillSwitchEnabled;
-        _draftRequireVpn = _settings.RequireVpn;
-        _draftBlockBypass = _settings.BlockBypass;
         _draftHideDns = _settings.HideDns;
         _draftStartWithWindows = _settings.StartWithWindows;
         _draftNetworkMode = _settings.NetworkMode;
         _draftConnectionId = _settings.ConnectionId;
         _draftRuleMode = _settings.RuleMode;
         _draftHideBehavior = _settings.HideBehavior;
+        _draftOutsideCopies = _settings.OutsideCopies;
         _draftSelected.Clear();
         _draftSelected.AddRange(_settings.SelectedAdapters);
         ResetLogDraft();
+        ResetUpdateDraft();
 
         OnPropertyChanged(nameof(KillSwitchEnabled));
-        OnPropertyChanged(nameof(RequireVpn));
-        OnPropertyChanged(nameof(BlockBypass));
         OnPropertyChanged(nameof(HideDns));
         OnPropertyChanged(nameof(StartWithWindows));
         OnPropertyChanged(nameof(NetworkMode));
@@ -810,6 +823,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         OnPropertyChanged(nameof(DraftConnectionId));
         OnPropertyChanged(nameof(RuleMode));
         OnPropertyChanged(nameof(HideBehavior));
+        OnPropertyChanged(nameof(OutsideCopies));
         OnPropertyChanged(nameof(IsAdapterSelectionEnabled));
         OnDraftChanged();
 
@@ -832,6 +846,16 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             return false;
         }
 
+        if (HasUpdateDraftChanges && NeedsUpdateConnectionSelection)
+        {
+            Section = SettingsSection.Updates;
+            _dialogs.ShowWarning(_settings.Connections.Count == 0
+                    ? "Чтобы скачивать обновления через подключение лаунчера, сначала добавьте подключение в разделе «Подключения лаунчера»."
+                    : "Выберите подключение, через которое скачивать обновления.",
+                "Подключение не выбрано");
+            return false;
+        }
+
         if (!ConfirmLogDraft())
             return false;
 
@@ -840,12 +864,9 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
                           !new HashSet<string>(_draftSelected, StringComparer.OrdinalIgnoreCase).SetEquals(_settings.SelectedAdapters);
         var modeChanged = _draftNetworkMode != _settings.NetworkMode ||
                           _draftNetworkMode == GlobalNetworkMode.LauncherConnection && _draftConnectionId != _settings.ConnectionId;
-        var requireChanged = _draftRequireVpn != _settings.RequireVpn;
-        var bypassChanged = _draftBlockBypass != _settings.BlockBypass;
         var hideDnsChanged = _draftHideDns != _settings.HideDns;
+        var outsideChanged = _draftOutsideCopies != _settings.OutsideCopies;
         var autoStartChanged = _draftStartWithWindows != _settings.StartWithWindows;
-        var running = AffectedRunningApps(a => a.Network.Mode == AppNetworkMode.Inherit);
-        var coreRunning = AffectedRunningApps(a => NetworkPlan.For(a, _settings).UsesLauncherCore);
         if (autoStartChanged && !TrySetAutoStart(_draftStartWithWindows))
         {
             _draftStartWithWindows = _settings.StartWithWindows;
@@ -854,8 +875,6 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         }
 
         _settings.KillSwitchEnabled = _draftKillSwitch;
-        _settings.RequireVpn = _draftRequireVpn;
-        _settings.BlockBypass = _draftBlockBypass;
         _settings.HideDns = _draftHideDns;
         _settings.StartWithWindows = _draftStartWithWindows;
         _settings.NetworkMode = _draftNetworkMode;
@@ -863,11 +882,15 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             _settings.ConnectionId = _draftConnectionId;
         _settings.RuleMode = _draftRuleMode;
         _settings.HideBehavior = _draftHideBehavior;
+        _settings.OutsideCopies = _draftOutsideCopies;
         _settings.SelectedAdapters = new List<string>(_draftSelected);
         ApplyLogDraft();
+        ApplyUpdateDraft();
+        // Сначала общее правило монитора, потом правила приложений: если по новому правилу VPN не подключён, итог по
+        // приложениям (кого закрыл Kill-Switch) сообщается последним.
+        _monitor.SetRule(BuildRule());
         ApplyNetworkSettings();
-        if (!_settings.KillSwitchEnabled)
-            _tracker.StopBlocking();
+        UnblockWithoutKillSwitch();
         SaveSettings();
 
         OnPropertyChanged(nameof(IsKillSwitchOff));
@@ -876,12 +899,16 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
         if (killSwitchChanged)
             _log.Add(LogKind.Info, _settings.KillSwitchEnabled ? "Kill-Switch включён" : "Kill-Switch выключен");
-        if (requireChanged)
-            _log.Add(LogKind.Info, _settings.RequireVpn ? "«Не запускать без VPN» включено" : "«Не запускать без VPN» выключено");
-        if (bypassChanged)
-            _log.Add(LogKind.Info, _settings.BlockBypass ? "Блокировка трафика мимо VPN включена" : "Блокировка трафика мимо VPN выключена");
         if (hideDnsChanged)
-            _log.Add(LogKind.Info, _settings.HideDns ? "Скрытие DNS-запросов включено (на весь компьютер, пока работают приложения лаунчера)" : "Скрытие DNS-запросов выключено");
+            _log.Add(LogKind.Info, _settings.HideDns ? "Скрытие DNS-запросов включено (на весь компьютер, пока открыт лаунчер)" : "Скрытие DNS-запросов выключено");
+        if (outsideChanged)
+            _log.Add(LogKind.Info, "Приложения, открытые не из лаунчера: " + _settings.OutsideCopies switch
+            {
+                OutsideCopies.Block => "без интернета",
+                OutsideCopies.Allow => "напрямую",
+                OutsideCopies.Launcher => "через лаунчер",
+                _ => "через VPN"
+            });
         if (autoStartChanged)
             _log.Add(LogKind.Info, _settings.StartWithWindows ? "Лаунчер будет запускаться вместе с Windows" : "Автозапуск лаунчера выключен");
         if (modeChanged)
@@ -902,19 +929,15 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         else
         {
             StatusMessage = "Настройки применены";
-            Toast("Настройки применены", DescribeRule(), GlyphCheck, ToastKind.Success);
+            Toast("Настройки применены", _settings.NetworkMode == GlobalNetworkMode.LauncherConnection ? "Общее условие: " + DescribeGlobal() : DescribeRule(),
+                GlyphCheck, ToastKind.Success);
         }
 
-        // Новое правило проверяется сразу; если VPN по нему не подключён, сработает обычная логика обрыва.
-        _monitor.SetRule(BuildRule());
+        // Новое правило проверяется сразу; если VPN по нему не подключён, сработает обычная логика обрыва (CheckRuleChange).
+        // Условия запуска, «Скрывать DNS-запросы» и копии мимо лаунчера тоже действуют сразу, и для работающих приложений:
+        // ядро перезапускается (ApplyNetworkSettings → KeepCoreRunning), фильтры Windows меняются.
         RefreshRunningCounts();
 
-        if (modeChanged && running.Count > 0)
-            _dialogs.ShowWarning($"Работающие приложения ({string.Join(", ", running)}) продолжат идти так же, как раньше. " +
-                                 "Новое условие запуска подействует, когда их перезапустят из лаунчера.", "Нужен перезапуск");
-        else if (hideDnsChanged && coreRunning.Count > 0)
-            _dialogs.ShowWarning($"Для приложений через подключение лаунчера ({string.Join(", ", coreRunning)}) новое значение " +
-                                 "«Скрывать DNS-запросы» подействует, когда их перезапустят из лаунчера.", "Нужен перезапуск");
         return true;
     }
 
@@ -923,12 +946,17 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         ? $"подключение лаунчера «{_settings.Connections.FirstOrDefault(c => c.Id == _settings.ConnectionId)?.Name ?? "не выбрано"}»"
         : "системный VPN";
 
-    /// <summary>Работающие приложения, которых касается изменение (их сеть поменяется только после перезапуска).</summary>
+    /// <summary>Работающие приложения, которых касается изменение.</summary>
     private List<string> AffectedRunningApps(Func<AppEntry, bool> affected)
     {
+        // Запущенные разово без сети настройки сети не касаются.
         var running = new HashSet<Guid>(_tracker.RunningApps());
+        running.ExceptWith(_offlineRuns);
         return _settings.Apps.Where(a => running.Contains(a.Id) && affected(a)).Select(a => a.Name).ToList();
     }
+
+    /// <summary>Сетевые условия приложения с учётом разового запуска без сети.</summary>
+    private NetworkPlan PlanFor(AppEntry entry) => NetworkPlan.For(entry, _settings, _offlineRuns.Contains(entry.Id));
 
     private string DescribeRule() => _settings.RuleMode switch
     {
@@ -978,7 +1006,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     }
 
     /// <param name="report">Что закрыл Kill-Switch; null — закрывать было некого.</param>
-    /// <param name="unprotected">Работающие приложения без «Закрывать при обрыве»: остались без VPN.</param>
+    /// <param name="unprotected">Работающие приложения без «Закрывать при обрыве»: ждут VPN без сети.</param>
     private void OnVpnLost(KillReport? report, IReadOnlyList<string> unprotected)
     {
         var time = DateTime.Now.ToString("HH:mm:ss");
@@ -988,7 +1016,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             subtitle = (report.Killed.Count > 0 ? "Kill-Switch закрыл: " + string.Join(", ", report.Killed) : "Kill-Switch не смог закрыть приложения") +
                        (report.Failed.Count > 0 ? " · не закрылись: " + string.Join(", ", report.Failed) : string.Empty);
         else if (unprotected.Count > 0)
-            subtitle = (_settings.BlockBypass ? "Ждут VPN без сети: " : "Работают без VPN: ") + string.Join(", ", unprotected);
+            subtitle = "Ждут VPN без сети: " + string.Join(", ", unprotected);
         else
             subtitle = "Запущенных приложений не было";
 
@@ -998,17 +1026,17 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         _log.Add(LogKind.VpnDown, $"VPN отключён: {_monitor.Current.Explanation}" +
                                        (unprotected.Count > 0
                                            ? " · не закрывались (Kill-Switch выключен): " + string.Join(", ", unprotected) +
-                                             (_settings.BlockBypass ? " — сеть для них закрыта, пока VPN не вернётся" : string.Empty)
+                                             " — сеть для них закрыта, пока VPN не вернётся"
                                            : string.Empty));
         if (report is { Killed.Count: > 0 })
             _log.Add(LogKind.Closed, $"Kill-Switch закрыл: {string.Join(", ", report.Killed)}");
         if (report is { Failed.Count: > 0 })
-            _log.Add(LogKind.Failed, $"Не удалось закрыть, работают без VPN: {string.Join(", ", report.Failed)}");
+            _log.Add(LogKind.Failed, $"Не удалось закрыть, ждут VPN без сети: {string.Join(", ", report.Failed)}");
 
         // Отдельный диалог — только если что-то закрыть не удалось: это требует действий пользователя.
         if (report is { Failed.Count: > 0 })
         {
-            var text = "Эти приложения продолжают работать без VPN. Закройте их вручную:\n\n" + string.Join("\n", report.Failed);
+            var text = "Эти приложения не удалось закрыть. Пока VPN не вернётся, они без сети. Закройте их вручную:\n\n" + string.Join("\n", report.Failed);
             if (report.Killed.Count > 0)
                 text += "\n\nЗакрыто: " + string.Join(", ", report.Killed);
             _dialogs.ShowWarning(text, "Не все приложения закрыты");
@@ -1018,15 +1046,30 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     /// <summary>Ядро VPN упало или пропала служба: приложения через подключения лаунчера уже закрыты.</summary>
     private void OnCoreLost(string reason, KillReport report)
     {
-        var subtitle = report.Killed.Count > 0
-            ? "Закрыты: " + string.Join(", ", report.Killed)
-            : "Запущенных приложений не было";
+        var parts = new List<string>();
+        if (report.Killed.Count > 0)
+            parts.Add("Закрыты: " + string.Join(", ", report.Killed));
+        if (report.Failed.Count > 0)
+            parts.Add("Не закрылись: " + string.Join(", ", report.Failed));
+        // Закрывать было некого: ядро было нужно копиям приложений, открытым не из лаунчера.
+        var subtitle = parts.Count > 0 ? string.Join(" · ", parts) : "Приложения, открытые не из лаунчера, идут напрямую";
         StatusMessage = $"{DateTime.Now:HH:mm:ss} — {reason} {subtitle}";
         Toast("Подключение лаунчера выключилось", subtitle, GlyphUnlock, ToastKind.Danger, "Выгрузить журналы", () => ShowExport(ExportPeriods.Last15));
         _log.Add(LogKind.VpnDown, reason);
         if (report.Killed.Count > 0)
             _log.Add(LogKind.Closed, $"Закрыты без подключения: {string.Join(", ", report.Killed)}");
         ShowFailedKills(report);
+        RefreshRunningCounts();
+    }
+
+    /// <summary>Ядро упало и запущено заново: приложения были приостановлены и продолжили работу.</summary>
+    private void OnCoreRecovered(string reason, IReadOnlyList<string> apps)
+    {
+        var subtitle = "Продолжили работу: " + string.Join(", ", apps);
+        StatusMessage = $"{DateTime.Now:HH:mm:ss} — {reason} Ядро запущено заново. {subtitle}";
+        Toast("Ядро VPN перезапущено после сбоя", subtitle, GlyphLock, ToastKind.Info, "Выгрузить журналы", () => ShowExport(ExportPeriods.Last15));
+        _log.Add(LogKind.VpnDown, reason);
+        _log.Add(LogKind.VpnUp, $"Ядро VPN запущено заново, приложения продолжили работу: {string.Join(", ", apps)}");
         RefreshRunningCounts();
     }
 
@@ -1053,6 +1096,8 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         var parts = new List<string>();
         if (info.Closed.Killed.Count > 0)
             parts.Add("Закрыты: " + string.Join(", ", info.Closed.Killed));
+        if (info.Closed.Failed.Count > 0)
+            parts.Add("Не закрылись: " + string.Join(", ", info.Closed.Failed));
         if (info.Waiting.Count > 0)
             parts.Add("Ждут сеть: " + string.Join(", ", info.Waiting));
         var subtitle = parts.Count > 0 ? string.Join(" · ", parts) : "Запущенных приложений не было";
@@ -1077,7 +1122,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         if (report.Failed.Count == 0)
             return;
         _log.Add(LogKind.Failed, $"Не удалось закрыть: {string.Join(", ", report.Failed)}");
-        _dialogs.ShowWarning("Эти приложения продолжают работать без защиты. Закройте их вручную:\n\n" + string.Join("\n", report.Failed),
+        _dialogs.ShowWarning("Эти приложения не удалось закрыть. Сети у них нет, но лучше закройте их вручную:\n\n" + string.Join("\n", report.Failed),
             "Не все приложения закрыты");
     }
 
@@ -1085,18 +1130,27 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     /// Сетевые настройки в силу: у каждого приложения своя защита (закрывать ли вместе с лаунчером, идёт ли оно
     /// через ядро), план ядра и правила адаптеров для монитора. Вызывается при запуске и после изменения настроек.
     /// </summary>
-    private void ApplyNetworkSettings()
+    /// <param name="released">Приложение, которое убрали из лаунчера, пока оно работало (см. LauncherNetwork.KeepRunningAsync).</param>
+    private void ApplyNetworkSettings(string trigger = "изменились настройки", Guid? released = null)
     {
+        var previous = _adapterApps;
         var adapterApps = new List<AdapterApp>();
-        foreach (var entry in _settings.Apps)
+        _offlineRuns.IntersectWith(_settings.Apps.Select(a => a.Id));
+        _coreProcesses.SetOffline(_offlineRuns);
+        var plans = _settings.Apps.Select(entry => (Entry: entry, Plan: PlanFor(entry))).ToList();
+        // Условия запуска «Через лаунчер» известны раньше, чем трекер начнёт брать копии под контроль.
+        _outsideLaunches = plans.Where(p => p.Plan.OutsideCopies == OutsideCopies.Launcher)
+            .ToDictionary(p => p.Entry.Id, p => new OutsideLaunch(p.Plan.Kind, p.Plan.AdapterRule, p.Plan.Connection?.Name));
+        foreach (var (entry, plan) in plans)
         {
-            var plan = NetworkPlan.For(entry, _settings);
-            _tracker.SetPolicy(entry, plan.UsesLauncherCore, ClosesWithLauncher(plan));
+            // Без лаунчера нет ни ядра, ни фильтров Windows: приложение закрывается вместе с ним, в том числе при его сбое.
+            _tracker.SetPolicy(entry, plan.UsesLauncherCore, killOnClose: true, adoptOutside: plan.OutsideCopies == OutsideCopies.Launcher);
             if (plan.Kind == NetworkPlanKind.SystemAdapters)
                 adapterApps.Add(new AdapterApp(entry.Id, entry.Name, plan.AdapterRule!, plan.CloseOnDrop));
         }
 
         _adapterApps = adapterApps;
+        CheckRuleChange(previous, adapterApps);
         var ipv6 = CorePlan.DetectIpv6();
         if (ipv6 != _lastIpv6)
         {
@@ -1105,80 +1159,219 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         }
         _network.Update(CorePlan.Build(_settings, ipv6));
         SubmitGuard();
+        KeepCoreRunning(trigger, released);
+    }
+
+    /// <summary>
+    /// Правило VPN поменяли (общее или у приложения), а адаптеры прежние, поэтому монитор ничего не пришлёт. Работающее
+    /// приложение, которому по новому правилу VPN не подключён, обрывается так же, как при отключении VPN (и приложение,
+    /// которое раньше шло не через системный VPN: оно работало с сетью). Приложение, которому VPN теперь хватает, снова можно
+    /// запускать.
+    /// </summary>
+    private void CheckRuleChange(IReadOnlyList<AdapterApp> previous, IReadOnlyList<AdapterApp> current)
+    {
+        if (current.Count == 0 || _monitor is null)
+            return; // при открытии лаунчера монитора ещё нет, а приложения не запущены
+
+        var adapters = _monitor.Current.Adapters;
+        var before = previous.ToDictionary(a => a.Id);
+        var lost = new List<AdapterApp>();
+        foreach (var app in current)
+        {
+            if (VpnMonitor.Apply(app.Rule, adapters).IsConnected)
+            {
+                _tracker.StopBlocking(app.Id);
+                continue;
+            }
+
+            var was = !before.TryGetValue(app.Id, out var old) || VpnMonitor.Apply(old.Rule, adapters).IsConnected;
+            if (was && _tracker.CountFor(app.Id) > 0)
+                lost.Add(app);
+        }
+
+        if (lost.Count == 0)
+            return;
+        var close = lost.Where(a => a.CloseOnDrop).Select(a => a.Id).ToList();
+        var report = close.Count > 0 ? _tracker.KillApps(close, blockRelaunch: true) : new KillReport(Array.Empty<string>(), Array.Empty<string>());
+        var waiting = lost.Where(a => !a.CloseOnDrop).Select(a => a.Name).ToList();
+        TechLog.Info(LogAreas.KillSwitch, LogCodes.KsClose, $"По новому правилу VPN не подключён: закрыты {(report.Killed.Count > 0 ? string.Join(", ", report.Killed) : "никто")}" +
+            (report.Failed.Count > 0 ? $", не удалось закрыть {string.Join(", ", report.Failed)}" : string.Empty) +
+            (waiting.Count > 0 ? $", ждут VPN без сети {string.Join(", ", waiting)}" : string.Empty));
+        _dispatcher.BeginInvoke(() => OnRuleLost(report, waiting));
+    }
+
+    private void OnRuleLost(KillReport report, IReadOnlyList<string> waiting)
+    {
+        var parts = new List<string>();
+        if (report.Killed.Count > 0)
+            parts.Add("Kill-Switch закрыл: " + string.Join(", ", report.Killed));
+        if (report.Failed.Count > 0)
+            parts.Add("Не закрылись: " + string.Join(", ", report.Failed));
+        if (waiting.Count > 0)
+            parts.Add("Ждут VPN без сети: " + string.Join(", ", waiting));
+        var subtitle = parts.Count > 0 ? string.Join(" · ", parts) : "Запущенных приложений не было";
+
+        StatusMessage = $"{DateTime.Now:HH:mm:ss} — по новому правилу VPN не подключён. {subtitle}";
+        Toast("По новому правилу VPN не подключён", subtitle, GlyphUnlock, ToastKind.Danger);
+        _log.Add(LogKind.VpnDown, "По новому правилу VPN не подключён · " + subtitle);
+        ShowFailedKills(report);
+        RefreshRunningCounts();
+    }
+
+    /// <summary>
+    /// Пока в настройках есть приложения через подключение лаунчера, ядро работает всё время, пока открыт лаунчер: тогда
+    /// и копия такого приложения, открытая по ярлыку, сразу идёт как выбрано в «Приложения, открытые не из лаунчера».
+    /// Ядро не запустилось — лаунчер работает дальше, причина в журнале и в уведомлении (одно на одну и ту же причину).
+    /// </summary>
+    private async void KeepCoreRunning(string trigger, Guid? released)
+    {
+        string? error;
+        try
+        {
+            error = await _network.KeepRunningAsync(trigger, released: released is { } app ? new[] { app } : null);
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+        }
+
+        if (error is null || error == _keepCoreError)
+        {
+            _keepCoreError = error;
+            return;
+        }
+
+        _keepCoreError = error;
+        _log.Add(LogKind.Failed, "Ядро VPN не запустилось: " + error + ". Приложения, открытые не из лаунчера, пока идут напрямую. " +
+                                 "Приложения из лаунчера запускаются как обычно: ядро включится при запуске.");
+        // При открытии лаунчера ошибка бывает известна ещё в конструкторе, до того как окно начнёт показывать уведомления.
+        _ = _dispatcher.BeginInvoke(() =>
+            Toast("Ядро VPN не запустилось", "Приложения, открытые не из лаунчера, идут напрямую. Подробности в журнале.", GlyphUnlock, ToastKind.Danger));
     }
 
     // ---------------------------------------------------------------- блокировка трафика мимо VPN
 
-    /// <summary>Нужны ли приложению с такими условиями фильтры Windows (иначе его запуск от них не зависит).</summary>
-    private bool NeedsGuard(NetworkPlan plan) =>
-        plan.Kind == NetworkPlanKind.LauncherConnection && _settings.BlockBypass ||
-        plan.Kind == NetworkPlanKind.SystemAdapters && plan.RequireVpn && (_settings.BlockBypass || _settings.HideDns);
+    /// <summary>
+    /// Пока приложение готовилось к запуску (подключение, проверка сервера, фильтры), его условия запуска могли поменять или
+    /// удалить его подключение. Запускать по прежней подготовке нельзя: ядро и фильтры готовили другое. true — не запускаем,
+    /// пользователь предупреждён.
+    /// </summary>
+    private bool LaunchPlanChanged(AppEntry entry, NetworkPlan prepared)
+    {
+        var plan = PlanFor(entry);
+        if (plan.Kind == prepared.Kind && plan.Connection?.Id == prepared.Connection?.Id && plan.Kind != NetworkPlanKind.MissingConnection)
+            return false;
+
+        TechLog.Warn(LogAreas.App, LogCodes.AppReject, $"«{entry.Name}» не запущено: пока шла подготовка, изменились его условия запуска или подключение");
+        _dialogs.ShowWarning(plan.Kind == NetworkPlanKind.MissingConnection
+                ? $"«{entry.Name}» не запущено: у него больше нет подключения. Выберите подключение в настройках приложения."
+                : $"«{entry.Name}» не запущено: пока оно запускалось, у него изменились условия запуска. Запустите его снова.",
+            "Приложение не запущено");
+        return true;
+    }
 
     /// <summary>
     /// Какие фильтры должны действовать сейчас: работающие (и запускаемые) приложения пускаются в сеть только через свой
-    /// VPN — адаптер ядра или адаптеры системного VPN по их правилу (VPN не подключён — никуда). Приложения под системным VPN
-    /// без «Не запускать без VPN» не ограничиваются: им разрешено работать и без VPN. Только в UI-потоке.
+    /// VPN — адаптер ядра или адаптеры системного VPN по их правилу (VPN не подключён — никуда). Приложения с «Через лаунчер» —
+    /// всё время, пока открыт лаунчер: копия, открытая не из лаунчера, до того как он возьмёт её под контроль, выходит
+    /// в сеть только через VPN приложения. Только в UI-потоке.
     /// </summary>
     private GuardRequest BuildGuardRequest()
     {
         var request = new GuardRequest();
-        if (_monitor is null || !_settings.BlockBypass && !_settings.HideDns)
+        if (_monitor is null)
             return request;
 
         var adapters = _monitor.Current.Adapters;
         var running = new HashSet<Guid>(_tracker.RunningApps());
         running.UnionWith(_guardPending);
         var dns = new SortedSet<int>();
-        var dnsPaths = new List<string>();
-        foreach (var entry in _settings.Apps.Where(a => running.Contains(a.Id)))
+        foreach (var entry in _settings.Apps.Where(a => running.Contains(a.Id) || _tracker.AdoptsCopies(a.Id)))
         {
-            var plan = NetworkPlan.For(entry, _settings);
+            var plan = PlanFor(entry);
+            if (plan.Kind is NetworkPlanKind.Offline or NetworkPlanKind.MissingConnection)
+            {
+                // Ни адаптера ядра, ни адаптеров VPN. Системный прокси другой VPN-программы тоже закрыт: через него трафик ушёл бы в интернет.
+                // Без подключения (его удалили или сменили условие, пока приложение работало или запускалось) — тоже никуда.
+                if (GuardPaths(entry) is { Count: > 0 } offlinePaths)
+                    request.Apps.Add(new GuardRule { Paths = offlinePaths, LoopbackPorts = _proxy.Current?.Ports.ToList() });
+                continue;
+            }
+
             if (plan.Kind == NetworkPlanKind.LauncherConnection)
             {
-                if (_settings.BlockBypass && GuardPaths(entry) is { Count: > 0 } paths)
+                if (GuardPaths(entry) is { Count: > 0 } paths)
                     request.Apps.Add(new GuardRule { Paths = paths, ViaCore = true, LoopbackPorts = ViaLocalProxy(plan) ? null : _proxy.Current?.Ports.ToList() });
                 continue;
             }
 
-            if (plan.Kind != NetworkPlanKind.SystemAdapters || !plan.RequireVpn)
+            if (plan.Kind != NetworkPlanKind.SystemAdapters)
                 continue;
             var snapshot = VpnMonitor.Apply(plan.AdapterRule!, adapters);
             var vpn = snapshot.IsConnected
                 ? adapters.Where(a => a.IsUp && a.Index > 0 && snapshot.ActiveVpnNames.Contains(a.Name, StringComparer.OrdinalIgnoreCase)).ToList()
                 : new List<VpnAdapterInfo>();
-            if (_settings.BlockBypass && GuardPaths(entry) is { Count: > 0 } appPaths)
+            if (GuardPaths(entry) is { Count: > 0 } appPaths)
                 request.Apps.Add(new GuardRule { Paths = appPaths, Interfaces = vpn.Select(a => a.Index).Distinct().ToList() });
-            if (_settings.HideDns)
-            {
+            if (_settings.HideDns && running.Contains(entry.Id))
                 dns.UnionWith(vpn.Where(a => a.HasDns).Select(a => a.Index));
-                // Без блокировки мимо VPN фильтра у приложения нет: его собственный DNS закрывает правило DNS.
-                if (!_settings.BlockBypass)
-                    dnsPaths.AddRange(GuardPaths(entry));
-            }
         }
 
         if (dns.Count > 0)
-        {
             request.DnsInterfaces = dns.ToList();
-            if (dnsPaths.Count > 0)
-                request.DnsPaths = dnsPaths.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
-        }
 
         return request;
     }
 
     /// <summary>
-    /// Программы приложения: его exe, работающие процессы и замеченные раньше за этот сеанс. Пути настоящие
-    /// (<see cref="GuardPath"/>): служба работает в другом сеансе Windows и дисков subst и сетевых дисков пользователя не видит.
+    /// Программы приложения: его exe, работающие процессы и замеченные раньше за этот сеанс. До первого запуска известны и
+    /// программа приложения Store (из его пакета), и программа, которую запускает Squirrel-ярлык (Update.exe → Discord.exe):
+    /// иначе первые секунды после запуска они шли бы без фильтра. Пути настоящие (<see cref="GuardPath"/>): служба работает
+    /// в другом сеансе Windows и дисков subst и сетевых дисков пользователя не видит. Только существующие .exe: другой файл
+    /// (например, временный установщик обновления в задании приложения) служба не примет, и тогда не применился бы весь набор.
     /// </summary>
     private List<string> GuardPaths(AppEntry entry)
     {
-        var paths = new List<string>(_tracker.ImagePaths(entry.Id));
+        // Сначала программы самого приложения: если программ больше, чем примет служба, отбрасываются замеченные давно.
+        var paths = new List<string>();
+        if (entry.IsPackaged)
+        {
+            if (PackagedApps.ExecutablePath(entry.AppUserModelId) is { } packaged)
+                paths.Add(packaged);
+        }
+        else if (!string.IsNullOrWhiteSpace(entry.ExePath) && File.Exists(entry.ExePath))
+        {
+            paths.Add(entry.ExePath);
+            if (AppFamily.SquirrelTarget(entry) is { } target)
+                paths.Add(target);
+        }
+
+        paths.AddRange(_tracker.ImagePaths(entry.Id));
         if (_guardPaths.TryGetValue(entry.Id, out var seen))
             paths.AddRange(seen);
-        if (!entry.IsPackaged && !string.IsNullOrWhiteSpace(entry.ExePath) && File.Exists(entry.ExePath))
-            paths.Add(entry.ExePath);
-        return paths.Select(GuardPath).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+        return paths.Where(IsProgram).Select(GuardPath).Distinct(StringComparer.OrdinalIgnoreCase).Take(MaxGuardPaths).ToList();
+    }
+
+    /// <summary>Сколько программ одного приложения принимает служба.</summary>
+    private const int MaxGuardPaths = 256;
+
+    private static bool IsProgram(string path)
+    {
+        if (!path.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
+            return false;
+        // Сетевой путь служба проверит сама (и не ограничит): обращение к недоступному серверу подвесило бы окно.
+        if (path.StartsWith(@"\\", StringComparison.Ordinal))
+            return true;
+        try
+        {
+            if (Path.GetPathRoot(path) is { Length: > 0 } root && new DriveInfo(root).DriveType == DriveType.Network)
+                return true;
+            return File.Exists(path);
+        }
+        catch (Exception)
+        {
+            return false;
+        }
     }
 
     private static string GuardPath(string path)
@@ -1231,8 +1424,8 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
     /// <summary>
     /// В Windows включён прокси на этом компьютере, а приложения идут через подключение лаунчера: браузеры и многие
-    /// программы отдали бы трафик ему, то есть другой VPN-программе. С «Блокировать трафик мимо VPN» путь к нему закрыт,
-    /// без неё — только предупреждение. Один раз на каждый новый прокси. Только в UI-потоке.
+    /// программы отдали бы трафик ему, то есть другой VPN-программе. Путь к нему закрыт фильтрами, лаунчер только
+    /// сообщает об этом. Один раз на каждый новый прокси. Только в UI-потоке.
     /// </summary>
     private void WarnAboutSystemProxy()
     {
@@ -1244,27 +1437,16 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         }
 
         var running = new HashSet<Guid>(_tracker.RunningApps());
-        if (!_settings.Apps.Any(a => running.Contains(a.Id) && NetworkPlan.For(a, _settings) is { Kind: NetworkPlanKind.LauncherConnection } plan && !ViaLocalProxy(plan)) ||
+        if (!_settings.Apps.Any(a => running.Contains(a.Id) && PlanFor(a) is { Kind: NetworkPlanKind.LauncherConnection } plan && !ViaLocalProxy(plan)) ||
             _warnedProxy == proxy.Display)
             return;
         _warnedProxy = proxy.Display;
 
-        if (_settings.BlockBypass)
-        {
-            _log.Add(LogKind.Info, $"В Windows включён системный прокси {proxy.Display} — обычно его включает другая VPN-программа. " +
-                                   "Приложениям, которые идут через подключение лаунчера, путь к нему закрыт: иначе их трафик ушёл бы мимо подключения. " +
-                                   "Если такое приложение не открывает сайты, выключите системный прокси в той программе.");
-            Toast("Системный прокси закрыт для приложений", $"Прокси {proxy.Display} ведёт мимо подключения. Если сайты не открываются, выключите его в той VPN-программе.",
-                GlyphLock, ToastKind.Info);
-        }
-        else
-        {
-            _log.Add(LogKind.Info, $"В Windows включён системный прокси {proxy.Display} — обычно его включает другая VPN-программа. " +
-                                   "Приложения, которые идут через подключение лаунчера, могут отдавать трафик ему, то есть мимо подключения. " +
-                                   "Выключите системный прокси в той программе или включите «Блокировать трафик мимо VPN».");
-            Toast("Системный прокси ведёт мимо подключения", $"Приложения могут ходить через прокси {proxy.Display}. Выключите его в той VPN-программе.",
-                GlyphUnlock, ToastKind.Danger);
-        }
+        _log.Add(LogKind.Info, $"В Windows включён системный прокси {proxy.Display} — обычно его включает другая VPN-программа. " +
+                               "Приложениям, которые идут через подключение лаунчера, путь к нему закрыт: иначе их трафик ушёл бы мимо подключения. " +
+                               "Если такое приложение не открывает сайты, выключите системный прокси в той программе.");
+        Toast("Системный прокси закрыт для приложений", $"Прокси {proxy.Display} ведёт мимо подключения. Если сайты не открываются, выключите его в той VPN-программе.",
+            GlyphLock, ToastKind.Info);
     }
 
     private void OnGuardFailed(string error)
@@ -1292,23 +1474,12 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     private string? ResolveCoreTag(uint pid) =>
         _tracker.TryGetRoutedOwner((int)pid, out var appId) ? _network.TagFor(appId) : null;
 
-    /// <summary>Приложения, которые закроются вместе с лаунчером (см. <see cref="ClosesWithLauncher"/>).</summary>
+    /// <summary>Приложения, которые закроются вместе с лаунчером: все работающие (фильтры Windows и ядро действуют, только пока он работает).</summary>
     private List<Guid> AppsClosedOnExit()
     {
         var running = new HashSet<Guid>(_tracker.RunningApps());
-        return _settings.Apps
-            .Where(a => running.Contains(a.Id) && ClosesWithLauncher(NetworkPlan.For(a, _settings)))
-            .Select(a => a.Id)
-            .ToList();
+        return _settings.Apps.Where(a => running.Contains(a.Id)).Select(a => a.Id).ToList();
     }
-
-    /// <summary>
-    /// Приложение закрывается вместе с лаунчером, в том числе при его сбое: через подключение лаунчера, с «Закрывать при
-    /// обрыве» или под «Блокировать трафик мимо VPN» — фильтры Windows действуют, только пока лаунчер работает.
-    /// </summary>
-    private bool ClosesWithLauncher(NetworkPlan plan) =>
-        plan.UsesLauncherCore || plan.CloseOnDrop ||
-        plan.Kind == NetworkPlanKind.SystemAdapters && plan.RequireVpn && _settings.BlockBypass;
 
     // ---------------------------------------------------------------- подписки
 
@@ -1345,9 +1516,12 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
                 $"серверов {content.Links.Count}, пропущено {content.Skipped}, список {(changed ? "изменился" : "тот же")}, " +
                 $"выбранный сервер {(connection.SelectedServer == selectedBefore ? "тот же" : "сменился")}");
             SaveSettings();
+            // Строка подключения в настройках показывает список серверов и время обновления: и при автообновлении тоже.
+            Connections.FirstOrDefault(c => ReferenceEquals(c.Connection, connection))?.Refresh();
             if (changed)
             {
                 ApplyNetworkSettings();
+                RebuildConnections();
                 _log.Add(LogKind.Info, $"Подписка «{connection.Name}» обновлена: серверов {content.Links.Count}" +
                                        (content.Skipped > 0 ? $", пропущено {content.Skipped}" : string.Empty));
             }
@@ -1367,6 +1541,87 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         StatusMessage = $"{DateTime.Now:HH:mm:ss} — «{name}» запустилось без VPN и закрыто";
         Toast("Запуск без VPN заблокирован", $"Kill-Switch закрыл «{name}»", GlyphPower, ToastKind.Danger);
         _log.Add(LogKind.Blocked, $"«{name}» запустилось без VPN и сразу закрыто");
+    }
+
+    // ---------------------------------------------------------------- «Через лаунчер»
+
+    /// <summary>
+    /// «Через лаунчер»: можно ли сейчас запустить приложение, копию которого открыли не из лаунчера. Те же условия, что
+    /// у запуска с плитки: VPN по правилу приложения подключён или его подключение работает и сервер не перестал отвечать.
+    /// null — можно, иначе причина. Поток наблюдения трекера.
+    /// </summary>
+    private string? CheckOutsideLaunch(Guid appId)
+    {
+        if (!_outsideLaunches.TryGetValue(appId, out var app))
+            return "условие запуска не известно";
+
+        switch (app.Kind)
+        {
+            case NetworkPlanKind.Offline:
+                return null;
+
+            case NetworkPlanKind.SystemAdapters:
+                return _monitor is { } monitor && VpnMonitor.Apply(app.Rule!, monitor.Current.Adapters).IsConnected ? null : "VPN не подключён";
+
+            case NetworkPlanKind.LauncherConnection:
+                return _network.StateOf(appId) switch
+                {
+                    CoreAppState.Protected => null,
+                    CoreAppState.Waiting => $"сервер подключения «{app.ConnectionName}» не отвечает",
+                    _ => "подключение лаунчера не работает"
+                };
+
+            default:
+                return "у приложения не выбрано подключение";
+        }
+    }
+
+    /// <summary>
+    /// «Через лаунчер»: приложение не работало, его копию открыли не из лаунчера, и лаунчер взял её под контроль, как запуск
+    /// с плитки. Только в UI-потоке.
+    /// </summary>
+    private void OnOutsideLaunched(Guid appId, bool contained)
+    {
+        if (_settings.Apps.FirstOrDefault(a => a.Id == appId) is not { } entry)
+            return;
+
+        // Как и при запуске с плитки: программу, которую служба не смогла ограничить фильтрами (сетевой диск), не запускаем.
+        if (!entry.IsPackaged && _guard.IsUnguarded(GuardPath(entry.ExePath)))
+        {
+            var report = _tracker.Kill(appId);
+            _log.Add(LogKind.Blocked, $"«{entry.Name}» открыто не из лаунчера и закрыто: программа на сетевом диске или недоступна службе лаунчера, " +
+                                      $"блокировку трафика мимо VPN для неё не включить ({entry.ExePath})");
+            Toast("Запуск заблокирован", $"«{entry.Name}» открыто не из лаунчера и закрыто: блокировку трафика мимо VPN для него не включить",
+                GlyphPower, ToastKind.Danger);
+            ShowFailedKills(report);
+            RefreshRunningCounts();
+            return;
+        }
+
+        _dns.NoteLaunch(entry.Id);
+        var plan = PlanFor(entry);
+        var offline = plan.Kind == NetworkPlanKind.Offline;
+        var via = plan.UsesLauncherCore ? $" через «{plan.Connection?.Name}»" : offline ? " без сети" : string.Empty;
+        TechLog.Info(LogAreas.App, LogCodes.AppStarted, $"«{entry.Name}» открыто не из лаунчера и взято под контроль: {DescribeLaunch(entry)}");
+        StatusMessage = $"{DateTime.Now:HH:mm:ss} — запущено не из лаунчера: {entry.Name}{via}";
+        Toast($"Запущено: {entry.Name}",
+            "Открыто не из лаунчера, " + (offline ? "без сети"
+                : plan.UsesLauncherCore ? $"через подключение «{plan.Connection?.Name}»"
+                : !plan.CloseOnDrop ? "Kill-Switch выключен"
+                : "под защитой Kill-Switch"),
+            GlyphPlay, ToastKind.Info);
+        _log.Add(LogKind.Launch, $"Запущено не из лаунчера: {entry.Name}{via}" + (contained ? string.Empty : " · контроль неполный"));
+        if (plan.UsesLauncherCore)
+            WarnAboutSystemProxy();
+        CloseIfLostDuringLaunch(entry, plan);
+    }
+
+    /// <summary>«Через лаунчер»: копию открыли не из лаунчера, когда приложение запускать нельзя, и она закрыта.</summary>
+    private void OnOutsideRejected(string name, string reason)
+    {
+        StatusMessage = $"{DateTime.Now:HH:mm:ss} — «{name}» открыто не из лаунчера и закрыто: {reason}";
+        Toast("Запуск заблокирован", $"«{name}» открыто не из лаунчера и закрыто: {reason}", GlyphPower, ToastKind.Danger);
+        _log.Add(LogKind.Blocked, $"«{name}» открыто не из лаунчера и сразу закрыто: {reason}");
     }
 
     private void Toast(string title, string subtitle, string glyph, ToastKind kind, string? actionText = null, Action? action = null) =>
@@ -1464,10 +1719,33 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         SyncList(OtherAdapters, present.Where(r => !IsPrimary(r.Name, r.IsVpnLike)).ToList(), isPresent: true);
         SyncList(RemovedAdapters, removed, isPresent: false);
 
-        OnPropertyChanged(nameof(ShowOtherGroup));
-        OnPropertyChanged(nameof(AllAdaptersToggleText));
+        OnPropertyChanged(nameof(HasOtherAdapters));
+        OnPropertyChanged(nameof(OtherToggleText));
         OnPropertyChanged(nameof(HasRemovedAdapters));
         OnPropertyChanged(nameof(RemovedToggleText));
+    }
+
+    /// <summary>
+    /// «Обновить список адаптеров». Список обновляется сразу, поэтому значок кнопки делает хотя бы один оборот: видно,
+    /// что нажатие сработало. Потом кнопку можно нажать снова.
+    /// </summary>
+    private async void RefreshAdapters()
+    {
+        if (IsRefreshingAdapters)
+            return;
+        IsRefreshingAdapters = true;
+        try
+        {
+            var started = Stopwatch.StartNew();
+            ApplySnapshot(_monitor!.Evaluate());
+            var rest = 600 - (int)started.ElapsedMilliseconds;
+            if (rest > 0)
+                await Task.Delay(rest);
+        }
+        finally
+        {
+            IsRefreshingAdapters = false;
+        }
     }
 
     private void SyncList(ObservableCollection<VpnAdapterViewModel> target, List<AdapterRow> rows, bool isPresent)
@@ -1552,7 +1830,8 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             new RelayCommand(() => OpenDnsJournal(tile!)),
             new RelayCommand(() => Kill(tile!)),
             new RelayCommand(() => RestartProtected(tile!)),
-            new RelayCommand(() => OpenAppSettings(tile!)));
+            new RelayCommand(() => OpenAppSettings(tile!)),
+            new RelayCommand(() => LaunchOffline(tile!)));
         tile.RunningCount = _tracker.CountFor(entry.Id);
         return tile;
     }
@@ -1566,8 +1845,44 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         return entry.ShortcutPath is { } lnk && File.Exists(lnk) ? IconExtractor.TryGetShortcutIcon(lnk) : null;
     }
 
-    /// <summary>«Добавить приложение»: выбрать файл и открыть страницу нового приложения (условие запуска, защита).</summary>
-    private void AddApp()
+    /// <summary>
+    /// «Добавить приложение»: программы из меню «Пуск» с галочками (уже добавленные отмечены и недоступны)
+    /// и «Выбрать в проводнике» для одной программы.
+    /// </summary>
+    private void OpenAddApps()
+    {
+        if (CurrentPage == MainPage.AddApps || !Navigate(MainPage.Apps))
+            return;
+
+        var list = new StartMenuListViewModel(_findStartMenuApps, exe => IconExtractor.TryGetIcon(exe), IsAdded);
+        AddApps = new AddAppsViewModel(list,
+            add: apps =>
+            {
+                AddApps = null;
+                AddStartMenuApps(apps);
+                GoBack();
+            },
+            browse: BrowseForApp,
+            cancel: () => GoBack());
+        CurrentPage = MainPage.AddApps;
+        _ = list.LoadAsync();
+    }
+
+    /// <summary>Программа из меню «Пуск» уже есть в лаунчере (тот же exe-файл).</summary>
+    private bool IsAdded(StartMenuApp app) =>
+        _settings.Apps.Any(a => !a.IsPackaged && string.Equals(a.ExePath, app.ExePath, StringComparison.OrdinalIgnoreCase));
+
+    /// <summary>Приложение лаунчера с той же программой: тот же exe-файл или та же программа через Squirrel-ярлык.</summary>
+    private AppEntry? FindSameProgram(string exePath, string? arguments)
+    {
+        var family = AppFamily.For(new AppEntry { ExePath = exePath, Arguments = arguments });
+        return _settings.Apps.FirstOrDefault(a => !a.IsPackaged &&
+                                                  (string.Equals(a.ExePath, exePath, StringComparison.OrdinalIgnoreCase) ||
+                                                   family is not null && AppFamily.For(a) is { } other && family.Overlaps(other)));
+    }
+
+    /// <summary>«Выбрать в проводнике»: одна программа, и сразу её страница (условие запуска, защита).</summary>
+    private void BrowseForApp()
     {
         var path = _dialogs.PickExecutableOrShortcut();
         if (path is null) return;
@@ -1575,7 +1890,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     }
 
     /// <summary>
-    /// Файлы, перетащенные в окно (или выбранные в «Добавить приложение»). Один — открываем его страницу, чтобы
+    /// Файлы, перетащенные в окно (или программа, выбранная в проводнике в «Добавить приложение»). Один — открываем его страницу, чтобы
     /// сразу выбрать условие запуска; несколько — добавляем «как в общих», настроить можно потом.
     /// </summary>
     public void AddFromPaths(IEnumerable<string> paths)
@@ -1621,7 +1936,12 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         OnPropertyChanged(nameof(HasNoApps));
         Toast(added.Count == 1 ? "Приложение добавлено" : $"Добавлено приложений: {added.Count}",
             string.Join(", ", added), GlyphAdd, ToastKind.Info);
+        RebuildConnections(); // подписи «Основное · …» у подключений
         RefreshRunningCounts();
+
+        // Перетащили на страницу «Добавить приложения»: её список уже устарел, возвращаемся к плиткам.
+        if (CurrentPage == MainPage.AddApps)
+            GoBack();
     }
 
     /// <summary>
@@ -1687,14 +2007,16 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             return null;
         }
 
-        var duplicate = appUserModelId is not null
-            ? _settings.Apps.Any(a => string.Equals(a.AppUserModelId, appUserModelId, StringComparison.OrdinalIgnoreCase))
-            : _settings.Apps.Any(a => !a.IsPackaged
-                                      && string.Equals(a.ExePath, exePath, StringComparison.OrdinalIgnoreCase)
-                                      && string.Equals(a.Arguments ?? "", arguments ?? "", StringComparison.Ordinal));
-        if (duplicate)
+        // Одну программу дважды не добавить даже с другими параметрами запуска: ядро и фильтры Windows узнают приложение
+        // по exe-файлу, и копия, открытая мимо лаунчера, пошла бы через подключение одного из них наугад.
+        var same = appUserModelId is not null
+            ? _settings.Apps.FirstOrDefault(a => string.Equals(a.AppUserModelId, appUserModelId, StringComparison.OrdinalIgnoreCase))
+            : FindSameProgram(exePath, arguments);
+        if (same is not null)
         {
-            Fail($"«{name}» уже есть в списке.", warning: true);
+            Fail(appUserModelId is null && !string.Equals(same.Arguments ?? "", arguments ?? "", StringComparison.Ordinal)
+                ? $"Эта программа уже добавлена: «{same.Name}». Одну программу можно добавить только один раз, даже с другими параметрами запуска."
+                : $"Эта программа уже добавлена: «{same.Name}».", warning: true);
             return null;
         }
 
@@ -1708,6 +2030,17 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             AppUserModelId = appUserModelId
         };
     }
+
+    /// <summary>
+    /// Одна программа, добавленная несколько раз (до 2.3.1 так было можно с другими параметрами запуска): названия
+    /// приложений по каждой такой программе. Их не удаляем, а при каждом запуске лаунчера напоминаем убрать лишние.
+    /// </summary>
+    private List<string> RepeatedApps() =>
+        _settings.Apps
+            .GroupBy(a => a.IsPackaged ? "store " + a.AppUserModelId : a.ExePath, StringComparer.OrdinalIgnoreCase)
+            .Where(g => g.Count() > 1)
+            .Select(g => string.Join(", ", g.Select(a => $"«{a.Name}»")))
+            .ToList();
 
     private static string GetFriendlyName(string exePath)
     {
@@ -1732,9 +2065,20 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     /// <param name="dnsReady">Журнал DNS уже запущен (или запустить не вышло) — второй заход после StartDnsThenLaunch.</param>
     private async void Launch(AppTileViewModel tile, bool dnsReady = false)
     {
+        await LaunchAsync(tile, dnsReady);
+        EndOfflineRuns(); // запуск без сети не удался
+    }
+
+    private async Task LaunchAsync(AppTileViewModel tile, bool dnsReady)
+    {
         var entry = tile.Entry;
         if (_launching.Contains(entry.Id))
             return;
+        if (_updateHandoff)
+        {
+            _dialogs.ShowWarning("Устанавливается обновление лаунчера: приложение можно будет запустить после него.");
+            return;
+        }
 
         // Все строки этого запуска (лаунчер, служба, ядро) с одним id операции. Второй заход после журнала DNS продолжает тот же.
         using var operation = dnsReady && TechLog.CurrentCid is not null ? null : TechLog.Begin(out _);
@@ -1743,8 +2087,21 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             TechLog.Info(LogAreas.App, LogCodes.AppLaunch, $"Запуск «{entry.Name}»: {DescribeLaunch(entry)}");
         _launching.Add(entry.Id);
 
+        NetworkPlan prepared;
         try
         {
+            // Приложение добавлено ярлыком: запускаем то, на что ярлык указывает сейчас. Путь уточняется до подготовки сети:
+            // по нему ядро узнаёт копии приложения мимо лаунчера, а фильтры Windows — саму программу.
+            RefreshFromShortcut(entry);
+
+            if (!entry.IsPackaged && !File.Exists(entry.ExePath) && !TryRelocate(entry))
+            {
+                TechLog.Warn(LogAreas.App, LogCodes.AppReject, $"«{entry.Name}» не запущено: файл программы не найден ({entry.ExePath})");
+                _dialogs.ShowError($"Файл программы не найден:\n{entry.ExePath}");
+                return;
+            }
+
+            prepared = PlanFor(entry);
             if (!await PrepareNetworkAsync(tile))
                 return;
         }
@@ -1756,6 +2113,8 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
         if (!Apps.Contains(tile))
             return; // пока подключались, приложение убрали
+        if (LaunchPlanChanged(entry, prepared))
+            return;
 
         // Журнал DNS включён, но запись ещё не идёт: сначала запускаем её, чтобы не пропустить первые запросы.
         if (!dnsReady && entry.TrackDns && !_dns.IsActive)
@@ -1764,21 +2123,12 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             return;
         }
 
-        // Приложение добавлено ярлыком: запускаем то, на что ярлык указывает сейчас.
-        RefreshFromShortcut(entry);
-
-        if (!entry.IsPackaged && !File.Exists(entry.ExePath) && !TryRelocate(entry))
-        {
-            TechLog.Warn(LogAreas.App, LogCodes.AppReject, $"«{entry.Name}» не запущено: файл программы не найден ({entry.ExePath})");
-            _dialogs.ShowError($"Файл программы не найден:\n{entry.ExePath}");
-            return;
-        }
-
-        var plan = NetworkPlan.For(entry, _settings);
+        var plan = PlanFor(entry);
+        var offline = plan.Kind == NetworkPlanKind.Offline;
+        var guardName = offline ? "запрет сети" : "блокировку трафика мимо VPN";
 
         // Фильтры ставятся до запуска: с первого соединения программа не выйдет в сеть мимо VPN.
         // Не поставились — приложение не запускается (защита важнее).
-        if (NeedsGuard(plan))
         {
             if (!_launching.Add(entry.Id))
                 return;
@@ -1802,10 +2152,9 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             {
                 _guardPending.Remove(entry.Id);
                 SubmitGuard();
-                _log.Add(LogKind.Blocked, $"Запуск «{entry.Name}» отклонён: не удалось включить блокировку трафика мимо VPN — {guardError}");
-                _dialogs.ShowWarning($"«{entry.Name}» не запущено: не удалось включить защиту от трафика мимо VPN.\n\n{guardError}\n\n" +
-                                     "Если ошибка повторяется, переустановите лаунчер. Запускать без этой защиты можно, выключив " +
-                                     "«Блокировать трафик мимо VPN» в настройках, раздел «Защита».",
+                _log.Add(LogKind.Blocked, $"Запуск «{entry.Name}» отклонён: не удалось включить {guardName} — {guardError}");
+                _dialogs.ShowWarning($"«{entry.Name}» не запущено: не удалось включить {guardName}.\n\n{guardError}\n\n" +
+                                     "Если ошибка повторяется, переустановите лаунчер.",
                     "Защита не включилась");
                 return;
             }
@@ -1818,16 +2167,23 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             }
 
             // Служба не смогла проверить программу (сетевой диск, нет доступа) и не ограничила её: без фильтров не запускаем.
-            if (_settings.BlockBypass && !entry.IsPackaged && _guard.IsUnguarded(GuardPath(entry.ExePath)))
+            if (!entry.IsPackaged && _guard.IsUnguarded(GuardPath(entry.ExePath)))
             {
                 _guardPending.Remove(entry.Id);
                 SubmitGuard();
                 _log.Add(LogKind.Blocked, $"Запуск «{entry.Name}» отклонён: программа на сетевом диске или недоступна службе лаунчера, " +
-                                          $"блокировку трафика мимо VPN для неё не включить ({entry.ExePath})");
+                                          $"{guardName} для неё не включить ({entry.ExePath})");
                 _dialogs.ShowWarning($"«{entry.Name}» не запущено: программа лежит на сетевом диске или недоступна службе лаунчера, " +
-                                     $"поэтому блокировку трафика мимо VPN для неё включить нельзя.\n\n{entry.ExePath}\n\n" +
-                                     "Скопируйте программу на этот компьютер или выключите «Блокировать трафик мимо VPN» в настройках, раздел «Защита».",
+                                     $"поэтому {guardName} для неё включить нельзя.\n\n{entry.ExePath}\n\n" +
+                                     "Скопируйте программу на этот компьютер и добавьте её в лаунчер оттуда.",
                     "Защита не включилась");
+                return;
+            }
+
+            if (LaunchPlanChanged(entry, prepared))
+            {
+                _guardPending.Remove(entry.Id);
+                SubmitGuard();
                 return;
             }
         }
@@ -1841,7 +2197,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             // которые она породит, даже если сама она сразу завершится (как Update.exe у Discord).
             // Приложения Microsoft Store запускает сама Windows, их процесс забирается в задание сразу после старта.
             // Переменные прокси убираются у всех, кому нужен VPN: иначе программа отдала бы трафик прокси.
-            result = entry.IsPackaged ? _tracker.LaunchPackaged(entry) : _tracker.Launch(entry, withoutProxy: plan.UsesLauncherCore || plan.RequireVpn);
+            result = entry.IsPackaged ? _tracker.LaunchPackaged(entry) : _tracker.Launch(entry, withoutProxy: true);
         }
         catch (Win32Exception ex) when (ex.NativeErrorCode == ErrorCancelled)
         {
@@ -1866,6 +2222,16 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         TechLog.Info(LogAreas.App, LogCodes.AppStarted,
             $"«{entry.Name}» запущено за {started.ElapsedMilliseconds} мс: PID {result.ProcessId}, в задании {(result.Contained ? "да" : "нет")}, " +
             $"права администратора {(result.Elevated ? "да" : "нет")}, взято под контроль уже работавших {result.Adopted}");
+        if (result.OpenedBefore)
+        {
+            _log.Add(LogKind.Blocked, $"«{entry.Name}» уже было открыто не из лаунчера: Windows показала его, а не запустила заново");
+            _dialogs.ShowWarning($"«{entry.Name}» уже было открыто не из лаунчера, и Windows показала его, а не запустила заново. " +
+                                 "Его соединения идут так, как выбрано в «Если открыто не из лаунчера».\n\n" +
+                                 $"Закройте «{entry.Name}» полностью и запустите его из лаунчера снова.",
+                "Приложение уже открыто");
+            return;
+        }
+
         if (result.ProcessId == 0)
         {
             _log.Add(LogKind.Failed, $"«{entry.Name}» запущена, но без контроля: Windows не вернула её процесс");
@@ -1873,11 +2239,12 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             return;
         }
 
-        var via = plan.UsesLauncherCore ? $"через «{plan.Connection?.Name}»" : null;
+        var via = plan.UsesLauncherCore ? $"через «{plan.Connection?.Name}»" : offline ? "без сети" : null;
         StatusMessage = $"{DateTime.Now:HH:mm:ss} — запущено: {entry.Name} (PID {result.ProcessId})" + (via is null ? string.Empty : " " + via) +
                         (result.Adopted > 0 ? $", взято под контроль уже работавших: {ProcessTracker.ProcessesText(result.Adopted)}" : string.Empty);
         Toast($"Запущено: {entry.Name}",
-            plan.UsesLauncherCore ? $"Через подключение «{plan.Connection?.Name}»"
+            offline ? "Без сети: только связь внутри компьютера"
+            : plan.UsesLauncherCore ? $"Через подключение «{plan.Connection?.Name}»"
             : !plan.CloseOnDrop ? "Kill-Switch выключен"
             : result.Adopted > 0 ? "Уже открытое приложение тоже под защитой"
             : "Под защитой Kill-Switch",
@@ -1903,8 +2270,15 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
                 "Неполный контроль");
         }
 
-        // Закрываем окно гонки: VPN мог упасть между проверкой и стартом процесса,
-        // и тогда событие монитора уже отработало, когда приложения ещё не было в списке.
+        CloseIfLostDuringLaunch(entry, plan);
+    }
+
+    /// <summary>
+    /// Закрываем окно гонки: VPN мог упасть между проверкой и стартом процесса, и тогда событие монитора уже отработало,
+    /// когда приложения ещё не было в списке.
+    /// </summary>
+    private void CloseIfLostDuringLaunch(AppEntry entry, NetworkPlan plan)
+    {
         if (plan.Kind == NetworkPlanKind.SystemAdapters && plan.CloseOnDrop &&
             !VpnMonitor.Apply(plan.AdapterRule!, _monitor.Evaluate().Adapters).IsConnected)
         {
@@ -1927,19 +2301,21 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     private async Task<bool> PrepareNetworkAsync(AppTileViewModel tile)
     {
         var entry = tile.Entry;
-        var plan = NetworkPlan.For(entry, _settings);
+        var plan = PlanFor(entry);
+        if (plan.Kind == NetworkPlanKind.Offline)
+            return true; // VPN не нужен
 
         if (plan.Kind == NetworkPlanKind.SystemAdapters)
         {
             // Статус проверяем заново прямо сейчас, а не берём из кэша.
-            if (plan.RequireVpn && !VpnMonitor.Apply(plan.AdapterRule!, _monitor.Evaluate().Adapters).IsConnected)
+            if (!VpnMonitor.Apply(plan.AdapterRule!, _monitor.Evaluate().Adapters).IsConnected)
             {
                 _log.Add(LogKind.Blocked, $"Запуск «{entry.Name}» отклонён: VPN не подключён");
                 _dialogs.ShowWarning("Для запуска этого приложения необходимо подключиться к VPN.", "Нет подключения к VPN");
                 return false;
             }
 
-            return true;
+            return await CloseOutsideCopiesAsync(entry, viaCore: false);
         }
 
         // Подписку ещё ни разу не скачали: без списка серверов подключиться не к чему.
@@ -1951,29 +2327,10 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
         ApplyNetworkSettings();
 
-        // Копия, запущенная мимо лаунчера, уже ходит напрямую, а новая копия обычно просто передаёт ей управление.
-        var outside = _tracker.RefreshOutside(entry.Id);
-        if (outside > 0)
-        {
-            if (!_dialogs.Confirm($"«{entry.Name}» уже запущено без защиты",
-                    "Эта копия запущена мимо лаунчера, и её соединения идут напрямую. Закрыть её и запустить под защитой? " +
-                    "Несохранённые данные в ней пропадут.",
-                    "Перезапустить под защитой"))
-                return false;
+        if (!await CloseOutsideCopiesAsync(entry, viaCore: true))
+            return false;
 
-            var failed = _tracker.KillOutside(entry.Id);
-            if (failed.Count > 0)
-            {
-                _dialogs.ShowWarning("Не удалось закрыть копию, запущенную мимо лаунчера. Закройте её вручную:\n\n" + string.Join("\n", failed),
-                    "Копия не закрыта");
-                return false;
-            }
-
-            _log.Add(LogKind.Closed, $"Закрыта копия «{entry.Name}», запущенная мимо лаунчера");
-            await Task.Delay(500); // дать Windows освободить файлы и порты закрытой копии
-        }
-
-        tile.LaunchStage = plan.RequireVpn ? "Подключаю…" : "Включаю подключение…";
+        tile.LaunchStage = "Подключаю…";
         string? error;
         try
         {
@@ -1994,6 +2351,43 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         }
 
         tile.LaunchStage = "Запускаю…";
+        return true;
+    }
+
+    /// <summary>
+    /// Копия, запущенная мимо лаунчера, не под его защитой, а новая копия обычно просто передаёт ей управление. Её
+    /// предлагается закрыть и запустить приложение под защитой. У приложения под системным VPN такая копия — браузер,
+    /// открытый по ссылке другим приложением лаунчера: остальные копии лаунчер при запуске берёт под контроль сам.
+    /// false — не запускаем (пользователь отказался или копию закрыть не удалось).
+    /// </summary>
+    private async Task<bool> CloseOutsideCopiesAsync(AppEntry entry, bool viaCore)
+    {
+        if (_tracker.RefreshOutside(entry.Id) == 0)
+            return true;
+
+        var traffic = !viaCore
+            ? "Эта копия открыта другим приложением (например, по ссылке), и Kill-Switch за ней не следит."
+            : _network.OutsideBlocked(entry.Id) switch
+            {
+                true => "Эта копия запущена мимо лаунчера, и у неё нет интернета.",
+                false => "Эта копия запущена мимо лаунчера: её соединения идут через подключение приложения, но Kill-Switch за ней не следит.",
+                null => "Эта копия запущена мимо лаунчера, и её соединения идут напрямую."
+            };
+        if (!_dialogs.Confirm($"«{entry.Name}» уже запущено без защиты",
+                traffic + " Закрыть её и запустить под защитой? Несохранённые данные в ней пропадут.",
+                "Перезапустить под защитой"))
+            return false;
+
+        var failed = _tracker.KillOutside(entry.Id);
+        if (failed.Count > 0)
+        {
+            _dialogs.ShowWarning("Не удалось закрыть копию, запущенную мимо лаунчера. Закройте её вручную:\n\n" + string.Join("\n", failed),
+                "Копия не закрыта");
+            return false;
+        }
+
+        _log.Add(LogKind.Closed, $"Закрыта копия «{entry.Name}», запущенная мимо лаунчера");
+        await Task.Delay(500); // дать Windows освободить файлы и порты закрытой копии
         return true;
     }
 
@@ -2049,6 +2443,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         }
 
         SaveSettings();
+        ApplyNetworkSettings("ярлык приложения ведёт в другое место"); // копии мимо лаунчера узнаются по новому пути
     }
 
     /// <summary>
@@ -2068,24 +2463,40 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
         entry.ExePath = current;
         SaveSettings();
+        ApplyNetworkSettings("программа переехала в папку новой версии"); // копии мимо лаунчера узнаются по новому пути
         return true;
     }
 
     private void Remove(AppTileViewModel tile)
     {
-        if (!_dialogs.Confirm($"Убрать «{tile.Name}»?", "Приложение пропадёт из лаунчера. Сама программа удалена не будет.", "Убрать",
-                destructive: true))
+        var id = tile.Entry.Id;
+        if (_launching.Contains(id) || _dnsLaunching.Contains(id))
+        {
+            _dialogs.ShowWarning($"«{tile.Name}» сейчас запускается. Уберите его, когда запуск закончится.", "Приложение запускается");
+            return;
+        }
+
+        // Убранное приложение — обычная программа: работающее продолжает работать, но уже напрямую и без Kill-Switch.
+        var running = _tracker.CountFor(id) > 0;
+        if (!_dialogs.Confirm($"Убрать «{tile.Name}»?",
+                "Приложение пропадёт из лаунчера. Сама программа удалена не будет." +
+                (running ? " Сейчас оно запущено и продолжит работать как обычная программа: напрямую, без защиты лаунчера." : string.Empty),
+                "Убрать", destructive: true))
             return;
 
+        // Ядро по прежним настройкам ещё ведёт соединения работающего приложения через VPN: его настройки ядра меняются сразу.
+        running = _tracker.CountFor(id) > 0;
         _settings.Apps.Remove(tile.Entry);
+        _tracker.Forget(id);
+        _guardPaths.Remove(id);
         SaveSettings();
-        ApplyNetworkSettings();
-        _log.Add(LogKind.Info, $"Убрано из лаунчера: «{tile.Name}»");
-        _tracker.StopBlocking(tile.Entry.Id);
+        ApplyNetworkSettings("приложение убрано из лаунчера", released: running ? id : null);
+        _log.Add(LogKind.Info, $"Убрано из лаунчера: «{tile.Name}»" + (running ? " (продолжает работать как обычная программа)" : string.Empty));
         _dialogs.CloseDnsJournal(tile.Entry.Id);
         _dns.Forget(tile.Entry.Id);
         Apps.Remove(tile);
         OnPropertyChanged(nameof(HasNoApps));
+        RebuildConnections(); // подписи «Основное · …» у подключений
     }
 
     /// <summary>«Завершить все процессы»: всё, что лаунчер контролирует у приложения, закрывается сразу.</summary>
@@ -2135,20 +2546,30 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
     private void RefreshRunningCounts()
     {
+        EndOfflineRuns();
         foreach (var tile in Apps)
         {
             var id = tile.Entry.Id;
             tile.RunningCount = _tracker.CountFor(id);
-            tile.NetState = _network.StateOf(id);
+            tile.NetState = _offlineRuns.Contains(id) ? CoreAppState.None : _network.StateOf(id);
 
             var outside = _tracker.OutsideFor(id);
+            var blocked = outside > 0 ? _network.OutsideBlocked(id) : null;
             if (outside > 0 && tile.OutsideCount == 0)
             {
-                Toast($"«{tile.Name}» работает без защиты", "Запущено мимо лаунчера · «Перезапустить под защитой» в меню плитки",
+                Toast(blocked is null ? $"«{tile.Name}» работает без защиты" : $"«{tile.Name}» запущено мимо лаунчера",
+                    blocked switch { true => "Без интернета", false => "Через подключение приложения", null => "Запущено мимо лаунчера" } +
+                    " · «Перезапустить под защитой» в меню плитки",
                     GlyphUnlock, ToastKind.Danger);
-                _log.Add(LogKind.Blocked, $"«{tile.Name}» запущено мимо лаунчера: его соединения идут напрямую");
+                _log.Add(LogKind.Blocked, $"«{tile.Name}» запущено мимо лаунчера: " + blocked switch
+                {
+                    true => "у этой копии нет интернета",
+                    false => "её соединения идут через подключение приложения",
+                    null => "его соединения идут напрямую"
+                });
             }
 
+            tile.OutsideBlocked = blocked;
             tile.OutsideCount = outside;
         }
 
@@ -2158,6 +2579,45 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
     /// <summary>«Перезапустить под защитой»: закрыть копию мимо лаунчера и запустить приложение из лаунчера.</summary>
     private void RestartProtected(AppTileViewModel tile) => Launch(tile);
+
+    /// <summary>
+    /// «Запустить без сети»: разовый запуск, VPN не нужен. Пока приложение работает, фильтр Windows не пускает его
+    /// программы никуда, кроме связи внутри компьютера. Запрет действует на программу целиком, поэтому приложение,
+    /// уже запущенное с сетью, сначала нужно закрыть.
+    /// </summary>
+    private void LaunchOffline(AppTileViewModel tile)
+    {
+        var id = tile.Entry.Id;
+        if (_launching.Contains(id) || _dnsLaunching.Contains(id))
+            return;
+        if (!_offlineRuns.Contains(id) && (_tracker.CountFor(id) > 0 || _guardPending.Contains(id)))
+        {
+            _dialogs.ShowWarning($"«{tile.Name}» уже запущено с сетью. Закройте его и запустите без сети.", "Приложение уже запущено");
+            return;
+        }
+
+        if (_offlineRuns.Add(id))
+        {
+            ApplyNetworkSettings("запуск без сети");
+            RefreshStatus();
+        }
+
+        Launch(tile);
+    }
+
+    /// <summary>Приложения, запущенные без сети, закрылись (или не запустились): дальше они идут по своим настройкам.</summary>
+    private void EndOfflineRuns()
+    {
+        var ended = _offlineRuns
+            .Where(id => _tracker.CountFor(id) == 0 && !_launching.Contains(id) && !_guardPending.Contains(id) && !_dnsLaunching.Contains(id))
+            .ToList();
+        if (ended.Count == 0)
+            return;
+
+        _offlineRuns.ExceptWith(ended);
+        ApplyNetworkSettings("приложение без сети закрыто");
+        RefreshStatus();
+    }
 
     // ---------------------------------------------------------------- сводка в шапке и состояние плиток
 
@@ -2209,16 +2669,25 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         var anyAdapters = false;
         var anyCore = false;
 
+        var offline = 0;
+        // Почему приложения ждут сеть: от этого зависит подпись в шапке.
+        var serverDown = false;
+        var vpnOff = false;
+        var noConnection = false;
+
         foreach (var tile in Apps)
         {
-            var plan = NetworkPlan.For(tile.Entry, _settings);
+            var plan = PlanFor(tile.Entry);
             anyAdapters |= plan.Kind == NetworkPlanKind.SystemAdapters;
             anyCore |= plan.UsesLauncherCore;
+            tile.IsOfflineMode = tile.Entry.Network.Mode == AppNetworkMode.Offline;
+            tile.IsOffline = plan.Kind == NetworkPlanKind.Offline;
 
             // Подпись под названием: только если условие отличается от общего или с ним что-то не так.
             tile.IsSubtitleWarning = plan.Kind == NetworkPlanKind.MissingConnection;
             tile.Subtitle = plan.Kind switch
             {
+                NetworkPlanKind.Offline => "Без сети",
                 NetworkPlanKind.MissingConnection => "Нет подключения",
                 NetworkPlanKind.LauncherConnection when plan.Source == NetworkPlanSource.App => plan.Connection!.Name,
                 NetworkPlanKind.SystemAdapters when plan.Source == NetworkPlanSource.App => "Свои адаптеры",
@@ -2235,10 +2704,24 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
                 tile.Status = AppNetStatus.Idle;
                 tile.StatusText = plan.Kind switch
                 {
+                    NetworkPlanKind.Offline => "Не запущено · без сети",
                     NetworkPlanKind.MissingConnection => "Не запущено · подключение не выбрано",
                     NetworkPlanKind.LauncherConnection => $"Не запущено · через «{plan.Connection!.Name}»",
                     _ => "Не запущено · системный VPN"
                 };
+            }
+            else if (plan.Kind == NetworkPlanKind.Offline)
+            {
+                tile.Status = AppNetStatus.Protected;
+                tile.StatusText = "Работает без сети";
+                offline++;
+            }
+            else if (plan.Kind == NetworkPlanKind.MissingConnection)
+            {
+                // Подключение удалили или сменили условие, пока приложение работало: фильтры Windows держат его без сети.
+                tile.Status = AppNetStatus.Waiting;
+                tile.StatusText = "Без сети: подключение не выбрано";
+                noConnection = true;
             }
             else if (plan.UsesLauncherCore)
             {
@@ -2253,6 +2736,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
                 {
                     tile.Status = AppNetStatus.Waiting;
                     tile.StatusText = $"Ждёт сеть: сервер «{name}» не отвечает";
+                    serverDown = true;
                 }
             }
             else if (snapshot is not null && VpnMonitor.Apply(plan.AdapterRule!, snapshot.Adapters).IsConnected)
@@ -2262,8 +2746,10 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             }
             else
             {
-                tile.Status = AppNetStatus.Unprotected;
-                tile.StatusText = "Работает без VPN: Kill-Switch у приложения выключен";
+                // Kill-Switch у приложения выключен: фильтры Windows держат его без сети, пока VPN не вернётся.
+                tile.Status = AppNetStatus.Waiting;
+                tile.StatusText = "Ждёт VPN без сети: VPN отключён";
+                vpnOff = true;
             }
         }
 
@@ -2277,6 +2763,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             SummaryTitle = Apps.Count == 0 ? "Нет приложений" : "Ничего не запущено";
             SummarySubtitle = anyAdapters ? (IsVpnConnected ? $"VPN подключён · {VpnSubtitle}" : "VPN не подключён")
                 : anyCore ? "VPN включится сам при запуске"
+                : Apps.Count > 0 ? "VPN не нужен: приложения без сети"
                 : "Добавьте приложение";
             SummaryTone = anyAdapters ? (IsVpnConnected ? SummaryTone.Ok : SummaryTone.Danger) : SummaryTone.Idle;
         }
@@ -2284,8 +2771,12 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         {
             SummaryTitle = $"Защищены {protectedCount} из {running}";
             SummarySubtitle = danger ? "Есть приложения без защиты"
-                : waiting ? "Сервер не отвечает: приложения ждут сеть"
+                : waiting ? (serverDown && !vpnOff && !noConnection ? "Сервер не отвечает: приложения ждут сеть"
+                    : vpnOff && !serverDown && !noConnection ? "VPN отключён: приложения ждут сеть"
+                    : noConnection && !serverDown && !vpnOff ? "Нет подключения: приложения без сети"
+                    : "Приложения ждут сеть")
                 : connections.Count > 0 ? "Через " + string.Join(", ", connections.Select(c => $"«{c}»"))
+                : offline == running ? "Без сети"
                 : "VPN подключён";
             SummaryTone = danger ? SummaryTone.Danger : waiting ? SummaryTone.Warn : SummaryTone.Ok;
         }
@@ -2413,11 +2904,15 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     {
         var id = item.Id;
         var users = _settings.Apps.Where(a => NetworkPlan.For(a, _settings).Connection?.Id == id).ToList();
+        // Запускаемые тоже заняты: их ядро и фильтры уже готовятся под это подключение.
         var running = new HashSet<Guid>(_tracker.RunningApps());
+        running.UnionWith(_launching);
+        running.UnionWith(_dnsLaunching);
+        running.UnionWith(_guardPending);
         var busy = users.Where(a => running.Contains(a.Id)).Select(a => a.Name).ToList();
         if (busy.Count > 0)
         {
-            _dialogs.ShowWarning($"Через «{item.Name}» сейчас работают: {string.Join(", ", busy)}. Закройте их, потом удаляйте подключение.",
+            _dialogs.ShowWarning($"Через «{item.Name}» сейчас работают или запускаются: {string.Join(", ", busy)}. Закройте их, потом удаляйте подключение.",
                 "Подключение занято");
             return;
         }
@@ -2437,6 +2932,12 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         {
             _draftConnectionId = _settings.ConnectionId;
             OnPropertyChanged(nameof(DraftConnectionId));
+        }
+
+        if (_draftUpdateConnectionId == id)
+        {
+            _draftUpdateConnectionId = _settings.Updates.ConnectionId == id ? null : _settings.Updates.ConnectionId;
+            OnPropertyChanged(nameof(UpdateConnectionId));
         }
 
         SaveSettings();
@@ -2559,6 +3060,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         {
             SaveSettings();
             ApplyNetworkSettings();
+            UnblockWithoutKillSwitch();
             var tile = Apps.FirstOrDefault(t => t.Entry == entry);
             tile?.RefreshName();
             if (wasTracking != entry.TrackDns)
@@ -2572,9 +3074,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             var networkChanged = oldNetwork != System.Text.Json.JsonSerializer.Serialize(entry.Network);
             if (networkChanged)
                 _log.Add(LogKind.Info, $"Настройки «{entry.Name}»: {DescribeApp(entry)}");
-            Toast("Настройки сохранены",
-                networkChanged && _tracker.CountFor(entry.Id) > 0 ? "Новые условия подействуют при следующем запуске" : entry.Name,
-                GlyphCheck, ToastKind.Success);
+            Toast("Настройки сохранены", entry.Name, GlyphCheck, ToastKind.Success);
         }
 
         RefreshDnsState();
@@ -2588,12 +3088,30 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         }
     }
 
+    /// <summary>
+    /// Приложения, которые больше не закрываются при обрыве («Закрывать при обрыве» выключили в общих настройках или у
+    /// самого приложения): закрытые раньше можно снова запускать как угодно. У кого своё «Вкл», запрет остаётся.
+    /// </summary>
+    private void UnblockWithoutKillSwitch()
+    {
+        foreach (var entry in _settings.Apps.Where(a => !PlanFor(a).CloseOnDrop))
+            _tracker.StopBlocking(entry.Id);
+    }
+
     /// <summary>Условие запуска приложения словами, для журнала.</summary>
     private string DescribeApp(AppEntry entry) => entry.Network.Mode switch
     {
         AppNetworkMode.OwnConnection => $"своё подключение «{_settings.Connections.FirstOrDefault(c => c.Id == entry.Network.ConnectionId)?.Name}»",
         AppNetworkMode.OwnAdapters => $"свои адаптеры, {AppSettingsViewModel.DescribeRule(entry.Network.RuleMode, entry.Network.SelectedAdapters.Count)}",
+        AppNetworkMode.Offline => "без сети",
         _ => "как в общих"
+    } + entry.Network.OutsideCopies switch
+    {
+        OutsideCopiesOverride.Vpn => ", если открыто не из лаунчера: через VPN",
+        OutsideCopiesOverride.Block => ", если открыто не из лаунчера: без интернета",
+        OutsideCopiesOverride.Allow => ", если открыто не из лаунчера: напрямую",
+        OutsideCopiesOverride.Launcher => ", если открыто не из лаунчера: через лаунчер",
+        _ => string.Empty
     };
 
     // ---------------------------------------------------------------- мастер первого запуска
@@ -2602,13 +3120,14 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     {
         var add = new AddConnectionViewModel(() => _settings.Connections, c => AddConnectionAsync(c, makeDefault: true), _dialogs);
         Welcome = new WelcomeViewModel(add, CheckConnectionAsync,
-            () => Task.Run(StartMenuApps.Find),
-            exe => IconExtractor.TryGetIcon(exe),
+            new StartMenuListViewModel(_findStartMenuApps, exe => IconExtractor.TryGetIcon(exe), IsAdded),
             useSystemVpn: () =>
             {
                 _settings.NetworkMode = GlobalNetworkMode.SystemVpn;
                 SaveSettings();
                 ResetDraft();
+                ApplyNetworkSettings(); // подключение, добавленное на первом шаге, больше не общее
+                RebuildConnections();
             },
             finish: AddFromStartMenu,
             skip: () => GoBack());
@@ -2628,6 +3147,15 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
     private void AddFromStartMenu(IReadOnlyList<StartMenuApp> apps)
     {
+        AddStartMenuApps(apps);
+        GoBack();
+        RebuildConnections();
+        RefreshRunningCounts();
+    }
+
+    /// <summary>Отмеченные программы из меню «Пуск» (мастер первого запуска и «Добавить приложение»).</summary>
+    private void AddStartMenuApps(IReadOnlyList<StartMenuApp> apps)
+    {
         var added = new List<string>();
         foreach (var app in apps)
         {
@@ -2644,12 +3172,10 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             ApplyNetworkSettings();
             OnPropertyChanged(nameof(HasNoApps));
             _log.Add(LogKind.Info, $"Добавлены приложения: {string.Join(", ", added)}");
-            Toast("Приложения добавлены", string.Join(", ", added), GlyphAdd, ToastKind.Info);
+            Toast(added.Count == 1 ? "Приложение добавлено" : "Приложения добавлены", string.Join(", ", added), GlyphAdd, ToastKind.Info);
+            RebuildConnections();
+            RefreshRunningCounts();
         }
-
-        GoBack();
-        RebuildConnections();
-        RefreshRunningCounts();
     }
 
     // ---------------------------------------------------------------- журнал DNS
@@ -2761,191 +3287,6 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         Toast("Журнал DNS остановлен", "Запись продолжится при следующем запуске приложения", GlyphGlobe, ToastKind.Danger);
     }
 
-    // ---------------------------------------------------------------- обновления
-
-    private async void OnStartupIdle()
-    {
-        OnStartupLogs();
-
-        // Итог обновления, запущенного в прошлый раз (лаунчер перезапустился после установщика).
-        var outcome = _updates.TakePendingOutcome();
-        if (outcome is not null)
-        {
-            var target = UpdateService.Format(outcome.Target);
-            if (outcome.Succeeded)
-            {
-                StatusMessage = $"Обновление установлено: версия {target}";
-                _log.Add(LogKind.Update, $"Обновление до версии {target} установлено");
-                Toast("Обновление установлено", $"Безопасный лаунчер {target}", GlyphCheck, ToastKind.Success);
-            }
-            else
-            {
-                StatusMessage = $"Не удалось обновить до версии {target}";
-                _log.Add(LogKind.Failed, $"Не удалось обновить до версии {target}, осталась {UpdateService.Format(UpdateService.CurrentVersion)}");
-                Toast("Не удалось обновить", $"Осталась версия {UpdateService.Format(UpdateService.CurrentVersion)}", GlyphInfo, ToastKind.Danger);
-            }
-        }
-
-        // Подписки обновляются при каждом запуске (если пора) и потом раз в час проверяется, не пора ли снова.
-        _subscriptionTimer.Start();
-        _ = UpdateSubscriptionsAsync();
-
-        // Не перекрываем уведомление об итоге обновления.
-        await Task.Delay(outcome is null ? 1500 : 4500);
-        await CheckForUpdatesAsync(userInitiated: false);
-    }
-
-    /// <summary>Проверить обновления. При запуске (userInitiated = false) сообщаем только о найденном обновлении.</summary>
-    private async Task CheckForUpdatesAsync(bool userInitiated)
-    {
-        if (IsUpdateBusy) return;
-        IsUpdateBusy = true;
-        UpdateStatusText = "Проверка…";
-
-        try
-        {
-            _updateCheck = await _updates.CheckAsync(CancellationToken.None);
-            TechLog.Info(LogAreas.Update, LogCodes.UpdateCheck,
-                $"Проверка обновлений{(userInitiated ? " (вручную)" : string.Empty)}: установлена {UpdateService.Format(_updateCheck.Current)}, " +
-                $"последняя {(_updateCheck.Latest is { } latest ? UpdateService.Format(latest.Version) : "не найдена")}");
-            OnPropertyChanged(nameof(IsUpdateAvailable));
-            OnPropertyChanged(nameof(IsUpdateNotAvailable));
-
-            if (_updateCheck.IsUpdateAvailable)
-            {
-                var version = UpdateService.Format(_updateCheck.Latest!.Version);
-                UpdateStatusText = $"Доступна v{version}";
-
-                // При запуске — только значок на кнопке «Настройки», без уведомления.
-                if (userInitiated)
-                    Toast("Доступно обновление", $"Версия {version} · нажмите «Обновить»", GlyphInfo, ToastKind.Info);
-            }
-            else
-            {
-                UpdateStatusText = "Последняя версия";
-                if (userInitiated)
-                    Toast("Обновлений нет", "Установлена последняя версия", GlyphCheck, ToastKind.Success);
-            }
-        }
-        catch (Exception ex)
-        {
-            TechLog.Warn(LogAreas.Update, LogCodes.UpdateFail, "Не удалось проверить обновления: " + ex.Message);
-            UpdateStatusText = "Не удалось проверить";
-            if (userInitiated)
-                Toast("Не удалось проверить обновления", ShortReason(ex), GlyphInfo, ToastKind.Danger);
-        }
-        finally
-        {
-            IsUpdateBusy = false;
-        }
-    }
-
-    /// <summary>Одна кнопка: «Проверить», а если обновление найдено — «Обновить».</summary>
-    private async void OnUpdateAction()
-    {
-        if (IsUpdateAvailable)
-            InstallUpdate();
-        else
-            await CheckForUpdatesAsync(userInitiated: true);
-    }
-
-    /// <summary>«Что нового»: при доступном обновлении — описание новой версии, иначе — установленной.</summary>
-    private async void ShowChangelog()
-    {
-        if (_updateCheck is null)
-            await CheckForUpdatesAsync(userInitiated: false);
-
-        if (_updateCheck is null)
-        {
-            _dialogs.ShowWarning("Не удалось загрузить описание изменений. Проверьте подключение к интернету и попробуйте ещё раз.", "Что нового");
-            return;
-        }
-
-        var canUpdate = _updateCheck.IsUpdateAvailable;
-        var release = canUpdate ? _updateCheck.Latest : _updateCheck.CurrentRelease;
-        var version = UpdateService.Format(release?.Version ?? UpdateService.CurrentVersion);
-
-        if (release is null)
-        {
-            _dialogs.ShowWarning($"Описание изменений для версии {version} пока не опубликовано.", "Что нового");
-            return;
-        }
-
-        var date = release.PublishedAt is { } published ? published.ToLocalTime().ToString("d MMMM yyyy", new System.Globalization.CultureInfo("ru-RU")) : null;
-        var subtitle = (canUpdate ? "Доступно обновление" : "Установленная версия") + (date is null ? string.Empty : $" · {date}");
-
-        if (_dialogs.ShowChangelog($"Что нового в версии {version}", subtitle, release.Notes, canUpdate))
-            InstallUpdate();
-    }
-
-    /// <summary>Скачать установщик с лоадером, запустить его и закрыть лаунчер. Установщик сам запустит новую версию.</summary>
-    private void InstallUpdate()
-    {
-        if (IsUpdateBusy || _updateCheck?.Latest is not { } release || !_updateCheck.IsUpdateAvailable)
-            return;
-
-        var version = UpdateService.Format(release.Version);
-        var closing = AppsClosedOnExit();
-        if (closing.Count > 0 && !_dialogs.Confirm($"Обновить до версии {version}?",
-                $"Лаунчер перезапустится. Запущенные приложения ({closing.Count}) будут закрыты: без лаунчера защита не работает.",
-                "Обновить"))
-            return;
-
-        IsUpdateBusy = true;
-        try
-        {
-            string? setupPath = null;
-            var outcome = _dialogs.RunWithProgress("Загрузка обновления", $"Безопасный лаунчер {version}",
-                async (progress, token) => setupPath = await _updates.DownloadAsync(release, progress, token));
-
-            if (outcome.Cancelled)
-            {
-                StatusMessage = "Загрузка обновления отменена";
-                return;
-            }
-
-            if (!outcome.Completed || setupPath is null)
-            {
-                _dialogs.ShowError($"Не удалось загрузить обновление:\n{outcome.Error?.Message}", "Обновление");
-                return;
-            }
-
-            try
-            {
-                _updates.StartSetup(setupPath, release);
-            }
-            catch (Win32Exception ex) when (ex.NativeErrorCode == ErrorCancelled)
-            {
-                StatusMessage = "Установка обновления отменена";
-                return;
-            }
-            catch (Exception ex)
-            {
-                _dialogs.ShowError($"Не удалось запустить установщик:\n{ex.Message}", "Обновление");
-                return;
-            }
-
-            // Установщик запущен: закрываем приложения (как при обычном закрытии с Kill-Switch) и выходим.
-            _tracker.KillApps(AppsClosedOnExit(), blockRelaunch: false);
-
-            _closingForUpdate = true;
-            StatusMessage = $"Устанавливается версия {version}…";
-            _log.Add(LogKind.Update, $"Запущена установка версии {version}, лаунчер перезапустится");
-            ShutdownRequested?.Invoke(this, EventArgs.Empty);
-        }
-        finally
-        {
-            IsUpdateBusy = false;
-        }
-    }
-
-    private static string ShortReason(Exception ex) => ex switch
-    {
-        HttpRequestException => "Нет связи с GitHub",
-        TaskCanceledException => "GitHub не ответил вовремя",
-        _ => ex.Message.Length <= 60 ? ex.Message : ex.Message[..57] + "…"
-    };
-
     // ---------------------------------------------------------------- трей
 
     /// <summary>
@@ -3016,13 +3357,20 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
                 "Закрыть всё", destructive: true))
             return false;
 
-        // Сначала приложения, потом подключение (ядро выключится в Dispose): иначе они успели бы пойти напрямую.
-        var report = _tracker.KillApps(closing, blockRelaunch: false);
+        // Сначала приложения, потом подключение (ядро выключится в Dispose): иначе они успели бы пойти напрямую. Список
+        // заново: пока был открыт вопрос, могло запуститься ещё одно приложение.
+        var report = _tracker.KillApps(AppsClosedOnExit(), blockRelaunch: false);
         if (report.Killed.Count > 0)
             _log.Add(LogKind.Closed, $"При закрытии лаунчера закрыты: {string.Join(", ", report.Killed)}");
-        if (report.Failed.Count > 0)
-            _log.Add(LogKind.Failed, $"При закрытии лаунчера не удалось закрыть: {string.Join(", ", report.Failed)}");
-        return true;
+        if (report.Failed.Count == 0)
+            return true;
+
+        _log.Add(LogKind.Failed, $"При закрытии лаунчера не удалось закрыть: {string.Join(", ", report.Failed)}");
+        // Без лаунчера они работали бы без фильтров и подключения: пусть пользователь решит, пока защита ещё есть.
+        return _dialogs.Confirm("Не все приложения закрыты",
+            "Эти приложения не удалось закрыть (обычно так бывает с программами, запущенными с правами администратора):\n\n" +
+            string.Join("\n", report.Failed) + "\n\nБез лаунчера они будут работать без защиты. Закройте их вручную или закройте лаунчер всё равно.",
+            "Закрыть лаунчер", destructive: true);
     }
 
     private void SaveSettings()
@@ -3045,12 +3393,13 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         _monitor.StatusChanged -= OnVpnStatusChanged;
         _monitor.Dispose();
         _subscriptionTimer.Stop();
+        DisposeUpdates();
         _dns.Dispose();
 
         // Сначала приложения (Windows закроет те, что закрываются вместе с лаунчером), потом ядро и фильтры.
         _tracker.Dispose();
         _network.Dispose();
-        _guard.Dispose(); // служба снимает фильтры: всё как без лаунчера
+        _guard.Dispose(); // служба снимает фильтры (скрытие DNS — когда закроются приложения, которые работают и без лаунчера)
         _proxy.Dispose();
     }
 }

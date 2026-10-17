@@ -1,0 +1,120 @@
+<Window x:Class="KillSwitchLauncher.Views.UpdateWaitWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:local="clr-namespace:KillSwitchLauncher.Views"
+        Title="Обновление Безопасного лаунчера"
+        WindowStyle="None" AllowsTransparency="True" Background="Transparent"
+        ResizeMode="NoResize" SizeToContent="WidthAndHeight" ShowInTaskbar="True"
+        WindowStartupLocation="CenterScreen"
+        FontFamily="{StaticResource UiFont}" FontSize="13"
+        Foreground="{StaticResource TextPrimary}"
+        UseLayoutRounding="True">
+
+    <!-- Окно ожидания обновления: работает из копии лаунчера, пока служба ставит новую версию.
+         Показывает шаги установки, сколько прошло времени, и само запускает лаунчер. Внешний Margin — место под тень. -->
+    <Border Margin="36" Width="440" CornerRadius="24" Background="{StaticResource CardBg}" Padding="26,24,26,22"
+            MouseLeftButtonDown="OnDragArea">
+        <Border.Effect>
+            <DropShadowEffect BlurRadius="40" ShadowDepth="10" Direction="270" Opacity="0.16" Color="#1A1A2E" />
+        </Border.Effect>
+
+        <Grid>
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+            </Grid.ColumnDefinitions>
+
+            <!-- Круг: вращающаяся дуга, пока идёт установка; знак предупреждения при ошибке -->
+            <Grid Grid.Row="0" Grid.Column="0" Width="44" Height="44" Margin="0,0,16,0" VerticalAlignment="Top">
+                <Ellipse x:Name="IconCircle" Fill="{StaticResource AccentSoft}" />
+                <local:GlyphIcon x:Name="IconGlyph" Glyph="&#xE895;" Size="17" Foreground="{StaticResource Accent}" HorizontalAlignment="Center" VerticalAlignment="Center" />
+                <Path x:Name="Spinner" Stroke="{StaticResource Accent}" StrokeThickness="3" StrokeStartLineCap="Round" StrokeEndLineCap="Round"
+                      Data="M 22,2 A 20,20 0 0 1 42,22" RenderTransformOrigin="0.5,0.5">
+                    <Path.RenderTransform>
+                        <RotateTransform x:Name="SpinnerTurn" />
+                    </Path.RenderTransform>
+                    <Path.Triggers>
+                        <EventTrigger RoutedEvent="Loaded">
+                            <BeginStoryboard>
+                                <Storyboard RepeatBehavior="Forever">
+                                    <DoubleAnimation Storyboard.TargetName="SpinnerTurn" Storyboard.TargetProperty="Angle" From="0" To="360" Duration="0:0:1" />
+                                </Storyboard>
+                            </BeginStoryboard>
+                        </EventTrigger>
+                    </Path.Triggers>
+                </Path>
+            </Grid>
+
+            <StackPanel Grid.Row="0" Grid.Column="1" VerticalAlignment="Center">
+                <TextBlock x:Name="TitleText" FontSize="17" FontWeight="Bold" TextWrapping="Wrap" />
+                <TextBlock x:Name="MessageText" Foreground="{StaticResource TextSecondary}" Margin="0,4,0,0" TextWrapping="Wrap" LineHeight="19" />
+            </StackPanel>
+
+            <ProgressBar x:Name="Progress" Grid.Row="1" Grid.Column="0" Grid.ColumnSpan="2" Style="{StaticResource SlimProgress}"
+                         Margin="0,20,0,0" IsIndeterminate="True" />
+
+            <!-- Шаги установки: выполнен — галочка, идёт — синяя точка, не начат — пустой кружок, не получился — крестик -->
+            <ItemsControl x:Name="StepList" Grid.Row="2" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,18,0,0" Focusable="False">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate>
+                        <Grid Margin="0,3">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition Width="22" />
+                                <ColumnDefinition Width="*" />
+                            </Grid.ColumnDefinitions>
+                            <local:GlyphIcon x:Name="Mark" Grid.Column="0" Size="11" Glyph="&#xE73E;" Foreground="{StaticResource Success}"
+                                             HorizontalAlignment="Left" VerticalAlignment="Center" Visibility="Collapsed" />
+                            <Ellipse x:Name="Dot" Grid.Column="0" Width="9" Height="9" Margin="1,0,0,0" HorizontalAlignment="Left" VerticalAlignment="Center"
+                                     Stroke="{StaticResource TextMuted}" StrokeThickness="1.5" />
+                            <TextBlock x:Name="StepTitle" Grid.Column="1" Text="{Binding Title}" Foreground="{StaticResource TextMuted}" TextTrimming="CharacterEllipsis" />
+                        </Grid>
+                        <DataTemplate.Triggers>
+                            <DataTrigger Binding="{Binding State}" Value="Done">
+                                <Setter TargetName="Mark" Property="Visibility" Value="Visible" />
+                                <Setter TargetName="Dot" Property="Visibility" Value="Collapsed" />
+                                <Setter TargetName="StepTitle" Property="Foreground" Value="{StaticResource TextPrimary}" />
+                            </DataTrigger>
+                            <DataTrigger Binding="{Binding State}" Value="Active">
+                                <Setter TargetName="Dot" Property="Fill" Value="{StaticResource Accent}" />
+                                <Setter TargetName="Dot" Property="Stroke" Value="{StaticResource Accent}" />
+                                <Setter TargetName="StepTitle" Property="Foreground" Value="{StaticResource Accent}" />
+                                <Setter TargetName="StepTitle" Property="FontWeight" Value="SemiBold" />
+                            </DataTrigger>
+                            <DataTrigger Binding="{Binding State}" Value="Failed">
+                                <Setter TargetName="Mark" Property="Visibility" Value="Visible" />
+                                <Setter TargetName="Mark" Property="Glyph" Value="&#xE711;" />
+                                <Setter TargetName="Mark" Property="Foreground" Value="{StaticResource Danger}" />
+                                <Setter TargetName="Dot" Property="Visibility" Value="Collapsed" />
+                                <Setter TargetName="StepTitle" Property="Foreground" Value="{StaticResource Danger}" />
+                                <Setter TargetName="StepTitle" Property="FontWeight" Value="SemiBold" />
+                            </DataTrigger>
+                        </DataTemplate.Triggers>
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+            </ItemsControl>
+
+            <Grid Grid.Row="3" Grid.Column="0" Grid.ColumnSpan="2" Margin="0,18,0,0">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="Auto" />
+                </Grid.ColumnDefinitions>
+                <StackPanel Grid.Column="0" VerticalAlignment="Center">
+                    <TextBlock x:Name="ElapsedText" Foreground="{StaticResource TextMuted}" FontSize="12" />
+                    <TextBlock x:Name="HintText" Foreground="{StaticResource TextMuted}" FontSize="12" TextWrapping="Wrap" Margin="0,2,0,0"
+                               Text="Окно закроется само, когда откроется лаунчер" />
+                </StackPanel>
+                <StackPanel x:Name="Buttons" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Bottom" Visibility="Collapsed">
+                    <Button x:Name="LaunchButton" Style="{StaticResource PrimaryButton}" Padding="18,9" Margin="10,0,0,0" Content="Запустить лаунчер"
+                            Click="OnLaunchClick" />
+                    <Button Style="{StaticResource SecondaryButton}" Padding="18,9" Margin="8,0,0,0" Content="Закрыть" Click="OnCloseClick" />
+                </StackPanel>
+            </Grid>
+        </Grid>
+    </Border>
+</Window>
