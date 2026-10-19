@@ -222,9 +222,20 @@
                             </StackPanel>
                         </Border>
 
-                        <!-- ===== Исключения ===== -->
+                        <!-- ===== Исключения: свои дополняют общие из настроек или заменяют их ===== -->
                         <TextBlock Text="Исключения" Style="{StaticResource BlockTitle}" />
                         <TextBlock Text="{Binding DomainsHint}" Style="{StaticResource Caption}" Margin="0,0,0,10" />
+                        <StackPanel Visibility="{Binding UsesLauncherCore, Converter={StaticResource BoolToVis}}" Margin="0,0,0,10">
+                            <Border Background="{StaticResource SubtleBg}" CornerRadius="14" Padding="4" HorizontalAlignment="Left">
+                                <StackPanel Orientation="Horizontal">
+                                    <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="160" Content="Дополнять общие"
+                                                 IsChecked="{Binding DomainsMode, Converter={StaticResource EnumToBool}, ConverterParameter=AddToCommon}" />
+                                    <RadioButton Style="{StaticResource SegmentRadio}" MinWidth="160" Content="Вместо общих"
+                                                 IsChecked="{Binding DomainsMode, Converter={StaticResource EnumToBool}, ConverterParameter=OwnOnly}" />
+                                </StackPanel>
+                            </Border>
+                            <TextBlock Text="{Binding CommonDomainsHint}" Style="{StaticResource Caption}" Margin="0,6,0,0" />
+                        </StackPanel>
                         <TextBox Style="{StaticResource InputArea}" Tag="kaspi.kz&#x0a;gosuslugi.ru"
                                  Text="{Binding DomainsText, UpdateSourceTrigger=PropertyChanged}" />
                     </StackPanel>

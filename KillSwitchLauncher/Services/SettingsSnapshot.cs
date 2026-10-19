@@ -25,7 +25,8 @@ public static class SettingsSnapshot
         {
             ["Kill-Switch"] = Yes(s.KillSwitchEnabled),
             ["Копии приложений мимо лаунчера"] = s.OutsideCopies.ToString(),
-            ["Скрывать DNS-запросы"] = Yes(s.HideDns),
+            ["Защита от утечки DNS"] = Yes(s.HideDns),
+            ["Общие исключения доменов"] = s.DirectDomains.Count.ToString(),
             ["Как понимать, что VPN есть"] = s.NetworkMode.ToString(),
             ["Общее подключение"] = Conn(s.ConnectionId),
             ["Правило адаптеров"] = s.RuleMode.ToString(),
@@ -50,6 +51,7 @@ public static class SettingsSnapshot
             d[p + "закрывать при обрыве"] = n.CloseOnDrop.ToString();
             d[p + "копии мимо лаунчера"] = n.OutsideCopies.ToString();
             d[p + "исключения доменов"] = n.DirectDomains.Count.ToString();
+            d[p + "исключения"] = n.DomainsMode == DomainsMode.OwnOnly ? "вместо общих" : "дополняют общие";
             d[p + "журнал DNS"] = Yes(app.TrackDns);
         }
 
@@ -116,6 +118,8 @@ public static class SettingsSnapshot
                 ["outsideCopies"] = app.Network.OutsideCopies.ToString(),
                 ["trackDns"] = app.TrackDns,
                 ["directDomains"] = new JsonArray(app.Network.DirectDomains.Select(x => (JsonNode)JsonValue.Create(x)!).ToArray()),
+                ["domainsMode"] = app.Network.DomainsMode.ToString(),
+                ["planDirectDomains"] = plan.DirectDomains.Count,
                 ["adapters"] = new JsonArray(app.Network.SelectedAdapters.Select(x => (JsonNode)JsonValue.Create(x)!).ToArray())
             });
         }
@@ -159,6 +163,7 @@ public static class SettingsSnapshot
             ["killSwitch"] = s.KillSwitchEnabled,
             ["outsideCopies"] = s.OutsideCopies.ToString(),
             ["hideDns"] = s.HideDns,
+            ["directDomains"] = new JsonArray(s.DirectDomains.Select(x => (JsonNode)JsonValue.Create(x)!).ToArray()),
             ["networkMode"] = s.NetworkMode.ToString(),
             ["connection"] = s.ConnectionId is { } id ? CorePlan.ConnectionTag(id) : null,
             ["ruleMode"] = s.RuleMode.ToString(),

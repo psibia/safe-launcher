@@ -26,6 +26,7 @@ public enum SettingsSection
     Connections,
     Adapters,
     Protection,
+    Exclusions,
     Window,
     Log,
     Updates

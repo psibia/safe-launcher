@@ -17,6 +17,7 @@ namespace KillSwitchLauncher.ViewModels;
 public sealed class StartMenuChoiceViewModel : ObservableObject
 {
     private bool _isSelected;
+    private bool _isShown = true;
     private ImageSource? _icon;
 
     public StartMenuChoiceViewModel(StartMenuApp app, bool isAdded = false)
@@ -52,10 +53,18 @@ public sealed class StartMenuChoiceViewModel : ObservableObject
                 SetField(ref _isSelected, value);
         }
     }
+
+    /// <summary>Подходит под поиск. Скрытая поиском галочка не снимается.</summary>
+    public bool IsShown
+    {
+        get => _isShown;
+        set => SetField(ref _isShown, value);
+    }
 }
 
 /// <summary>
 /// Программы из меню «Пуск» с галочками: шаг «Приложения» мастера первого запуска и страница «Добавить приложения».
+/// Поиск по названию только скрывает строки: отмеченные раньше программы остаются отмеченными и добавятся.
 /// </summary>
 public sealed class StartMenuListViewModel : ObservableObject
 {
@@ -64,6 +73,7 @@ public sealed class StartMenuListViewModel : ObservableObject
     private readonly Func<StartMenuApp, bool> _isAdded;
     private bool _isLoading;
     private bool _loaded;
+    private string _searchText = "";
 
     /// <param name="findApps">Программы из меню «Пуск» (долго: в фоне).</param>
     /// <param name="icon">Иконка программы по пути к её .exe.</param>
@@ -86,6 +96,23 @@ public sealed class StartMenuListViewModel : ObservableObject
     /// <summary>Поиск закончен, а подходящих программ в меню «Пуск» нет.</summary>
     public bool IsEmpty => _loaded && Apps.Count == 0;
 
+    /// <summary>Строка поиска над списком: что искать в названиях программ.</summary>
+    public string SearchText
+    {
+        get => _searchText;
+        set
+        {
+            if (!SetField(ref _searchText, value ?? ""))
+                return;
+            foreach (var choice in Apps)
+                choice.IsShown = StartMenuApps.Matches(choice.App, _searchText);
+            OnPropertyChanged(nameof(NothingFound));
+        }
+    }
+
+    /// <summary>Программы в меню «Пуск» есть, но под поиск не подошла ни одна.</summary>
+    public bool NothingFound => Apps.Count > 0 && !Apps.Any(a => a.IsShown);
+
     /// <summary>Отмеченные программы, которых ещё нет в лаунчере.</summary>
     public IReadOnlyList<StartMenuApp> Selected => Apps.Where(a => a.IsSelected && !a.IsAdded).Select(a => a.App).ToList();
 
@@ -103,12 +130,13 @@ public sealed class StartMenuListViewModel : ObservableObject
             var apps = await _findApps();
             foreach (var app in apps)
             {
-                var choice = new StartMenuChoiceViewModel(app, _isAdded(app));
+                var choice = new StartMenuChoiceViewModel(app, _isAdded(app)) { IsShown = StartMenuApps.Matches(app, _searchText) };
                 choice.PropertyChanged += OnChoiceChanged;
                 Apps.Add(choice);
             }
             _loaded = true;
             OnPropertyChanged(nameof(IsEmpty));
+            OnPropertyChanged(nameof(NothingFound));
 
             // Иконки — после списка, чтобы он появился сразу.
             foreach (var choice in Apps.ToList())

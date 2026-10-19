@@ -103,6 +103,7 @@ public sealed class SettingsStorage
         settings.Connections ??= new List<VpnConnection>();
         settings.Connections.RemoveAll(c => c is null);
         settings.Logs = (settings.Logs ?? new SafeLauncher.Logging.LogSettings()).Normalized();
+        settings.DirectDomains = DomainList.Normalize(settings.DirectDomains ?? new List<string>());
 
         if (settings.Apps.Count > 0)
             settings.WelcomeDone = true;

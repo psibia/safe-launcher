@@ -121,6 +121,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     private VpnRuleMode _draftRuleMode;
     private HideBehavior _draftHideBehavior;
     private OutsideCopies _draftOutsideCopies;
+    private string _draftDomainsText = string.Empty;
     private readonly List<string> _draftSelected = new();
 
     // Только вид списка, не сохраняется: при каждом запуске выключено.
@@ -202,7 +203,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         CreateUpdateCommands();
         ShowLogCommand = new RelayCommand(() => _dialogs.ShowActivityLog(_log, this));
         CreateLogCommands();
-        ShowHideDnsInfoCommand = new RelayCommand(() => _dialogs.ShowInfo(HideDnsExplanation, "Скрытие DNS-запросов"));
+        ShowHideDnsInfoCommand = new RelayCommand(() => _dialogs.ShowInfo(HideDnsExplanation, "Защита от утечки DNS"));
 
         foreach (var entry in _settings.Apps)
         {
@@ -320,7 +321,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     public AddConnectionViewModel AddConnection { get; }
     public ICommand ShowLogCommand { get; }
 
-    /// <summary>«Как это работает и на что влияет» у «Скрывать DNS-запросы».</summary>
+    /// <summary>«Как это работает и на что влияет» у «Защиты от утечки DNS».</summary>
     public ICommand ShowHideDnsInfoCommand { get; }
 
     /// <summary>Окно должно закрыться (лаунчер обновляется). Всегда в UI-потоке.</summary>
@@ -543,6 +544,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         _draftHideBehavior != _settings.HideBehavior ||
         _draftOutsideCopies != _settings.OutsideCopies ||
         _draftHideDns != _settings.HideDns ||
+        DomainsDraftChanged ||
         _draftStartWithWindows != _settings.StartWithWindows ||
         !new HashSet<string>(_draftSelected, StringComparer.OrdinalIgnoreCase).SetEquals(_settings.SelectedAdapters) ||
         HasLogDraftChanges ||
@@ -636,14 +638,14 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         }
     }
 
-    /// <summary>«Скрывать DNS-запросы от провайдера» (черновик). Влияет на весь компьютер: включение — после объяснения.</summary>
+    /// <summary>«Защита от утечки DNS» (черновик). Влияет на весь компьютер: включение — после объяснения.</summary>
     public bool HideDns
     {
         get => _draftHideDns;
         set
         {
             if (_draftHideDns == value) return;
-            if (value && !_settings.HideDns && !_dialogs.Confirm("Скрывать DNS-запросы от провайдера?", HideDnsExplanation, "Включить"))
+            if (value && !_settings.HideDns && !_dialogs.Confirm("Включить защиту от утечки DNS?", HideDnsExplanation, "Включить"))
             {
                 _dispatcher.BeginInvoke(() => OnPropertyChanged(nameof(HideDns)));
                 return;
@@ -655,7 +657,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         }
     }
 
-    /// <summary>Что делает «Скрывать DNS-запросы» и на что влияет: показывается перед включением.</summary>
+    /// <summary>Что делает «Защита от утечки DNS» и на что влияет: показывается перед включением.</summary>
     internal const string HideDnsExplanation =
         "Зачем. Чтобы открыть сайт, программа сначала спрашивает его адрес по имени (DNS). В Windows эти вопросы за все " +
         "программы задаёт одна системная служба, поэтому по ним нельзя понять, какая программа спрашивает. Без этой " +
@@ -680,6 +682,25 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         "переведите приложение на подключение лаунчера.\n\n" +
         "Когда это перестаёт действовать (выключено ядро или закрыты приложения под системным VPN), лаунчер очищает " +
         "кэш DNS Windows, и всё работает как без него.";
+
+    /// <summary>Общие исключения (черновик): домены по одному в строке, как в поле на странице приложения.</summary>
+    public string CommonDomainsText
+    {
+        get => _draftDomainsText;
+        set
+        {
+            value ??= string.Empty;
+            if (_draftDomainsText == value) return;
+            _draftDomainsText = value;
+            OnPropertyChanged();
+            OnDraftChanged();
+        }
+    }
+
+    /// <summary>Общие исключения в черновике отличаются от действующих (с учётом приведения к одному виду).</summary>
+    private bool DomainsDraftChanged =>
+        DomainList.Problem(_draftDomainsText) is not null ||
+        !DomainList.Normalize(DomainList.Split(_draftDomainsText)).SequenceEqual(_settings.DirectDomains, StringComparer.Ordinal);
 
     /// <summary>«Запускать вместе с Windows» (черновик).</summary>
     public bool StartWithWindows
@@ -809,6 +830,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         _draftRuleMode = _settings.RuleMode;
         _draftHideBehavior = _settings.HideBehavior;
         _draftOutsideCopies = _settings.OutsideCopies;
+        _draftDomainsText = string.Join(Environment.NewLine, _settings.DirectDomains);
         _draftSelected.Clear();
         _draftSelected.AddRange(_settings.SelectedAdapters);
         ResetLogDraft();
@@ -824,6 +846,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         OnPropertyChanged(nameof(RuleMode));
         OnPropertyChanged(nameof(HideBehavior));
         OnPropertyChanged(nameof(OutsideCopies));
+        OnPropertyChanged(nameof(CommonDomainsText));
         OnPropertyChanged(nameof(IsAdapterSelectionEnabled));
         OnDraftChanged();
 
@@ -856,6 +879,13 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             return false;
         }
 
+        if (DomainsDraftChanged && CommonDomainsProblem() is { } domainsProblem)
+        {
+            Section = SettingsSection.Exclusions;
+            _dialogs.ShowWarning(domainsProblem, "Исключения не сохранены");
+            return false;
+        }
+
         if (!ConfirmLogDraft())
             return false;
 
@@ -866,6 +896,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
                           _draftNetworkMode == GlobalNetworkMode.LauncherConnection && _draftConnectionId != _settings.ConnectionId;
         var hideDnsChanged = _draftHideDns != _settings.HideDns;
         var outsideChanged = _draftOutsideCopies != _settings.OutsideCopies;
+        var domainsChanged = DomainsDraftChanged;
         var autoStartChanged = _draftStartWithWindows != _settings.StartWithWindows;
         if (autoStartChanged && !TrySetAutoStart(_draftStartWithWindows))
         {
@@ -883,6 +914,12 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         _settings.RuleMode = _draftRuleMode;
         _settings.HideBehavior = _draftHideBehavior;
         _settings.OutsideCopies = _draftOutsideCopies;
+        if (domainsChanged)
+        {
+            _settings.DirectDomains = DomainList.Normalize(DomainList.Split(_draftDomainsText));
+            _draftDomainsText = string.Join(Environment.NewLine, _settings.DirectDomains);
+            OnPropertyChanged(nameof(CommonDomainsText));
+        }
         _settings.SelectedAdapters = new List<string>(_draftSelected);
         ApplyLogDraft();
         ApplyUpdateDraft();
@@ -900,7 +937,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         if (killSwitchChanged)
             _log.Add(LogKind.Info, _settings.KillSwitchEnabled ? "Kill-Switch включён" : "Kill-Switch выключен");
         if (hideDnsChanged)
-            _log.Add(LogKind.Info, _settings.HideDns ? "Скрытие DNS-запросов включено (на весь компьютер, пока открыт лаунчер)" : "Скрытие DNS-запросов выключено");
+            _log.Add(LogKind.Info, _settings.HideDns ? "Защита от утечки DNS включена (на весь компьютер, пока открыт лаунчер)" : "Защита от утечки DNS выключена");
         if (outsideChanged)
             _log.Add(LogKind.Info, "Приложения, открытые не из лаунчера: " + _settings.OutsideCopies switch
             {
@@ -909,6 +946,10 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
                 OutsideCopies.Launcher => "через лаунчер",
                 _ => "через VPN"
             });
+        if (domainsChanged)
+            _log.Add(LogKind.Info, _settings.DirectDomains.Count == 0
+                ? "Общие исключения убраны"
+                : $"Общие исключения: {_settings.DirectDomains.Count} (напрямую, мимо подключения лаунчера)");
         if (autoStartChanged)
             _log.Add(LogKind.Info, _settings.StartWithWindows ? "Лаунчер будет запускаться вместе с Windows" : "Автозапуск лаунчера выключен");
         if (modeChanged)
@@ -934,11 +975,31 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         }
 
         // Новое правило проверяется сразу; если VPN по нему не подключён, сработает обычная логика обрыва (CheckRuleChange).
-        // Условия запуска, «Скрывать DNS-запросы» и копии мимо лаунчера тоже действуют сразу, и для работающих приложений:
+        // Условия запуска, «Защита от утечки DNS» и копии мимо лаунчера тоже действуют сразу, и для работающих приложений:
         // ядро перезапускается (ApplyNetworkSettings → KeepCoreRunning), фильтры Windows меняются.
         RefreshRunningCounts();
 
         return true;
+    }
+
+    /// <summary>
+    /// Что не так с общими исключениями в черновике: не домены или вместе со своими исключениями какого-то приложения
+    /// («Дополнять общие») их больше, чем примет служба. null — можно применять.
+    /// </summary>
+    private string? CommonDomainsProblem()
+    {
+        if (DomainList.Problem(_draftDomainsText) is { } problem)
+            return problem;
+
+        var common = DomainList.Normalize(DomainList.Split(_draftDomainsText));
+        if (common.Count > DomainList.MaxPerApp)
+            return $"Исключений больше {DomainList.MaxPerApp}: столько ядро не примет. Уберите лишние.";
+        var crowded = _settings.Apps.FirstOrDefault(a => a.Network.DomainsMode == DomainsMode.AddToCommon &&
+                                                         DomainList.Normalize(common.Concat(a.Network.DirectDomains)).Count > DomainList.MaxPerApp);
+        return crowded is null
+            ? null
+            : $"Вместе с исключениями приложения «{crowded.Name}» получается больше {DomainList.MaxPerApp}: столько ядро не примет. " +
+              "Уберите лишние здесь или у приложения.";
     }
 
     /// <summary>Как сейчас настроено общее условие запуска, словами.</summary>
@@ -970,6 +1031,10 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     /// <summary>Вызывается в фоновом потоке монитора.</summary>
     private void OnVpnStatusChanged(object? sender, VpnStatusChangedEventArgs e)
     {
+        // Сеть Windows изменилась: серверы подключений лаунчера проверяются вне очереди, а ядро, которое не заметило
+        // вернувшуюся сеть, перезапускается.
+        _network.CheckSoon();
+
         // У каждого приложения под системным VPN своё правило адаптеров и своя защита. Монитор присылает снимок
         // при любом изменении адаптеров, поэтому каждое правило проверяется и до, и после изменения.
         var lost = new List<AdapterApp>();
@@ -1074,13 +1139,29 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     }
 
     /// <summary>
+    /// Компьютер вышел из сна: сеть могла смениться, пока он спал. Серверы подключений лаунчера проверяются вне очереди.
+    /// Любой поток.
+    /// </summary>
+    public void OnResumedFromSleep()
+    {
+        TechLog.Info(LogAreas.Monitor, LogCodes.PowerResume, "Компьютер вышел из сна: подключения проверяются вне очереди");
+        _network.CheckSoon();
+    }
+
+    /// <summary>
     /// Перед запуском сервер не ответил через ядро. В журнал — что сказало ядро и итог отдельной проверки того же
-    /// подключения (без адаптера лаунчера): так видно, виноват сервер или работа через адаптер.
+    /// подключения (без адаптера лаунчера): так видно, виноват сервер или работа через адаптер. Если причина на самом
+    /// компьютере (нет сети, ядро её не видит), отдельная проверка не нужна: её соединения идут через ту же сеть.
     /// </summary>
     private async Task OnProbeFailedAsync(ProbeFailure failure)
     {
         // Строки ядра пишет технический журнал (LauncherNetwork), в Журнале событий только понятный итог.
         _log.Add(LogKind.Failed, failure.Summary);
+        if (failure.LocalCause is { } local)
+        {
+            _log.Add(LogKind.Info, $"Сервер не проверялся отдельно: {local}");
+            return;
+        }
 
         if (_settings.Connections.FirstOrDefault(c => c.Id == failure.ConnectionId) is not { } connection)
             return;
@@ -1102,9 +1183,19 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             parts.Add("Ждут сеть: " + string.Join(", ", info.Waiting));
         var subtitle = parts.Count > 0 ? string.Join(" · ", parts) : "Запущенных приложений не было";
 
-        StatusMessage = $"{DateTime.Now:HH:mm:ss} — сервер «{info.ConnectionName}» не отвечает. {subtitle}";
-        Toast($"Сервер «{info.ConnectionName}» не отвечает", subtitle, GlyphUnlock, ToastKind.Danger, "Выгрузить журналы", () => ShowExport(ExportPeriods.Last15));
-        _log.Add(LogKind.VpnDown, $"Сервер подключения «{info.ConnectionName}» не отвечает · {subtitle}");
+        if (info.NoNetwork)
+        {
+            StatusMessage = $"{DateTime.Now:HH:mm:ss} — компьютер не подключён к сети, сервер «{info.ConnectionName}» недоступен. {subtitle}";
+            Toast("Компьютер не подключён к сети", subtitle, GlyphUnlock, ToastKind.Danger);
+            _log.Add(LogKind.VpnDown, $"Компьютер не подключён к сети: сервер подключения «{info.ConnectionName}» недоступен · {subtitle}");
+        }
+        else
+        {
+            StatusMessage = $"{DateTime.Now:HH:mm:ss} — сервер «{info.ConnectionName}» не отвечает. {subtitle}";
+            Toast($"Сервер «{info.ConnectionName}» не отвечает", subtitle, GlyphUnlock, ToastKind.Danger, "Выгрузить журналы", () => ShowExport(ExportPeriods.Last15));
+            _log.Add(LogKind.VpnDown, $"Сервер подключения «{info.ConnectionName}» не отвечает · {subtitle}");
+        }
+
         ShowFailedKills(info.Closed);
         RefreshRunningCounts();
     }
@@ -2294,8 +2385,8 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     }
 
     /// <summary>
-    /// Условие запуска. Под системным VPN — VPN по правилу приложения подключён. Через подключение лаунчера — копий мимо
-    /// лаунчера нет (или пользователь согласился их закрыть), ядро работает с текущими настройками, сервер отвечает.
+    /// Условие запуска. Под системным VPN — VPN по правилу приложения подключён. Через подключение лаунчера — ядро
+    /// работает с текущими настройками, сервер отвечает, копий мимо лаунчера нет (или пользователь согласился их закрыть).
     /// false — запускать нельзя, причина уже показана.
     /// </summary>
     private async Task<bool> PrepareNetworkAsync(AppTileViewModel tile)
@@ -2327,9 +2418,6 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
         ApplyNetworkSettings();
 
-        if (!await CloseOutsideCopiesAsync(entry, viaCore: true))
-            return false;
-
         tile.LaunchStage = "Подключаю…";
         string? error;
         try
@@ -2347,6 +2435,14 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             _log.Add(LogKind.Blocked, $"Запуск «{entry.Name}» отклонён: {error}");
             if (_dialogs.ShowWarningWithLogs(error, "Не удалось подключиться"))
                 ShowExport(ExportPeriods.Last15);
+            return false;
+        }
+
+        // Копию мимо лаунчера закрываем, только когда ясно, что приложение запустится: иначе пользователь остался бы
+        // и без копии, и без приложения.
+        if (!await CloseOutsideCopiesAsync(entry, viaCore: true))
+        {
+            _network.OnProcessesChanged(); // ядро включали ради этого запуска: выключится, если больше не нужно
             return false;
         }
 

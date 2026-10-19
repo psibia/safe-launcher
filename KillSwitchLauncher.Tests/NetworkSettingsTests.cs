@@ -59,7 +59,9 @@ public class SettingsMigrationTests
                 Assert.Equal(ProtectionOverride.Inherit, app.Network.CloseOnDrop);
                 Assert.Equal(OutsideCopiesOverride.Inherit, app.Network.OutsideCopies);
                 Assert.Empty(app.Network.DirectDomains);
+                Assert.Equal(DomainsMode.AddToCommon, app.Network.DomainsMode);
             }
+            Assert.Empty(settings.DirectDomains);
         }
     }
 
@@ -149,12 +151,13 @@ public class SettingsMigrationTests
         using var dir = new TempDir();
         var path = dir.File("settings.json");
         File.WriteAllText(path, """
-            { "SettingsVersion": 1, "Connections": null, "SelectedAdapters": null,
+            { "SettingsVersion": 1, "Connections": null, "SelectedAdapters": null, "DirectDomains": null,
               "Apps": [ { "Name": "A", "Network": null }, { "Name": "B", "Network": { "DirectDomains": null, "SelectedAdapters": null } } ] }
             """);
 
         var settings = new SettingsStorage(path).Load();
 
+        Assert.Empty(settings.DirectDomains);
         Assert.Empty(settings.Connections);
         Assert.Empty(settings.SelectedAdapters);
         Assert.All(settings.Apps, a =>
@@ -163,6 +166,28 @@ public class SettingsMigrationTests
             Assert.Empty(a.Network.DirectDomains);
             Assert.Empty(a.Network.SelectedAdapters);
         });
+    }
+
+    [Fact]
+    public void CommonDomains_AndDomainsMode_SurviveSaveAndLoad_JunkDropped()
+    {
+        using var dir = new TempDir();
+        var path = dir.File("settings.json");
+        File.WriteAllText(path, """
+            { "SettingsVersion": 1, "DirectDomains": [ "Kaspi.KZ", "мусор", "kaspi.kz", "*.gosuslugi.ru" ],
+              "Apps": [ { "Name": "A", "Network": { "DomainsMode": "OwnOnly" } }, { "Name": "B", "Network": { "DomainsMode": "Неизвестно" } } ] }
+            """);
+        var storage = new SettingsStorage(path);
+
+        var settings = storage.Load();
+        Assert.Equal(new[] { "kaspi.kz", "gosuslugi.ru" }, settings.DirectDomains);
+        Assert.Equal(DomainsMode.OwnOnly, settings.Apps[0].Network.DomainsMode);
+        Assert.Equal(DomainsMode.AddToCommon, settings.Apps[1].Network.DomainsMode);
+
+        storage.Save(settings);
+        var again = storage.Load();
+        Assert.Equal(new[] { "kaspi.kz", "gosuslugi.ru" }, again.DirectDomains);
+        Assert.Equal(DomainsMode.OwnOnly, again.Apps[0].Network.DomainsMode);
     }
 
     [Fact]

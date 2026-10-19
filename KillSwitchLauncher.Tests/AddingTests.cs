@@ -212,6 +212,53 @@ public class StartMenuAppsTests
     }
 }
 
+/// <summary>Поиск над списком программ из меню «Пуск».</summary>
+public class StartMenuSearchTests
+{
+    private static readonly StartMenuApp Telegram = new("Telegram Desktop", @"C:\menu\Telegram.lnk", @"C:\Users\me\AppData\Roaming\Telegram Desktop\Telegram.exe");
+    private static readonly StartMenuApp Discord = new("Discord", @"C:\menu\Discord.lnk", @"C:\Users\me\AppData\Local\Discord\Update.exe");
+    private static readonly StartMenuApp Yandex = new("Яндекс Браузер", @"C:\menu\Yandex.lnk", @"C:\Users\me\AppData\Local\Yandex\YandexBrowser\Application\browser.exe");
+    private static readonly StartMenuApp Steam = new("Steam", @"C:\menu\Steam.lnk", @"C:\Program Files (x86)\Steam\steam.exe");
+
+    [Theory]
+    [InlineData("")]
+    [InlineData("   ")]
+    [InlineData(null)]
+    public void EmptyQuery_ShowsAll(string? query) => Assert.True(StartMenuApps.Matches(Discord, query));
+
+    [Theory]
+    [InlineData("tele")]
+    [InlineData("TELEGRAM")]
+    [InlineData("desk tel")]
+    public void PartOfName_AnyCase_AnyWordOrder(string query) => Assert.True(StartMenuApps.Matches(Telegram, query));
+
+    [Fact]
+    public void EveryWordMustBeFound() => Assert.False(StartMenuApps.Matches(Telegram, "telegram web"));
+
+    [Fact]
+    public void ExeName_IsSearchedToo_ButNotTheFolders()
+    {
+        Assert.True(StartMenuApps.Matches(Yandex, "browser"));
+        Assert.False(StartMenuApps.Matches(Yandex, "appdata"));
+    }
+
+    [Fact]
+    public void YoAndYe_AreTheSame()
+    {
+        var app = new StartMenuApp("Ёлка", @"C:\menu\e.lnk", @"C:\E\elka.exe");
+        Assert.True(StartMenuApps.Matches(app, "елк"));
+        Assert.True(StartMenuApps.Matches(app, "ЁЛК"));
+    }
+
+    [Fact]
+    public void WrongKeyboardLayout_StillFinds()
+    {
+        Assert.True(StartMenuApps.Matches(Steam, "ыеуфь"));
+        Assert.True(StartMenuApps.Matches(Yandex, "zyltrc"));
+        Assert.False(StartMenuApps.Matches(Discord, "ыеуфь"));
+    }
+}
+
 public class LocalProxiesTests
 {
     [Fact]

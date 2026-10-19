@@ -2,16 +2,44 @@ using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Linq;
+using KillSwitchLauncher.Models;
 
 namespace KillSwitchLauncher.Services;
 
 /// <summary>
-/// Домены-исключения приложения: приводит введённое к виду «example.com» (без схемы, пути, «*.» и с IDN
+/// Домены-исключения (общие и приложения): приводит введённое к виду «example.com» (без схемы, пути, «*.» и с IDN
 /// в punycode), отбрасывает то, что доменом не является. Домен действует вместе с поддоменами.
 /// </summary>
 public static class DomainList
 {
+    /// <summary>Больше исключений у одного приложения служба не примет (CoreConfigBuilder.MaxDomainsPerApp).</summary>
+    public const int MaxPerApp = 1000;
+
     private static readonly IdnMapping Idn = new();
+
+    /// <summary>Строки поля ввода: по одному домену в строке, запятые, точки с запятой и пробелы тоже разделяют.</summary>
+    public static List<string> Split(string? text) =>
+        (text ?? string.Empty).Split(new[] { '\n', '\r', ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+        .ToList();
+
+    /// <summary>Что не так в поле ввода: null — всё можно сохранить.</summary>
+    public static string? Problem(string? text)
+    {
+        var wrong = Split(text).Where(d => !TryNormalize(d, out _)).ToList();
+        return wrong.Count > 0 ? $"Это не похоже на домен: {string.Join(", ", wrong.Take(3))}. Пишите так: kaspi.kz." : null;
+    }
+
+    /// <summary>
+    /// Исключения приложения с учётом общих: свои дополняют общие или заменяют их. Не больше <see cref="MaxPerApp"/>:
+    /// лишнее (только при ручной правке настроек) отбрасывается и идёт через подключение, а не ломает ядро всем.
+    /// </summary>
+    public static List<string> Combine(IEnumerable<string>? common, IEnumerable<string>? own, DomainsMode mode)
+    {
+        var all = mode == DomainsMode.OwnOnly
+            ? own ?? Enumerable.Empty<string>()
+            : (common ?? Enumerable.Empty<string>()).Concat(own ?? Enumerable.Empty<string>());
+        return Normalize(all).Take(MaxPerApp).ToList();
+    }
 
     public static List<string> Normalize(IEnumerable<string> domains)
     {

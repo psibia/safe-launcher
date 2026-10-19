@@ -63,6 +63,7 @@ public sealed class AppSettingsViewModel : ObservableObject
     private ProtectionOverride _closeOnDrop;
     private OutsideCopiesOverride _outsideCopies;
     private string _domainsText;
+    private DomainsMode _domainsMode;
     private bool _trackDns;
     private string _arguments;
     private string? _error;
@@ -90,6 +91,7 @@ public sealed class AppSettingsViewModel : ObservableObject
         _closeOnDrop = network.CloseOnDrop;
         _outsideCopies = network.OutsideCopies;
         _domainsText = string.Join(Environment.NewLine, network.DirectDomains ?? new List<string>());
+        _domainsMode = network.DomainsMode;
         _trackDns = entry.TrackDns;
         _arguments = entry.Arguments ?? string.Empty;
 
@@ -321,6 +323,35 @@ public sealed class AppSettingsViewModel : ObservableObject
         ? "Эти сайты приложение откроет напрямую, мимо подключения. По одному в строке, поддомены входят: kaspi.kz откроет и online.kaspi.kz."
         : "Работают только с подключением лаунчера: под системным VPN маршрутом управляет ваша VPN-программа.";
 
+    /// <summary>Свои исключения дополняют общие из настроек или заменяют их.</summary>
+    public DomainsMode DomainsMode
+    {
+        get => _domainsMode;
+        set
+        {
+            if (!SetField(ref _domainsMode, value)) return;
+            OnPropertyChanged(nameof(CommonDomainsHint));
+            OnChanged();
+        }
+    }
+
+    /// <summary>Что приходит из общих исключений (раздел настроек «Исключения») при выбранном варианте.</summary>
+    public string CommonDomainsHint
+    {
+        get
+        {
+            var common = _settings.DirectDomains ?? new List<string>();
+            var list = common.Count == 0 ? "" : ": " + string.Join(", ", common.Take(3)) + (common.Count > 3 ? $" и ещё {common.Count - 3}" : "");
+            if (DomainsMode == DomainsMode.OwnOnly)
+                return common.Count == 0
+                    ? "Напрямую идут только сайты из списка ниже. Если он пуст, всё идёт через подключение."
+                    : $"Общие исключения ({common.Count}) не действуют, напрямую идут только сайты из списка ниже. Если он пуст, всё идёт через подключение.";
+            return common.Count == 0
+                ? "Общих исключений нет. Их можно задать в настройках, раздел «Исключения»."
+                : $"Напрямую идут и общие исключения ({common.Count}){list}.";
+        }
+    }
+
     public bool TrackDns
     {
         get => _trackDns;
@@ -376,7 +407,8 @@ public sealed class AppSettingsViewModel : ObservableObject
         network.ConnectionId = ConnectionId;
         network.CloseOnDrop = CloseOnDrop;
         network.OutsideCopies = OutsideCopies;
-        network.DirectDomains = DomainList.Normalize(SplitLines(DomainsText));
+        network.DirectDomains = DomainList.Normalize(DomainList.Split(DomainsText));
+        network.DomainsMode = DomainsMode;
     }
 
     /// <summary>null — можно сохранять, иначе что исправить.</summary>
@@ -391,9 +423,14 @@ public sealed class AppSettingsViewModel : ObservableObject
         if (NeedsAdapterSelection)
             return "Включите хотя бы один адаптер или выберите правило «Любой VPN».";
 
-        var wrong = SplitLines(DomainsText).Where(d => !DomainList.TryNormalize(d, out _)).ToList();
-        if (wrong.Count > 0)
-            return $"Это не похоже на домен: {string.Join(", ", wrong.Take(3))}. Пишите так: kaspi.kz.";
+        if (DomainList.Problem(DomainsText) is { } problem)
+            return problem;
+        var own = DomainList.Normalize(DomainList.Split(DomainsText));
+        var total = DomainsMode == DomainsMode.OwnOnly ? own.Count : DomainList.Normalize((_settings.DirectDomains ?? new List<string>()).Concat(own)).Count;
+        if (total > DomainList.MaxPerApp)
+            return DomainsMode == DomainsMode.OwnOnly
+                ? $"Исключений больше {DomainList.MaxPerApp}: столько ядро не примет. Уберите лишние."
+                : $"Исключений вместе с общими больше {DomainList.MaxPerApp}: столько ядро не примет. Уберите лишние.";
         return null;
     }
 
@@ -441,10 +478,7 @@ public sealed class AppSettingsViewModel : ObservableObject
 
     private string Signature() => string.Join("|",
         Name.Trim(), Mode, RuleMode, string.Join(",", Adapters.Where(a => a.IsSelected).Select(a => a.Name)),
-        ConnectionId, CloseOnDrop, OutsideCopies, string.Join(",", SplitLines(DomainsText)), TrackDns, Arguments.Trim());
-
-    private static IEnumerable<string> SplitLines(string text) =>
-        text.Split(new[] { '\n', '\r', ',', ';', ' ' }, StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        ConnectionId, CloseOnDrop, OutsideCopies, string.Join(",", DomainList.Split(DomainsText)), DomainsMode, TrackDns, Arguments.Trim());
 
     internal static string DescribeRule(VpnRuleMode mode, int selected) => mode switch
     {

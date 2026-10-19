@@ -119,6 +119,7 @@ public static class LogCodes
     public const string AdapterChange = "adapter.change";
     public const string NetSnapshot = "net.snapshot";
     public const string ProxyChange = "proxy.change";
+    public const string PowerResume = "power.resume";
 
     public const string CheckStart = "check.start";
     public const string CheckResult = "check.result";

@@ -53,11 +53,17 @@ public sealed class AppSettings
     public OutsideCopies OutsideCopies { get; set; } = OutsideCopies.Vpn;
 
     /// <summary>
-    /// «Скрывать DNS-запросы от провайдера» — настройка на весь компьютер, пока работает приложение лаунчера:
+    /// «Защита от утечки DNS» — настройка на весь компьютер, пока работает приложение лаунчера:
     /// служба DNS Windows получает подменные адреса от ядра (подключения лаунчера) или ходит только через VPN
     /// (системный VPN). По умолчанию выключено; при включении пользователь видит, на что это влияет.
     /// </summary>
     public bool HideDns { get; set; }
+
+    /// <summary>
+    /// Общие исключения (раздел «Исключения»): домены, которые приложения через подключение лаунчера открывают напрямую,
+    /// вместе с поддоменами. Приложение дополняет их своими или заменяет своими (<see cref="AppNetwork.DomainsMode"/>).
+    /// </summary>
+    public List<string> DirectDomains { get; set; } = new();
 
     /// <summary>Запускать лаунчер при входе в Windows (свёрнутым в трей).</summary>
     public bool StartWithWindows { get; set; }

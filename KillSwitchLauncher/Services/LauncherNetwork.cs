@@ -1,7 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.Linq;
+using System.Net;
+using System.Net.NetworkInformation;
 using System.Threading;
 using System.Threading.Tasks;
 using SafeLauncher.Logging;
@@ -57,11 +60,18 @@ public enum CoreAppState
     Waiting
 }
 
-/// <summary>Сервер подключения перестал отвечать: кого закрыли и кто ждёт без сети.</summary>
-public sealed record ConnectionDownInfo(Guid ConnectionId, string ConnectionName, KillReport Closed, IReadOnlyList<string> Waiting);
+/// <summary>
+/// Сервер подключения перестал отвечать: кого закрыли и кто ждёт без сети. <paramref name="NoNetwork"/> — у самого
+/// компьютера в этот момент нет сети.
+/// </summary>
+public sealed record ConnectionDownInfo(Guid ConnectionId, string ConnectionName, KillReport Closed, IReadOnlyList<string> Waiting,
+    bool NoNetwork = false);
 
-/// <summary>Перед запуском сервер не ответил: подключение, что сказало ядро и строки из его журнала.</summary>
-public sealed record ProbeFailure(Guid ConnectionId, string Summary, IReadOnlyList<string> CoreLog);
+/// <summary>
+/// Перед запуском сервер не ответил: подключение, что сказало ядро и строки из его журнала. <paramref name="LocalCause"/> —
+/// причина на компьютере (нет сети, ядро не видит сеть), тогда сервер ни при чём; null — не отвечает сам сервер.
+/// </summary>
+public sealed record ProbeFailure(Guid ConnectionId, string Summary, IReadOnlyList<string> CoreLog, string? LocalCause = null);
 
 /// <summary>
 /// Подключения лаунчера в работе: порядок «подключение → регистрация → запуск», проверка серверов, Kill-Switch
@@ -76,11 +86,15 @@ public sealed record ProbeFailure(Guid ConnectionId, string Summary, IReadOnlyLi
 /// Перезапуск ядра (поменялись настройки) приостанавливает работающие приложения, чтобы их соединения не ушли напрямую,
 /// пока адаптера нет, и обрывает их соединения и соединения других программ. Поэтому изменения, без которых программа
 /// пошла бы не так, как выбрано (<see cref="UrgentChange"/>: копии приложений мимо лаунчера, работающие приложения,
-/// «Скрывать DNS-запросы», приложение убрали), применяются сразу. Остальные (новые настройки самих подключений, IPv6)
+/// «Защита от утечки DNS», приложение убрали), применяются сразу. Остальные (новые настройки самих подключений, IPv6)
 /// ждут: ядро перезапускается, только если без них запускаемое приложение не пойдёт как настроено, или когда через ядро
 /// ничего не идёт.
 /// Сервер проверяется каждые <see cref="HealthInterval"/>; два промаха подряд — сервер не отвечает: приложения
 /// с «Закрывать при обрыве» закрываются, остальные ждут без сети (их трафик всё равно идёт только в подключение).
+/// Сеть Windows изменилась или компьютер проснулся — внеочередная проверка (<see cref="CheckSoon"/>).
+/// Ядро может не заметить, что сеть вернулась (компьютер уснул сразу после отключения кабеля), и до перезапуска
+/// отвечать на любое соединение «no route to internet». Если так, а у Windows сеть есть, виноват не сервер: ядро
+/// перезапускается с теми же настройками (<see cref="RestartIfBlindAsync"/>), и промах не засчитывается.
 /// Ядро упало или пропала служба: работающие приложения через ядро приостанавливаются (пока ядра нет, фильтры Windows
 /// и так не пускают их в сеть) и ядро запускается заново. Не вышло или ядро падает <see cref="CrashesToClose"/>-й раз
 /// за <see cref="CrashWindow"/> — приложения закрываются.
@@ -106,6 +120,12 @@ public sealed class LauncherNetwork : IDisposable
     private const int CrashesToClose = 3;
     private static readonly TimeSpan CrashWindow = TimeSpan.FromMinutes(5);
 
+    /// <summary>Так ядро отвечает на любое соединение, пока не знает адаптера с выходом в интернет.</summary>
+    internal const string NoRouteMarker = "no route to internet";
+
+    /// <summary>Не больше стольких перезапусков ядра, не видящего сеть, за <see cref="CrashWindow"/>: дальше перезапуск не помогает.</summary>
+    private const int BlindRestartsLimit = 2;
+
     private readonly IAppProcesses _processes;
     private readonly Func<ICoreBackend> _backendFactory;
     private readonly TimeSpan _idleStop;
@@ -114,6 +134,7 @@ public sealed class LauncherNetwork : IDisposable
     private readonly object _state = new();
     private readonly Timer _idleTimer;
     private readonly Timer _healthTimer;
+    private readonly Timer _quickTimer;
     private readonly Dictionary<Guid, int> _misses = new();
     private readonly HashSet<Guid> _down = new();
 
@@ -122,6 +143,12 @@ public sealed class LauncherNetwork : IDisposable
 
     /// <summary>Когда ядро падало (за последние <see cref="CrashWindow"/>).</summary>
     private readonly List<DateTime> _crashes = new();
+
+    /// <summary>Когда перезапускалось ядро, не видящее сеть (за последние <see cref="CrashWindow"/>).</summary>
+    private readonly List<DateTime> _blindRestarts = new();
+
+    /// <summary>Когда в журнал записано, что ядро не видит сеть и больше не перезапускается (не чаще раза за <see cref="CrashWindow"/>).</summary>
+    private DateTime _blindGaveUpLogged;
 
     private ICoreBackend? _backend;
     private CorePlan _desired = CorePlan.Empty;
@@ -153,6 +180,7 @@ public sealed class LauncherNetwork : IDisposable
         _healthInterval = healthInterval;
         _idleTimer = new Timer(_ => OnIdle(), null, Timeout.Infinite, Timeout.Infinite);
         _healthTimer = new Timer(_ => _ = CheckHealthAsync(), null, Timeout.Infinite, Timeout.Infinite);
+        _quickTimer = new Timer(_ => _ = CheckHealthAsync(quick: true), null, Timeout.Infinite, Timeout.Infinite);
     }
 
     /// <summary>
@@ -178,6 +206,15 @@ public sealed class LauncherNetwork : IDisposable
 
     /// <summary>Пауза между попытками проверки перед запуском (в тестах короче).</summary>
     internal TimeSpan ProbeRetryPause { get; set; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>
+    /// Через сколько после смены сети или пробуждения проверять серверы (<see cref="CheckSoon"/>): сети нужно время,
+    /// а несколько изменений подряд дают одну проверку. В тестах — никогда, тесты проверяют сами.
+    /// </summary>
+    internal TimeSpan QuickCheckDelay { get; set; } = TimeSpan.FromSeconds(3);
+
+    /// <summary>Есть ли сеть у Windows (<see cref="HasNetwork"/>; в тестах подменяется).</summary>
+    internal Func<bool> NetworkAvailable { get; set; } = HasNetwork;
 
     /// <summary>
     /// Перед запуском сервер так и не ответил: что сказало ядро и его последние ошибки — для журнала событий. Любой поток.
@@ -354,8 +391,8 @@ public sealed class LauncherNetwork : IDisposable
     /// <summary>
     /// Что в новых настройках нельзя отложить: без перезапуска ядра программа шла бы не так, как выбрано. Это копии
     /// приложений, запущенные мимо лаунчера (их программы, подключение, исключения, «без интернета»; приложение убрали),
-    /// работающие приложения из <paramref name="running"/> (подключение, исключения, другое условие запуска) и «Скрывать
-    /// DNS-запросы» (касается всех программ). Не срочно: настройки самих подключений (обновилась подписка, выбран другой
+    /// работающие приложения из <paramref name="running"/> (подключение, исключения, другое условие запуска) и «Защита
+    /// от утечки DNS» (касается всех программ). Не срочно: настройки самих подключений (обновилась подписка, выбран другой
     /// сервер), IPv6 и приложения, которые не запущены и копии которых идут напрямую: прежние настройки продолжают работать,
     /// а запускаемое приложение получит новые при запуске. Исключение: приложение не запущено, а его копии мимо лаунчера
     /// идут через ядро. Запуска, который применил бы новые настройки подключения, может и не быть, а копия, открытая по
@@ -505,28 +542,63 @@ public sealed class LauncherNetwork : IDisposable
         lock (_state)
             generation = _generation;
         var watch = Stopwatch.StartNew();
+        var since = DateTime.Now;
         CoreProbe probe;
         var attempts = 0;
+        var restarted = false;
+        var blind = false;
         while (true)
         {
             attempts++;
             probe = await backend.ProbeAsync(tag, ProbeTimeout, cancellation).ConfigureAwait(false);
-            if (probe.Delay is null)
-                TechLog.Info(LogAreas.Network, LogCodes.ProbeFail,
-                    $"Проверка «{app.ConnectionName}» перед запуском «{app.Name}», попытка {attempts}: {probe.Failure ?? "нет ответа"} ({watch.ElapsedMilliseconds} мс с начала)");
+            if (probe.Delay is not null)
+                break;
+            TechLog.Info(LogAreas.Network, LogCodes.ProbeFail,
+                $"Проверка «{app.ConnectionName}» перед запуском «{app.Name}», попытка {attempts}: {probe.Failure ?? "нет ответа"} ({watch.ElapsedMilliseconds} мс с начала)");
             // Ещё попытка, только если до конца бюджета остаётся хотя бы её срок: с промахом на первой странице проверка
             // откроет и вторую, то есть может занять вдвое больше.
-            if (probe.Delay is not null || attempts >= LaunchProbeAttempts || watch.Elapsed + ProbeRetryPause + ProbeTimeout > LaunchProbeBudget)
+            if (attempts < LaunchProbeAttempts && watch.Elapsed + ProbeRetryPause + ProbeTimeout <= LaunchProbeBudget)
+            {
+                await Task.Delay(ProbeRetryPause, cancellation).ConfigureAwait(false);
+                continue;
+            }
+
+            // Ядро могло не заметить, что сеть вернулась: тогда оно перезапускается, и проверка начинается заново (один раз).
+            if (restarted)
+            {
+                blind = await IsBlindAsync(backend, since, cancellation).ConfigureAwait(false);
                 break;
-            await Task.Delay(ProbeRetryPause, cancellation).ConfigureAwait(false);
+            }
+
+            var restart = await RestartIfBlindAsync(backend, generation, since, $"запуск «{app.Name}»", cancellation).ConfigureAwait(false);
+            if (restart != true)
+            {
+                blind = restart == false;
+                break;
+            }
+
+            restarted = true;
+            backend = Backend();
+            lock (_state)
+                generation = _generation;
+            attempts = 0;
+            watch.Restart();
+            since = DateTime.Now;
         }
 
         if (probe.Delay is null)
         {
-            await ReportProbeFailureAsync(backend, app, tag, probe, attempts).ConfigureAwait(false);
+            var local = blind ? "ядро лаунчера не видит сеть компьютера"
+                : !NetworkAvailable() ? "компьютер не подключён к сети"
+                : null;
+            await ReportProbeFailureAsync(backend, app, tag, probe, attempts, local).ConfigureAwait(false);
             ScheduleIdleCheck();
-            return $"Сервер подключения «{app.ConnectionName}» не отвечает. Проверьте подключение в настройках или выберите другое. " +
-                   "Подробности сохранены в журналах.";
+            return local is null
+                ? $"Сервер подключения «{app.ConnectionName}» не отвечает. Проверьте подключение в настройках или выберите другое. " +
+                  "Подробности сохранены в журналах."
+                : blind
+                    ? "Ядро лаунчера не видит сеть компьютера, хотя она есть. Закройте лаунчер и откройте снова. Подробности сохранены в журналах."
+                    : "Компьютер не подключён к сети. Проверьте кабель или Wi-Fi и запустите приложение снова.";
         }
 
         TechLog.Info(LogAreas.Network, LogCodes.ProbeOk,
@@ -536,7 +608,7 @@ public sealed class LauncherNetwork : IDisposable
         return null;
     }
 
-    private async Task ReportProbeFailureAsync(ICoreBackend backend, CoreApp app, string tag, CoreProbe probe, int attempts)
+    private async Task ReportProbeFailureAsync(ICoreBackend backend, CoreApp app, string tag, CoreProbe probe, int attempts, string? local)
     {
         IReadOnlyList<string> log;
         try
@@ -551,10 +623,10 @@ public sealed class LauncherNetwork : IDisposable
         var important = ImportantLines(log, tag);
         TechLog.Warn(LogAreas.Network, LogCodes.ProbeFail,
             $"Сервер «{app.ConnectionName}» не ответил перед запуском «{app.Name}» (попыток {attempts}): {probe.Failure ?? "причина неизвестна"}" +
-            CoreLines(important));
+            (local is not null ? $"; причина на компьютере: {local}" : string.Empty) + CoreLines(important));
         ProbeFailed?.Invoke(new ProbeFailure(app.ConnectionId,
             $"Проверка сервера «{app.ConnectionName}» через ядро не прошла (попыток: {attempts}): {probe.Failure ?? "причина неизвестна"}",
-            important));
+            important, local));
     }
 
     /// <summary>Строки ядра для технического журнала (в одну запись).</summary>
@@ -757,7 +829,7 @@ public sealed class LauncherNetwork : IDisposable
 
     /// <summary>
     /// Пойдёт ли приложение через ядро с настройками <paramref name="applied"/> так же, как с <paramref name="desired"/>:
-    /// то же подключение с теми же настройками и DNS, те же исключения, то же «Скрывать DNS-запросы», так же идут его копии
+    /// то же подключение с теми же настройками и DNS, те же исключения, та же «Защита от утечки DNS», так же идут его копии
     /// мимо лаунчера.
     /// </summary>
     internal static bool SameRoute(CorePlan applied, CorePlan desired, Guid appId)
@@ -1145,8 +1217,12 @@ public sealed class LauncherNetwork : IDisposable
         }
     }
 
-    /// <summary>Проверка серверов, через которые сейчас идут приложения.</summary>
-    internal async Task CheckHealthAsync()
+    /// <summary>
+    /// Проверка серверов, через которые сейчас идут приложения. Внеочередная (<paramref name="quick"/>, после смены сети
+    /// или пробуждения) промахи не засчитывает: сеть появляется не сразу, и короткий перебой не должен закрывать
+    /// приложения. Она отмечает вернувшиеся серверы и перезапускает ядро, если оно не видит сеть.
+    /// </summary>
+    internal async Task CheckHealthAsync(bool quick = false)
     {
         if (Interlocked.Exchange(ref _healthRunning, 1) != 0)
             return;
@@ -1177,6 +1253,7 @@ public sealed class LauncherNetwork : IDisposable
                     continue; // подключение осталось в ядре только ради DNS
                 var tag = applied.ConnectionTags[connectionId];
                 var name = user.ConnectionName;
+                var since = DateTime.Now;
                 var probe = await backend.ProbeAsync(tag, ProbeTimeout, CancellationToken.None).ConfigureAwait(false);
                 if (probe.Delay is { } delay)
                 {
@@ -1185,6 +1262,22 @@ public sealed class LauncherNetwork : IDisposable
                     else
                         TechLog.Debug(LogAreas.Network, LogCodes.ProbeOk, $"Проверка «{name}»: {delay} мс");
                     MarkUp(applied, connectionId, generation);
+                    continue;
+                }
+
+                // Ядро не видит сеть, которая у Windows есть: виноват не сервер. Ядро перезапущено, промах не засчитывается,
+                // а серверы проверяются снова, как только ядро поднимется.
+                if (await RestartIfBlindAsync(backend, generation, since, quick ? "внеочередная проверка" : "проверка сервера",
+                        CancellationToken.None).ConfigureAwait(false) == true)
+                {
+                    CheckSoon();
+                    return;
+                }
+
+                if (quick)
+                {
+                    TechLog.Debug(LogAreas.Network, LogCodes.ProbeFail,
+                        $"Внеочередная проверка: сервер «{name}» не ответил, промах не засчитывается: {probe.Failure ?? "нет ответа"}");
                     continue;
                 }
 
@@ -1245,9 +1338,143 @@ public sealed class LauncherNetwork : IDisposable
         TechLog.Info(LogAreas.KillSwitch, LogCodes.KsClose, $"Обрыв «{name}»: закрыты {Names(report.Killed)}" +
             (report.Failed.Count > 0 ? $", не удалось закрыть {Names(report.Failed)}" : string.Empty) +
             (waiting.Count > 0 ? $", ждут без сети {Names(waiting)}" : string.Empty));
-        ConnectionDown?.Invoke(new ConnectionDownInfo(connectionId, name, report, waiting));
+        ConnectionDown?.Invoke(new ConnectionDownInfo(connectionId, name, report, waiting, !NetworkAvailable()));
         StateChanged?.Invoke();
         ScheduleIdleCheck();
+    }
+
+    /// <summary>
+    /// Сеть Windows изменилась или компьютер проснулся: проверить серверы вне очереди через <see cref="QuickCheckDelay"/>
+    /// (<see cref="CheckHealthAsync"/> с quick). Несколько вызовов подряд дают одну проверку. Любой поток.
+    /// </summary>
+    public void CheckSoon()
+    {
+        lock (_state)
+        {
+            if (_disposed || _applied is null)
+                return;
+            _quickTimer.Change(QuickCheckDelay, Timeout.InfiniteTimeSpan);
+        }
+    }
+
+    /// <summary>
+    /// Сервер не ответил. Ядро могло не заметить, что сеть вернулась (например, компьютер уснул сразу после отключения
+    /// кабеля): тогда до перезапуска оно отвечает на любое соединение «no route to internet», хотя у Windows сеть есть.
+    /// В этом случае ядро перезапускается с теми же настройками, а работающие через него приложения на это время
+    /// приостанавливаются, как при любом перезапуске: фильтры Windows и так не пускают их мимо адаптера ядра.
+    /// null — ядро сеть видит (виноват сервер, или сети нет у самой Windows); true — ядро перезапущено (или его уже
+    /// перезапустили), проверку стоит повторить; false — ядро сеть не видит, а перезапуск не помог или не удался.
+    /// </summary>
+    /// <param name="since">Когда началась проверка: старые строки журнала о том, что сети не было, в счёт не идут.</param>
+    private async Task<bool?> RestartIfBlindAsync(ICoreBackend backend, int generation, DateTime since, string trigger,
+        CancellationToken cancellation)
+    {
+        if (!await IsBlindAsync(backend, since, cancellation).ConfigureAwait(false))
+            return null;
+
+        await _gate.WaitAsync(cancellation).ConfigureAwait(false);
+        try
+        {
+            CorePlan? applied;
+            lock (_state)
+            {
+                if (_generation != generation)
+                    return _applied is not null ? true : null; // ядро уже перезапустили, пока шла проверка
+                applied = _applied;
+                if (applied is null)
+                    return null;
+                var now = DateTime.UtcNow;
+                _blindRestarts.RemoveAll(t => now - t > CrashWindow);
+                if (_blindRestarts.Count >= BlindRestartsLimit)
+                {
+                    if (now - _blindGaveUpLogged > CrashWindow)
+                    {
+                        _blindGaveUpLogged = now;
+                        TechLog.Warn(LogAreas.Network, LogCodes.CoreFail,
+                            $"Ядро не видит сеть, хотя у Windows она есть ({trigger}), и после {_blindRestarts.Count} перезапусков за 5 минут. " +
+                            "Больше не перезапускается: промахи засчитываются как обычно");
+                    }
+
+                    return false;
+                }
+
+                _blindRestarts.Add(now);
+            }
+
+            var running = _processes.RunningApps().Where(applied.Apps.ContainsKey).Distinct().ToList();
+            return await StartLockedAsync(applied, trigger,
+                "ядро не видит сеть, которая у Windows есть («no route to internet»), так бывает после сна компьютера",
+                running, cancellation).ConfigureAwait(false) is null;
+        }
+        finally
+        {
+            _gate.Release();
+        }
+    }
+
+    /// <summary>Ядро не видит сеть, которая у Windows есть (<see cref="CoreSeesNoNetwork"/>).</summary>
+    private async Task<bool> IsBlindAsync(ICoreBackend backend, DateTime since, CancellationToken cancellation)
+    {
+        if (!NetworkAvailable())
+            return false;
+        try
+        {
+            return CoreSeesNoNetwork(await backend.LogTailAsync(cancellation).ConfigureAwait(false), since);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return false; // журнала нет: судить о ядре не по чему
+        }
+    }
+
+    /// <summary>
+    /// Ядро не видит сеть: в его журнале с момента <paramref name="since"/> (секунда в запас) есть «no route to internet».
+    /// Строки журнала начинаются с местного времени «ЧЧ:мм:сс.ммм»: служба работает на том же компьютере.
+    /// </summary>
+    internal static bool CoreSeesNoNetwork(IReadOnlyList<string> log, DateTime since)
+    {
+        for (var i = log.Count - 1; i >= 0; i--)
+        {
+            var line = log[i];
+            if (line.Length < 12 || !line.Contains(NoRouteMarker, StringComparison.Ordinal) ||
+                !TimeSpan.TryParseExact(line.AsSpan(0, 12), @"hh\:mm\:ss\.fff", CultureInfo.InvariantCulture, out var time))
+                continue;
+            // Время без даты: разница по кругу суток (проверка могла начаться до полуночи).
+            var after = time - since.TimeOfDay;
+            if (after < -TimeSpan.FromHours(12))
+                after += TimeSpan.FromDays(1);
+            else if (after > TimeSpan.FromHours(12))
+                after -= TimeSpan.FromDays(1);
+            if (after >= -TimeSpan.FromSeconds(1))
+                return true;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Есть ли у Windows сеть: работающий адаптер со шлюзом, кроме адаптера ядра. Без шлюза выхода в интернет нет, и ядро
+    /// отвечает «no route to internet» по делу. Не узнать — считается, что сеть есть.
+    /// </summary>
+    public static bool HasNetwork()
+    {
+        try
+        {
+            foreach (var adapter in NetworkInterface.GetAllNetworkInterfaces())
+            {
+                if (adapter.OperationalStatus != OperationalStatus.Up || adapter.NetworkInterfaceType == NetworkInterfaceType.Loopback ||
+                    VpnAdapterDetector.IsOwnTunnel(adapter.Name))
+                    continue;
+                if (adapter.GetIPProperties().GatewayAddresses.Any(g => !g.Address.Equals(IPAddress.Any) && !g.Address.Equals(IPAddress.IPv6Any)))
+                    return true;
+            }
+        }
+        catch (NetworkInformationException)
+        {
+            return true;
+        }
+
+        return false;
     }
 
     private void NextGeneration()
@@ -1324,6 +1551,7 @@ public sealed class LauncherNetwork : IDisposable
 
         _idleTimer.Dispose();
         _healthTimer.Dispose();
+        _quickTimer.Dispose();
         if (backend is not null)
         {
             backend.Lost -= OnLost;

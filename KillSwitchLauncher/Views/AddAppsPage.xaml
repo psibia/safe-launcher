@@ -39,9 +39,7 @@
                            Text="Отметьте программы из меню «Пуск». Уже добавленные отмечены серым: убрать их можно в меню плитки." />
 
                 <Border Grid.Row="1" Style="{StaticResource PageCard}" Padding="8">
-                    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Focusable="False">
-                        <views:StartMenuList DataContext="{Binding List}" />
-                    </ScrollViewer>
+                    <views:StartMenuList DataContext="{Binding List}" />
                 </Border>
 
                 <!-- ===== Программы нет в списке ===== -->

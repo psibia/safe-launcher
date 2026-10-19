@@ -12,6 +12,7 @@ using System.Windows.Threading;
 using KillSwitchLauncher.Services;
 using KillSwitchLauncher.ViewModels;
 using KillSwitchLauncher.Views;
+using Microsoft.Win32;
 
 namespace KillSwitchLauncher;
 
@@ -67,6 +68,14 @@ public partial class MainWindow : Window
         _tray.NotificationClicked += (_, _) => OnNotificationClicked();
         _tray.MenuRequested += (_, _) => ShowTrayMenu();
         _viewModel.PropertyChanged += OnViewModelPropertyChanged;
+        SystemEvents.PowerModeChanged += OnPowerModeChanged;
+    }
+
+    /// <summary>Компьютер вышел из сна: сеть могла смениться (поток SystemEvents).</summary>
+    private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
+    {
+        if (e.Mode == PowerModes.Resume)
+            _viewModel.OnResumedFromSleep();
     }
 
     /// <summary>Затемнение окна, пока открыт диалог (вызывается из DialogService).</summary>
@@ -397,6 +406,7 @@ public partial class MainWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        SystemEvents.PowerModeChanged -= OnPowerModeChanged;
         _toastTimer.Stop();
         _tray.Dispose();
         _viewModel.Dispose();

@@ -66,7 +66,10 @@ public sealed class NetworkPlan
     /// </summary>
     public OutsideCopies OutsideCopies { get; }
 
-    /// <summary>Домены, которые идут мимо подключения лаунчера. Пусто, если трафик ведёт не лаунчер.</summary>
+    /// <summary>
+    /// Домены, которые идут мимо подключения лаунчера: общие и свои исключения (или только свои, «Вместо общих»).
+    /// Пусто, если трафик ведёт не лаунчер.
+    /// </summary>
     public IReadOnlyList<string> DirectDomains { get; }
 
     /// <summary>Трафик приложения ведёт ядро лаунчера (или должно вести, но подключение не выбрано).</summary>
@@ -103,7 +106,7 @@ public sealed class NetworkPlan
         NetworkPlan Launcher(NetworkPlanSource source, Guid? connectionId)
         {
             var connection = connectionId is { } id ? settings.Connections.FirstOrDefault(c => c.Id == id) : null;
-            var domains = (network.DirectDomains ?? new List<string>()).ToArray();
+            var domains = DomainList.Combine(settings.DirectDomains, network.DirectDomains, network.DomainsMode).ToArray();
             // Своё подключение без ядра невозможно, поэтому без подключения запуск запрещён.
             return connection is null
                 ? new NetworkPlan(NetworkPlanKind.MissingConnection, source, null, null, closeOnDrop, outsideCopies, domains)

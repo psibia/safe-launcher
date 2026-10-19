@@ -34,7 +34,7 @@ public sealed class CoreStartRequest
     /// <summary>Давать адаптеру ядра адрес IPv6 (только если в сети есть IPv6).</summary>
     public bool Ipv6 { get; set; }
 
-    /// <summary>Скрывать DNS-запросы от провайдера: подменные адреса для службы DNS Windows (настройка на весь компьютер).</summary>
+    /// <summary>«Защита от утечки DNS»: подменные адреса для службы DNS Windows (настройка на весь компьютер).</summary>
     public bool HideDns { get; set; }
 
     /// <summary>DNS-сервер внутри подключения (tag → IP), например из файла WireGuard.</summary>

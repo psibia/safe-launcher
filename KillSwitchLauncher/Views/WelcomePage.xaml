@@ -147,9 +147,8 @@
                                Text="Отметьте программы из меню «Пуск». Другие можно добавить потом кнопкой «Добавить приложение» или перетащив .exe или ярлык в окно." />
 
                     <Border Style="{StaticResource PageCard}" Padding="8">
-                        <ScrollViewer MaxHeight="340" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Focusable="False">
-                            <views:StartMenuList DataContext="{Binding AppList}" />
-                        </ScrollViewer>
+                        <!-- Список не выше прежних 340, плюс поле поиска над ним -->
+                        <views:StartMenuList DataContext="{Binding AppList}" MaxHeight="388" />
                     </Border>
 
                     <Grid Margin="0,18,0,0">

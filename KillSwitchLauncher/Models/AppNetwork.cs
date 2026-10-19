@@ -32,6 +32,16 @@ public enum GlobalNetworkMode
     LauncherConnection
 }
 
+/// <summary>Как исключения приложения сочетаются с общими исключениями из настроек.</summary>
+public enum DomainsMode
+{
+    /// <summary>«Дополнять общие»: напрямую идут и общие домены, и свои.</summary>
+    AddToCommon,
+
+    /// <summary>«Вместо общих»: только свои домены; пустой список — исключений нет, всё через подключение.</summary>
+    OwnOnly
+}
+
 /// <summary>Защита приложения поверх общих настроек.</summary>
 public enum ProtectionOverride
 {
@@ -71,4 +81,7 @@ public sealed class AppNetwork
     /// Действуют, только когда трафик ведёт ядро лаунчера.
     /// </summary>
     public List<string> DirectDomains { get; set; } = new();
+
+    /// <summary>Свои исключения дополняют общие (<see cref="AppSettings.DirectDomains"/>) или заменяют их.</summary>
+    public DomainsMode DomainsMode { get; set; } = DomainsMode.AddToCommon;
 }

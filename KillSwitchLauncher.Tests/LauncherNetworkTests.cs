@@ -684,8 +684,148 @@ public class LauncherNetworkTests
     private LauncherNetwork Network(TimeSpan? idle = null) =>
         new(_processes, () => _backend, idle ?? TimeSpan.FromHours(1), TimeSpan.FromHours(1))
         {
-            ProbeRetryPause = TimeSpan.FromMilliseconds(10)
+            ProbeRetryPause = TimeSpan.FromMilliseconds(10),
+            QuickCheckDelay = Timeout.InfiniteTimeSpan,
+            NetworkAvailable = () => true
         };
+
+    /// <summary>Строка журнала ядра, которое не видит сеть, со временем <paramref name="at"/> (как её пишет служба).</summary>
+    private static string NoRoute(DateTime at) =>
+        at.ToString("HH:mm:ss.fff", System.Globalization.CultureInfo.InvariantCulture) +
+        " ERROR [7 0ms] connection: open connection to 1.2.3.4:443 using outbound/vless[c1]: dial tcp 5.6.7.8:8443: no route to internet";
+
+    [Fact]
+    public void CoreSeesNoNetwork_OnlyFreshNoRouteLines()
+    {
+        var since = new DateTime(2026, 10, 19, 15, 52, 50);
+        Assert.True(LauncherNetwork.CoreSeesNoNetwork(new[] { "15:52:49.900 INFO x", NoRoute(since.AddSeconds(2)) }, since));
+        Assert.True(LauncherNetwork.CoreSeesNoNetwork(new[] { NoRoute(since.AddMilliseconds(-500)) }, since)); // секунда в запас
+        Assert.False(LauncherNetwork.CoreSeesNoNetwork(new[] { NoRoute(since.AddSeconds(-20)) }, since)); // сети не было раньше
+        Assert.False(LauncherNetwork.CoreSeesNoNetwork(new[] { "15:52:55.000 ERROR dial tcp: i/o timeout" }, since));
+        Assert.False(LauncherNetwork.CoreSeesNoNetwork(new[] { "no route to internet" }, since));
+
+        // Проверка началась до полуночи, строка — после.
+        var late = new DateTime(2026, 10, 19, 23, 59, 59);
+        Assert.True(LauncherNetwork.CoreSeesNoNetwork(new[] { NoRoute(late.AddSeconds(2)) }, late));
+    }
+
+    [Fact]
+    public async Task BlindCore_LaunchRestartsCore_ThenLaunches()
+    {
+        // Компьютер уснул сразу после отключения кабеля: ядро не заметило, что сеть вернулась, и на всё отвечает
+        // «no route to internet». Сервер при этом работает: после перезапуска ядра он отвечает.
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        var b = NetworkSamples.App("B");
+        using var network = Network();
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection, a, b), false));
+        Assert.Null(await network.PrepareLaunchAsync(a.Id));
+        _processes.Running.Add(a.Id);
+
+        _backend.Delay = _ => _backend.Starts >= 2 ? 40 : null;
+        _backend.CoreLog.Add(NoRoute(DateTime.Now.AddSeconds(30)));
+        var failed = false;
+        network.ProbeFailed += _ => failed = true;
+
+        Assert.Null(await network.PrepareLaunchAsync(b.Id));
+        Assert.Equal(2, _backend.Starts);
+        Assert.Contains(a.Id, _processes.FrozenApps); // работающее приложение на время перезапуска приостановлено
+        Assert.Equal(_processes.Frozen, _processes.Thawed);
+        Assert.False(failed);
+    }
+
+    [Fact]
+    public async Task BlindCore_HealthCheck_RestartsInsteadOfMiss_ThenGivesUp()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A", closeOnDrop: ProtectionOverride.On);
+        using var network = Network();
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection, a), false));
+        Assert.Null(await network.PrepareLaunchAsync(a.Id));
+        _processes.Running.Add(a.Id);
+        ConnectionDownInfo? down = null;
+        network.ConnectionDown += info => down = info;
+
+        _backend.Delay = _ => null;
+        _backend.CoreLog.Add(NoRoute(DateTime.Now.AddSeconds(30)));
+
+        // Два перезапуска за 5 минут: промахи не засчитываются, приложение работает.
+        await network.CheckHealthAsync();
+        await network.CheckHealthAsync();
+        Assert.Equal(3, _backend.Starts);
+        Assert.Empty(_processes.Killed);
+        Assert.Null(down);
+
+        // Перезапуск не помогает: дальше как при обрыве.
+        await network.CheckHealthAsync();
+        await network.CheckHealthAsync();
+        Assert.Equal(3, _backend.Starts);
+        Assert.Equal(new[] { a.Id }, _processes.Killed);
+        Assert.False(down!.NoNetwork);
+    }
+
+    [Fact]
+    public async Task NoNetworkOnComputer_NoRestart_PlainMessage()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        using var network = Network();
+        network.NetworkAvailable = () => false;
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection, a), false));
+        _backend.Delay = _ => null;
+        _backend.CoreLog.Add(NoRoute(DateTime.Now.AddSeconds(30)));
+        ProbeFailure? failure = null;
+        network.ProbeFailed += f => failure = f;
+
+        Assert.Contains("не подключён к сети", await network.PrepareLaunchAsync(a.Id));
+        Assert.Equal(1, _backend.Starts);
+        Assert.Equal("компьютер не подключён к сети", failure!.LocalCause);
+    }
+
+    [Fact]
+    public async Task OldNoRouteLines_ServerBlamed_NoRestart()
+    {
+        // Сети не было минуту назад, теперь она есть, а сервер не отвечает: ядро ни при чём.
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A");
+        using var network = Network();
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection, a), false));
+        _backend.Delay = _ => null;
+        _backend.CoreLog.Add(NoRoute(DateTime.Now.AddMinutes(-1)));
+        ProbeFailure? failure = null;
+        network.ProbeFailed += f => failure = f;
+
+        Assert.Contains("не отвечает", await network.PrepareLaunchAsync(a.Id));
+        Assert.Equal(1, _backend.Starts);
+        Assert.Null(failure!.LocalCause);
+    }
+
+    [Fact]
+    public async Task QuickCheck_NoMisses_ButServerBackIsNoticed()
+    {
+        var connection = NetworkSamples.Link("Германия");
+        var a = NetworkSamples.App("A", closeOnDrop: ProtectionOverride.Off);
+        using var network = Network();
+        network.Update(CorePlan.Build(NetworkSamples.Settings(connection, a), false));
+        Assert.Null(await network.PrepareLaunchAsync(a.Id));
+        _processes.Running.Add(a.Id);
+        string? up = null;
+        network.ConnectionUp += (_, name) => up = name;
+
+        _backend.Delay = _ => null;
+        for (var i = 0; i < 3; i++)
+            await network.CheckHealthAsync(quick: true);
+        Assert.Equal(CoreAppState.Protected, network.StateOf(a.Id)); // сеть после смены появляется не сразу
+
+        await network.CheckHealthAsync();
+        await network.CheckHealthAsync();
+        Assert.Equal(CoreAppState.Waiting, network.StateOf(a.Id));
+
+        _backend.Delay = _ => 50;
+        await network.CheckHealthAsync(quick: true);
+        Assert.Equal("Германия", up);
+        Assert.Equal(CoreAppState.Protected, network.StateOf(a.Id));
+    }
 
     [Fact]
     public async Task FirstLaunch_StartsCore_SecondDoesNotRestart()
@@ -2159,5 +2299,162 @@ public class BrowsersAndSubscriptionsTests
         var connection = Subscription("trojan://a@1.1.1.1:443#A");
 
         Assert.False(SubscriptionUpdater.Apply(connection, new SubscriptionContent(new[] { "trojan://a@1.1.1.1:443#A" }, 0), DateTimeOffset.Now));
+    }
+}
+
+/// <summary>
+/// Общие исключения: дополняются или заменяются исключениями приложения и доходят до правил ядра только у приложений
+/// через подключение лаунчера. Остальной трафик по-прежнему идёт через подключение.
+/// </summary>
+public class CommonDomainsTests
+{
+    private static readonly VpnConnection Connection = NetworkSamples.Link("Германия");
+
+    private static AppEntry Own(AppEntry app, DomainsMode mode)
+    {
+        app.Network.DomainsMode = mode;
+        return app;
+    }
+
+    private static AppSettings Settings(params AppEntry[] apps)
+    {
+        var settings = NetworkSamples.Settings(Connection, apps);
+        settings.DirectDomains = new List<string> { "kaspi.kz", "gosuslugi.ru" };
+        return settings;
+    }
+
+    [Fact]
+    public void AddToCommon_IsTheDefault_CommonFirstThenOwn_NoDuplicates()
+    {
+        var app = NetworkSamples.App("Discord", domains: new[] { "discord.com", "kaspi.kz" });
+
+        Assert.Equal(DomainsMode.AddToCommon, app.Network.DomainsMode);
+        Assert.Equal(new[] { "kaspi.kz", "gosuslugi.ru", "discord.com" }, NetworkPlan.For(app, Settings(app)).DirectDomains);
+    }
+
+    [Fact]
+    public void OwnOnly_ReplacesCommon_EmptyMeansNoExceptions()
+    {
+        var own = Own(NetworkSamples.App("Банк", domains: "bank.kz"), DomainsMode.OwnOnly);
+        var none = Own(NetworkSamples.App("Почта"), DomainsMode.OwnOnly);
+        var settings = Settings(own, none);
+
+        Assert.Equal(new[] { "bank.kz" }, NetworkPlan.For(own, settings).DirectDomains);
+        Assert.Empty(NetworkPlan.For(none, settings).DirectDomains);
+    }
+
+    [Fact]
+    public void Common_OnlyForLauncherConnection_NotSystemVpnOrOffline()
+    {
+        var adapters = NetworkSamples.App("Игра", AppNetworkMode.OwnAdapters);
+        var offline = NetworkSamples.App("Редактор", AppNetworkMode.Offline);
+        var own = NetworkSamples.App("Discord", AppNetworkMode.OwnConnection, Connection.Id);
+        var settings = Settings(adapters, offline, own);
+
+        Assert.Empty(NetworkPlan.For(adapters, settings).DirectDomains);
+        Assert.Empty(NetworkPlan.For(offline, settings).DirectDomains);
+        Assert.Empty(NetworkPlan.For(own, settings, offlineRun: true).DirectDomains);
+        Assert.Equal(new[] { "kaspi.kz", "gosuslugi.ru" }, NetworkPlan.For(own, settings).DirectDomains);
+
+        // Общее условие — системный VPN: приложения «как в общих» ядро не ведёт, исключений нет.
+        var inherit = NetworkSamples.App("Telegram");
+        settings.Apps.Add(inherit);
+        settings.NetworkMode = GlobalNetworkMode.SystemVpn;
+        Assert.Empty(NetworkPlan.For(inherit, settings).DirectDomains);
+    }
+
+    [Fact]
+    public void NoCommonList_BehavesAsBefore()
+    {
+        var app = NetworkSamples.App("Discord", domains: "discord.com");
+        var settings = NetworkSamples.Settings(Connection, app);
+
+        Assert.Equal(new[] { "discord.com" }, NetworkPlan.For(app, settings).DirectDomains);
+        Own(app, DomainsMode.OwnOnly);
+        Assert.Equal(new[] { "discord.com" }, NetworkPlan.For(app, settings).DirectDomains);
+    }
+
+    [Fact]
+    public void CoreRules_DirectOnlyForListedDomainsOfEachApp_RestThroughConnection()
+    {
+        var add = NetworkSamples.App("Discord", domains: "discord.com");
+        var empty = Own(NetworkSamples.App("Банк"), DomainsMode.OwnOnly);
+        var ownOnly = Own(NetworkSamples.App("Почта", domains: "mail.kz"), DomainsMode.OwnOnly);
+        var adapters = NetworkSamples.App("Игра", AppNetworkMode.OwnAdapters, domains: "game.com");
+        var plan = CorePlan.Build(Settings(add, empty, ownOnly, adapters), ipv6: false);
+
+        Assert.False(plan.Apps.ContainsKey(adapters.Id));
+        var request = new Svc.CoreRequest
+        {
+            Outbounds = plan.Request.Outbounds,
+            Apps = plan.Request.Apps.Select(r => new Svc.CoreAppRoute { Tag = r.Tag, Outbound = r.Outbound, DirectDomains = r.DirectDomains }).ToList(),
+            OutboundDns = plan.Request.OutboundDns
+        };
+        var rules = Svc.CoreConfigBuilder.Build(request)["route"]!["rules"]!.AsArray();
+
+        string[] Direct(AppEntry app)
+        {
+            var prefix = "^" + System.Text.RegularExpressions.Regex.Escape("launcher:" + plan.Apps[app.Id].Tag) + @"\|";
+            return rules.Where(r => (string?)r!["outbound"] == Svc.CoreConfigBuilder.DirectTag &&
+                                    r!["process_path_regex"]!.AsArray().Any(p => (string?)p == prefix))
+                .SelectMany(r => r!["domain_suffix"]!.AsArray().Select(d => (string)d!)).ToArray();
+        }
+
+        Assert.Equal(new[] { "kaspi.kz", "gosuslugi.ru", "discord.com" }, Direct(add));
+        Assert.Empty(Direct(empty));
+        Assert.Equal(new[] { "mail.kz" }, Direct(ownOnly));
+
+        // Прямой маршрут — только с доменами: у каждого приложения нет правила «напрямую» без списка сайтов,
+        // а последнее правило приложения ведёт всё остальное в его подключение.
+        Assert.All(rules.Where(r => (string?)r!["outbound"] == Svc.CoreConfigBuilder.DirectTag && r!["process_path_regex"] is not null),
+            r => Assert.NotEmpty(r!["domain_suffix"]!.AsArray()));
+        var connectionTag = CorePlan.ConnectionTag(Connection.Id);
+        foreach (var app in new[] { add, empty, ownOnly })
+        {
+            var prefix = "^" + System.Text.RegularExpressions.Regex.Escape("launcher:" + plan.Apps[app.Id].Tag) + @"\|";
+            Assert.Contains(rules, r => (string?)r!["outbound"] == connectionTag && r!["domain_suffix"] is null &&
+                                        r["process_path_regex"]!.AsArray().Any(p => (string?)p == prefix));
+        }
+    }
+
+    [Fact]
+    public void ChangingCommonList_ChangesRunningAppsRoute()
+    {
+        var app = NetworkSamples.App("Discord");
+        var settings = Settings(app);
+        var before = CorePlan.Build(settings, ipv6: false);
+
+        settings.DirectDomains.Add("example.com");
+        var after = CorePlan.Build(settings, ipv6: false);
+
+        Assert.NotEqual(before.Fingerprint, after.Fingerprint);
+        Assert.False(LauncherNetwork.SameRoute(before, after, app.Id));
+
+        // «Вместо общих»: общий список приложения не касается.
+        Own(app, DomainsMode.OwnOnly);
+        var own = CorePlan.Build(settings, ipv6: false);
+        settings.DirectDomains.Add("other.com");
+        Assert.True(LauncherNetwork.SameRoute(own, CorePlan.Build(settings, ipv6: false), app.Id));
+    }
+
+    [Fact]
+    public void Combine_NeverMoreThanServiceAccepts()
+    {
+        var common = Enumerable.Range(0, 800).Select(i => $"c{i}.com").ToList();
+        var own = Enumerable.Range(0, 800).Select(i => $"o{i}.com").ToList();
+
+        Assert.Equal(DomainList.MaxPerApp, DomainList.Combine(common, own, DomainsMode.AddToCommon).Count);
+        Assert.Equal(800, DomainList.Combine(common, own, DomainsMode.OwnOnly).Count);
+        Assert.Empty(DomainList.Combine(null, null, DomainsMode.AddToCommon));
+    }
+
+    [Fact]
+    public void FieldText_SplitAndProblems()
+    {
+        Assert.Equal(new[] { "kaspi.kz", "https://gosuslugi.ru/help", "a.com", "b.com" },
+            DomainList.Split("kaspi.kz\r\n https://gosuslugi.ru/help \n\na.com, b.com"));
+        Assert.Null(DomainList.Problem("kaspi.kz\n*.gosuslugi.ru"));
+        Assert.Null(DomainList.Problem(""));
+        Assert.Contains("домен!", DomainList.Problem("kaspi.kz\nне домен!") ?? "нет");
     }
 }

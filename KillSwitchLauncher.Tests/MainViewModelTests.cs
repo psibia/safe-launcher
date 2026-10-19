@@ -338,6 +338,43 @@ public class MainViewModelTests : IDisposable
     }
 
     [Fact]
+    public void CommonDomains_AreNormalizedSavedAndLogged()
+    {
+        WithViewModel((vm, log) =>
+        {
+            vm.CommonDomainsText = "https://www.Kaspi.kz/shop\nkaspi.kz\n*.gosuslugi.ru";
+            Assert.True(vm.HasPendingChanges);
+
+            vm.ApplySettingsCommand.Execute(null);
+
+            Assert.False(vm.HasPendingChanges);
+            Assert.Equal(new[] { "www.kaspi.kz", "kaspi.kz", "gosuslugi.ru" }, Storage.Load().DirectDomains);
+            Assert.Equal(string.Join(Environment.NewLine, "www.kaspi.kz", "kaspi.kz", "gosuslugi.ru"), vm.CommonDomainsText);
+            Assert.Contains(log.Snapshot(), e => e.Text == "Общие исключения: 3 (напрямую, мимо подключения лаунчера)");
+
+            vm.CommonDomainsText = "";
+            vm.ApplySettingsCommand.Execute(null);
+            Assert.Empty(Storage.Load().DirectDomains);
+            Assert.Contains(log.Snapshot(), e => e.Text == "Общие исключения убраны");
+        });
+    }
+
+    [Fact]
+    public void CommonDomains_WrongDomain_IsNotApplied()
+    {
+        WithViewModel((vm, _) =>
+        {
+            vm.CommonDomainsText = "kaspi.kz\nне_домен";
+            vm.ApplySettingsCommand.Execute(null);
+
+            Assert.True(vm.HasPendingChanges);
+            Assert.Equal(SettingsSection.Exclusions, vm.Section);
+            Assert.Contains("не похоже на домен", Assert.Single(_dialogs.Warnings));
+            Assert.Empty(Storage.Load().DirectDomains);
+        });
+    }
+
+    [Fact]
     public void ViaLauncher_FiltersActBeforeTheAppIsLaunched()
     {
         // Копия, открытая не из лаунчера, ещё до того, как он возьмёт её под контроль, выходит в сеть только через VPN приложения.

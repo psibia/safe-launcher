@@ -517,6 +517,39 @@ public class PagesTests : IDisposable
     }
 
     [Fact]
+    public void AppPage_DomainsMode_ShowsCommonAndIsSaved()
+    {
+        var exe = FakeExe("Tool");
+        Preset(s =>
+        {
+            s.WelcomeDone = true;
+            s.NetworkMode = GlobalNetworkMode.LauncherConnection;
+            var connection = new VpnConnection { Name = "Германия", Kind = ConnectionKind.Link, Link = "trojan://secret@5.6.7.8:443#A" };
+            s.Connections.Add(connection);
+            s.ConnectionId = connection.Id;
+            s.DirectDomains = new List<string> { "kaspi.kz", "gosuslugi.ru" };
+            s.Apps.Add(new AppEntry { Name = "Tool", ExePath = exe });
+        });
+
+        WithViewModel(vm =>
+        {
+            vm.Apps[0].OpenSettingsCommand.Execute(null);
+            var page = vm.AppPage!;
+            Assert.Equal(DomainsMode.AddToCommon, page.DomainsMode);
+            Assert.Equal("Напрямую идут и общие исключения (2): kaspi.kz, gosuslugi.ru.", page.CommonDomainsHint);
+
+            page.DomainsMode = DomainsMode.OwnOnly;
+            Assert.True(page.HasChanges);
+            Assert.StartsWith("Общие исключения (2) не действуют", page.CommonDomainsHint);
+            page.SaveCommand.Execute(null);
+
+            Assert.Null(page.Error);
+        });
+
+        Assert.Equal(DomainsMode.OwnOnly, Storage.Load().Apps[0].Network.DomainsMode);
+    }
+
+    [Fact]
     public void AppPage_WrongDomain_Explains()
     {
         var exe = FakeExe("Tool");

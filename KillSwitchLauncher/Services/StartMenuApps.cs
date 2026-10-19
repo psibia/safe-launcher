@@ -84,4 +84,37 @@ public static class StartMenuApps
             .Select(g => g.OrderBy(a => a.Name.Length).First())
             .OrderBy(a => a.Name, StringComparer.CurrentCultureIgnoreCase)
             .ToList();
+
+    // Клавиши русской раскладки на тех же местах, что и английской: «еуд» набрано вместо «tel».
+    private const string EnKeys = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`";
+    private const string RuKeys = "йцукенгшщзхъфывапролджэячсмитьбюё";
+
+    /// <summary>
+    /// Поиск в списке: каждое слово запроса есть в названии ярлыка или в имени .exe, без учёта регистра, «ё» и «е»
+    /// не различаются. Запрос, набранный не в той раскладке, тоже находит программу.
+    /// </summary>
+    public static bool Matches(StartMenuApp app, string? query)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+            return true;
+
+        var exe = app.ExePath[(app.ExePath.LastIndexOfAny(new[] { '\\', '/' }) + 1)..];
+        var text = Normalize(app.Name + " " + exe);
+        var words = Normalize(query);
+        return HasAll(text, words) || HasAll(text, Normalize(SwitchLayout(words)));
+    }
+
+    private static bool HasAll(string text, string query) =>
+        query.Split(' ', StringSplitOptions.RemoveEmptyEntries).All(w => text.Contains(w, StringComparison.Ordinal));
+
+    private static string Normalize(string s) => s.ToLowerInvariant().Replace('ё', 'е');
+
+    private static string SwitchLayout(string s) => new(s.Select(c =>
+    {
+        var i = EnKeys.IndexOf(c);
+        if (i >= 0)
+            return RuKeys[i];
+        i = RuKeys.IndexOf(c);
+        return i >= 0 ? EnKeys[i] : c;
+    }).ToArray());
 }
