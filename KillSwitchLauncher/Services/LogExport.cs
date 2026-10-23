@@ -106,6 +106,9 @@ public sealed class ExportOptions
 
     public bool HideSites { get; init; }
 
+    /// <summary>Названия приложений, подключений, адаптеров, программ, папок и файлов → метки (<see cref="NameMasker"/>).</summary>
+    public bool HideNames { get; init; }
+
     public bool IncludeDns { get; init; }
 
     /// <summary>Строки ядра только WARN/ERROR, кроме ±15 минут вокруг отметок (для очень больших выгрузок, §5.5).</summary>
@@ -149,6 +152,9 @@ public sealed class ExportInput
 
     public JsonObject? Tags { get; init; }
 
+    /// <summary>Известные названия → метки для <see cref="ExportOptions.HideNames"/>: приложения, подключения, адаптеры, параметры запуска.</summary>
+    public IReadOnlyList<KeyValuePair<string, string>> Names { get; init; } = Array.Empty<KeyValuePair<string, string>>();
+
     public LogSettings Logging { get; init; } = new();
 
     public bool MaskKeyShared { get; init; }
@@ -169,8 +175,8 @@ public sealed record ExportResult(int Lines, IReadOnlyList<string> Files, bool E
 
 /// <summary>
 /// Выгрузка для анализа (концепция §5.3): zip со сводкой, общей лентой, журналами по источникам, Журналом событий, снимками
-/// настроек, окружения и состояния, конфигами ядра и описаниями падений. Секреты не попадают никогда; адреса и имена сайтов
-/// скрываются по галочкам.
+/// настроек, окружения и состояния, конфигами ядра и описаниями падений. Секреты не попадают никогда; адреса, имена сайтов
+/// и названия программ и подключений скрываются по галочкам.
 /// </summary>
 public static class LogExport
 {
@@ -197,18 +203,21 @@ public static class LogExport
     public static ExportResult Write(Stream output, ExportOptions options, ExportInput input, LogMasker masker, DateTime createdUtc)
     {
         var period = options.Period;
-        string Clean(string? text)
+        var names = options.HideNames ? new NameMasker(masker, input.Names) : null;
+
+        // Названия скрываются до имен сайтов: так «Telegram.exe» станет программой, а не сайтом.
+        string Hide(string text)
         {
-            var result = options.HideAddresses && !input.Logging.HideAddresses ? masker.MaskAddressesNow(text) : masker.MaskSecretsOnly(text);
+            var result = names is null ? text : names.Mask(text);
             return options.HideSites ? masker.MaskDomains(result) : result;
         }
 
+        string Clean(string? text) =>
+            Hide(options.HideAddresses && !input.Logging.HideAddresses ? masker.MaskAddressesNow(text) : masker.MaskSecretsOnly(text));
+
         // Журнал событий и отчёты о сбоях пишутся без скрытия адресов, даже если журналы их скрывают: скрываем здесь.
-        string CleanRaw(string? text)
-        {
-            var result = options.HideAddresses || input.Logging.HideAddresses ? masker.MaskAddressesNow(text) : masker.MaskSecretsOnly(text);
-            return options.HideSites ? masker.MaskDomains(result) : result;
-        }
+        string CleanRaw(string? text) =>
+            Hide(options.HideAddresses || input.Logging.HideAddresses ? masker.MaskAddressesNow(text) : masker.MaskSecretsOnly(text));
 
         var all = new List<LogLine>(input.Launcher.Count + input.Service.Count);
         all.AddRange(input.Launcher.Where(l => InPeriod(l.TimeUtc, period)));
@@ -255,8 +264,8 @@ public static class LogExport
                 if (node is null)
                     return;
                 var sanitized = ConfigSanitizer.Sanitize(node.DeepClone(), masker, options.HideAddresses || input.Logging.HideAddresses);
-                if (options.HideSites)
-                    sanitized = MaskSites(sanitized, masker);
+                if (options.HideSites || names is not null)
+                    sanitized = MaskStrings(sanitized, Hide);
                 Text(name, sanitized?.ToJsonString(Pretty) ?? "null");
             }
 
@@ -283,10 +292,10 @@ public static class LogExport
             {
                 var name = "core-configs/" + config.Name;
                 configNames[config] = name;
-                Text(name, CleanConfig(config.Content, masker, options, input.Logging.HideAddresses));
+                Text(name, CleanConfig(config.Content, masker, options, input.Logging.HideAddresses, Hide));
             }
             if (configs.LastOrDefault(c => c.Utc <= period.ToUtc) is { } last)
-                Text("core-config.json", CleanConfig(last.Content, masker, options, input.Logging.HideAddresses));
+                Text("core-config.json", CleanConfig(last.Content, masker, options, input.Logging.HideAddresses, Hide));
 
             foreach (var crash in input.LauncherCrashes.Concat(input.ServiceFiles.Where(f => f.Name.StartsWith(CrashReport.FilePrefix, StringComparison.OrdinalIgnoreCase))))
             {
@@ -299,7 +308,7 @@ public static class LogExport
                 var used = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
                 foreach (var journal in input.Dns)
                 {
-                    var name = SafeName(journal.AppName);
+                    var name = SafeName(names is null ? journal.AppName : names.Mask(journal.AppName));
                     var unique = name;
                     for (var i = 2; !used.Add(unique); i++)
                         unique = name + "-" + i;
@@ -310,7 +319,7 @@ public static class LogExport
                         if (e.IsMarker)
                             text.Append("---- ").Append(Clean(e.Domain)).Append(" ----");
                         else
-                            text.Append(e.ProcessName).Append(" (").Append(e.ProcessId).Append(")\t").Append(e.TypeText).Append('\t').Append(Clean(e.Domain));
+                            text.Append(names is null ? e.ProcessName : names.MaskProcess(e.ProcessName)).Append(" (").Append(e.ProcessId).Append(")\t").Append(e.TypeText).Append('\t').Append(Clean(e.Domain));
                         text.Append('\n');
                     }
                     Text("dns/" + unique + ".log", text.ToString());
@@ -320,7 +329,8 @@ public static class LogExport
             if (input.ServiceProblem is { } problem)
                 Text("notes.txt", "Журналов службы и ядра в архиве нет: " + problem + "\r\n");
 
-            var summary = Summary(options, input, clean, markers.Select(m => m with { Text = Clean(m.Text) }).ToList(), configs, configNames, createdUtc, Clean);
+            var tags = names is null ? input.Tags?.DeepClone() : MaskStrings(input.Tags?.DeepClone(), Hide);
+            var summary = Summary(options, input, clean, markers.Select(m => m with { Text = Clean(m.Text) }).ToList(), configs, configNames, createdUtc, Clean, tags);
             files.Insert(0, "summary.json");
             summary["files"] = new JsonArray(files.Select(f => (JsonNode)JsonValue.Create(f)!).ToArray());
             var entry = zip.CreateEntry("summary.json", CompressionLevel.Optimal);
@@ -333,7 +343,8 @@ public static class LogExport
     }
 
     private static JsonObject Summary(ExportOptions options, ExportInput input, IReadOnlyList<LogLine> lines, IReadOnlyList<LogLine> markers,
-        IReadOnlyList<ExportFile> configs, IReadOnlyDictionary<ExportFile, string> configNames, DateTime createdUtc, Func<string?, string> clean)
+        IReadOnlyList<ExportFile> configs, IReadOnlyDictionary<ExportFile, string> configNames, DateTime createdUtc, Func<string?, string> clean,
+        JsonNode? tags)
     {
         JsonObject Coverage(string source)
         {
@@ -367,7 +378,7 @@ public static class LogExport
         {
             ["format"] = Format,
             ["createdUtc"] = LogLine.FormatTime(createdUtc),
-            ["timeZone"] = tz.Id,
+            ["timeZone"] = options.HideNames ? null : tz.Id, // название пояса говорит о стране, смещения для разбора хватает
             ["utcOffsetMinutes"] = (int)tz.GetUtcOffset(createdUtc).TotalMinutes,
             ["period"] = new JsonObject
             {
@@ -387,6 +398,7 @@ public static class LogExport
                 ["ips"] = options.HideAddresses || input.Logging.HideAddresses,
                 ["ipsInStoredLogs"] = input.Logging.HideAddresses,
                 ["domains"] = options.HideSites,
+                ["names"] = options.HideNames,
                 ["maskKeyShared"] = input.MaskKeyShared
             },
             ["versions"] = new JsonObject
@@ -415,7 +427,7 @@ public static class LogExport
                 ["text"] = m.Text
             }).ToArray()),
             ["coreStarts"] = coreStarts,
-            ["tags"] = input.Tags?.DeepClone(),
+            ["tags"] = tags,
             ["dropped"] = new JsonObject
             {
                 ["launcher"] = input.LauncherDropped,
@@ -427,36 +439,36 @@ public static class LogExport
         };
     }
 
-    private static string CleanConfig(string content, LogMasker masker, ExportOptions options, bool storedHidden)
+    private static string CleanConfig(string content, LogMasker masker, ExportOptions options, bool storedHidden, Func<string, string> hide)
     {
         var text = ConfigSanitizer.Sanitize(content, masker, options.HideAddresses || storedHidden);
-        if (!options.HideSites)
+        if (!options.HideSites && !options.HideNames)
             return text;
         try
         {
-            return MaskSites(JsonNode.Parse(text), masker)?.ToJsonString(Pretty) ?? text;
+            return MaskStrings(JsonNode.Parse(text), hide)?.ToJsonString(Pretty) ?? text;
         }
         catch (JsonException)
         {
-            return masker.MaskDomains(text);
+            return hide(text);
         }
     }
 
-    /// <summary>Имена сайтов во всех строках JSON (правила маршрутов ядра, исключения доменов).</summary>
-    private static JsonNode? MaskSites(JsonNode? node, LogMasker masker)
+    /// <summary>Имена сайтов и названия во всех строках JSON (правила маршрутов ядра, исключения доменов, программы).</summary>
+    private static JsonNode? MaskStrings(JsonNode? node, Func<string, string> hide)
     {
         switch (node)
         {
             case JsonObject obj:
                 foreach (var (key, value) in obj.ToList())
-                    obj[key] = MaskSites(value?.DeepClone(), masker);
+                    obj[key] = MaskStrings(value?.DeepClone(), hide);
                 return obj;
             case JsonArray array:
                 for (var i = 0; i < array.Count; i++)
-                    array[i] = MaskSites(array[i]?.DeepClone(), masker);
+                    array[i] = MaskStrings(array[i]?.DeepClone(), hide);
                 return array;
             case JsonValue value when value.TryGetValue<string>(out var text):
-                return JsonValue.Create(masker.MaskDomains(text));
+                return JsonValue.Create(hide(text));
             default:
                 return node;
         }

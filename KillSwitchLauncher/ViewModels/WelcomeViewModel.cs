@@ -9,13 +9,11 @@ using KillSwitchLauncher.Services;
 namespace KillSwitchLauncher.ViewModels;
 
 /// <summary>
-/// Мастер первого запуска из трёх шагов: подключение (или «У меня уже есть VPN-программа»), проверка подключения
-/// и программы из меню «Пуск» с галочками.
+/// Мастер первого запуска из трёх шагов: подключение, проверка подключения и программы из меню «Пуск» с галочками.
 /// </summary>
 public sealed class WelcomeViewModel : ObservableObject
 {
     private readonly Func<VpnConnection, Task<ConnectionCheck>> _check;
-    private readonly Action _useSystemVpn;
     private readonly Action<IReadOnlyList<StartMenuApp>> _finish;
 
     private int _step = 1;
@@ -27,26 +25,18 @@ public sealed class WelcomeViewModel : ObservableObject
 
     /// <param name="check">Проверить подключение (задержка, IP, страна).</param>
     /// <param name="appList">Программы из меню «Пуск» с галочками.</param>
-    /// <param name="useSystemVpn">«У меня уже есть VPN-программа»: оставить системный VPN.</param>
     /// <param name="finish">Добавить отмеченные программы и закрыть мастер.</param>
     /// <param name="skip">Закрыть мастер, ничего не добавляя.</param>
     public WelcomeViewModel(AddConnectionViewModel addConnection, Func<VpnConnection, Task<ConnectionCheck>> check,
-        StartMenuListViewModel appList, Action useSystemVpn, Action<IReadOnlyList<StartMenuApp>> finish, Action skip)
+        StartMenuListViewModel appList, Action<IReadOnlyList<StartMenuApp>> finish, Action skip)
     {
         AddConnection = addConnection;
         _check = check;
         AppList = appList;
-        _useSystemVpn = useSystemVpn;
         _finish = finish;
         AddConnection.Added += OnConnectionAdded;
 
-        // Пока подписка скачивается, выбрать системный VPN нельзя: добавленное следом подключение стало бы общим.
-        UseSystemVpnCommand = new RelayCommand(() =>
-        {
-            _useSystemVpn();
-            Step = 3;
-        }, () => !AddConnection.IsBusy);
-        BackCommand = new RelayCommand(() => Step = Math.Max(1, Step == 3 && _connection is null ? 1 : Step - 1));
+        BackCommand = new RelayCommand(() => Step = Math.Max(1, Step - 1));
         NextCommand = new RelayCommand(() => Step = Math.Min(3, Step + 1));
         RecheckCommand = new RelayCommand(() => _ = CheckAsync(), () => !IsChecking);
         FinishCommand = new RelayCommand(() => _finish(AppList.Selected));
@@ -58,7 +48,6 @@ public sealed class WelcomeViewModel : ObservableObject
     /// <summary>Шаг 3: программы из меню «Пуск».</summary>
     public StartMenuListViewModel AppList { get; }
 
-    public ICommand UseSystemVpnCommand { get; }
     public ICommand BackCommand { get; }
     public ICommand NextCommand { get; }
     public ICommand RecheckCommand { get; }

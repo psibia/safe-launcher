@@ -204,6 +204,9 @@ public static class CoreConfigBuilder
             // Процессы программ приложения без метки (копия, запущенная мимо лаунчера, или процесс, о котором лаунчер
             // не успел ответить ядру) идут так же, как приложение, или блокируются; без программ — напрямую.
             var outside = OutsidePatterns(app, servicePrograms);
+            // Процессы, которые лаунчер отнёс к копии (метка копий): идут так же, как копии, которые ядро узнаёт по программам.
+            if (outside.Count > 0)
+                outside.Add("^" + Regex.Escape(TagPrefix + app.Tag + ControlProtocol.CopyTagSuffix) + @"\|");
             var same = app.BlockOutside ? new List<string>() : outside;
             sniffed.AddRange(same.Where(p => !sniffed.Contains(p)));
             JsonArray Matches() => new(new[] { match }.Concat(same).Select(p => (JsonNode?)JsonValue.Create(p)).ToArray());
@@ -399,7 +402,8 @@ public static class CoreConfigBuilder
     /// <summary>
     /// Шаблоны ядра (регулярные выражения Go, без учёта регистра) для путей процессов программ приложения без метки.
     /// Программы Windows, её защитника и служб пропускаются: ядро ведёт трафик всего компьютера, а такие процессы —
-    /// не копии приложения, и закрывать или уводить в VPN их нельзя.
+    /// не копии приложения, и закрывать или уводить в VPN их нельзя. Программа приложения Microsoft Store узнаётся
+    /// в любой версии пакета (<see cref="FolderPattern"/>).
     /// </summary>
     private static List<string> OutsidePatterns(CoreAppRoute app, IReadOnlyCollection<string>? servicePrograms)
     {
@@ -416,7 +420,7 @@ public static class CoreConfigBuilder
             if (program.Subfolders && folder!.Length == 2 || IsSystemProgram(folder!, program.Name))
                 continue;
 
-            var pattern = "(?i)^" + GoQuote(folder + "\\") + (program.Subfolders ? @"(?:[^\\]+\\)*" : string.Empty) + GoQuote(program.Name) + "$";
+            var pattern = "(?i)^" + FolderPattern(folder!) + (program.Subfolders ? @"(?:[^\\]+\\)*" : string.Empty) + GoQuote(program.Name) + "$";
             if (result.Contains(pattern) ||
                 servicePrograms is not null && servicePrograms.Any(s => Regex.IsMatch(s, pattern, RegexOptions.CultureInvariant)))
                 continue;
@@ -424,6 +428,30 @@ public static class CoreConfigBuilder
         }
 
         return result;
+    }
+
+    private static readonly Regex StorePackage = new(@"^(?<name>[^_\\]+)_\d+(?:\.\d+){3}_[^_\\]*_[^_\\]*_(?<publisher>[a-z0-9]{13})$",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// Шаблон папки с «\» в конце. Папка пакета Microsoft Store (…\WindowsApps\Имя_Версия_Архитектура_Ресурс_Издатель) — в
+    /// любой версии: обновляясь, приложение Store переезжает в папку новой версии и само перезапускается оттуда, мимо лаунчера.
+    /// С версией из настроек его копии после обновления шли бы напрямую.
+    /// </summary>
+    internal static string FolderPattern(string folder)
+    {
+        var parts = folder.Split('\\');
+        var result = new System.Text.StringBuilder();
+        for (var i = 0; i < parts.Length; i++)
+        {
+            if (i > 0 && string.Equals(parts[i - 1], "WindowsApps", StringComparison.OrdinalIgnoreCase) && StorePackage.Match(parts[i]) is { Success: true } match)
+                result.Append(GoQuote(match.Groups["name"].Value + "_")).Append(@"\d+(?:\.\d+){3}_[^\\_]*_[^\\_]*_").Append(GoQuote(match.Groups["publisher"].Value));
+            else
+                result.Append(GoQuote(parts[i]));
+            result.Append(@"\\");
+        }
+
+        return result.ToString();
     }
 
     /// <summary>Полный путь к папке на диске: «C:» или «C:\Папка\…», без «.», «..» и недопустимых знаков.</summary>

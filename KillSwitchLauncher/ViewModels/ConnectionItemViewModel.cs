@@ -15,13 +15,17 @@ public sealed record SubscriptionServerOption(string Key, string Name);
 public interface IConnectionActions
 {
     void Check(ConnectionItemViewModel item);
+
+    /// <summary>«Сделать основным»: через него пойдут приложения с условием «Основное подключение».</summary>
+    void MakeDefault(ConnectionItemViewModel item);
+
     void Rename(ConnectionItemViewModel item, string name);
     void Delete(ConnectionItemViewModel item);
     void UpdateSubscription(ConnectionItemViewModel item);
     void SelectServer(ConnectionItemViewModel item, string serverKey);
 }
 
-/// <summary>Строка подключения: в разделе «Подключения лаунчера» и в списках выбора подключения.</summary>
+/// <summary>Строка подключения: в разделе «Подключения» и в списках выбора подключения.</summary>
 public sealed class ConnectionItemViewModel : ObservableObject
 {
     private readonly IConnectionActions _actions;
@@ -54,6 +58,7 @@ public sealed class ConnectionItemViewModel : ObservableObject
         });
         CancelRenameCommand = new RelayCommand(() => IsRenaming = false);
         DeleteCommand = new RelayCommand(() => _actions.Delete(this));
+        MakeDefaultCommand = new RelayCommand(() => _actions.MakeDefault(this));
         UpdateCommand = new RelayCommand(() => _actions.UpdateSubscription(this), () => !IsUpdating);
         Refresh();
     }
@@ -86,16 +91,17 @@ public sealed class ConnectionItemViewModel : ObservableObject
     public ICommand SaveNameCommand { get; }
     public ICommand CancelRenameCommand { get; }
     public ICommand DeleteCommand { get; }
+    public ICommand MakeDefaultCommand { get; }
     public ICommand UpdateCommand { get; }
 
-    /// <summary>Кто им пользуется: «Основное · Discord, Telegram» или «Не используется».</summary>
+    /// <summary>Кто им пользуется: «Приложения: Discord, Telegram» или «Не используется».</summary>
     public string UsedBy
     {
         get => _usedBy;
         set => SetField(ref _usedBy, value);
     }
 
-    /// <summary>Выбрано в общих настройках.</summary>
+    /// <summary>Основное подключение: через него идут приложения с условием «Основное подключение».</summary>
     public bool IsDefault
     {
         get => _isDefault;

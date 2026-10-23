@@ -321,6 +321,7 @@ public class CoreConfigBuilderTests
     // ---- процессы программ приложения без метки (копии, запущенные мимо лаунчера) ----
 
     private const string Tagged = @"^launcher:discord\|";
+    private const string CopyTagged = @"^launcher:discord-copy\|"; // помощники копии и программа того же издателя (метка копий)
     private const string DiscordPattern = @"(?i)^C:\\Apps\\Discord\\(?:[^\\]+\\)*Discord\.exe$";
     private const string ToolPattern = @"(?i)^D:\\Tools \(x86\)\\tool\+1\.exe$";
 
@@ -338,6 +339,23 @@ public class CoreConfigBuilderTests
     private static string[] Patterns(JsonNode rule) => rule["process_path_regex"]!.AsArray().Select(p => (string)p!).ToArray();
 
     [Fact]
+    public void OutsideCopies_StoreApp_AnyVersionOfItsPackage()
+    {
+        // Приложение Store, обновляясь, переезжает в папку новой версии и перезапускается оттуда мимо лаунчера.
+        var config = Svc.CoreConfigBuilder.Build(WithPrograms(true,
+            Program(@"C:\Program Files\WindowsApps\Claude_1.0.100.0_x64__pzs8sxrjxfjjc\app", "claude.exe", subfolders: true)));
+
+        var patterns = Patterns(Rules(config).Single(r => (string)r!["action"]! == "reject")!);
+        Assert.Equal(CopyTagged, patterns[^1]);
+        var pattern = Assert.Single(patterns[..^1]);
+        Assert.Equal(@"(?i)^C:\\Program Files\\WindowsApps\\Claude_\d+(?:\.\d+){3}_[^\\_]*_[^\\_]*_pzs8sxrjxfjjc\\app\\(?:[^\\]+\\)*claude\.exe$", pattern);
+        Assert.Matches(pattern, @"C:\Program Files\WindowsApps\Claude_1.0.100.0_x64__pzs8sxrjxfjjc\app\claude.exe");
+        Assert.Matches(pattern, @"C:\Program Files\WindowsApps\Claude_1.2.0.0_x64__pzs8sxrjxfjjc\app\claude.exe");
+        Assert.DoesNotMatch(pattern, @"C:\Program Files\WindowsApps\Claude_1.2.0.0_x64__aaaaaaaaaaaaa\app\claude.exe");
+        Assert.DoesNotMatch(pattern, @"C:\Program Files\WindowsApps\Other_1.2.0.0_x64__pzs8sxrjxfjjc\app\claude.exe");
+    }
+
+    [Fact]
     public void OutsideCopies_GoLikeTheApp()
     {
         var config = Svc.CoreConfigBuilder.Build(WithPrograms(false,
@@ -345,18 +363,18 @@ public class CoreConfigBuilderTests
 
         var rules = Rules(config);
         // имя сайта распознаётся и у копий: без него для них не сработали бы исключения доменов
-        Assert.Equal(new[] { "^launcher:", DiscordPattern, ToolPattern }, Patterns(rules[0]!));
+        Assert.Equal(new[] { "^launcher:", DiscordPattern, ToolPattern, CopyTagged }, Patterns(rules[0]!));
         var exceptions = rules.Single(r => r!["domain_suffix"] is not null)!;
         Assert.Equal("direct", (string)exceptions["outbound"]!);
-        Assert.Equal(new[] { Tagged, DiscordPattern, ToolPattern }, Patterns(exceptions));
+        Assert.Equal(new[] { Tagged, DiscordPattern, ToolPattern, CopyTagged }, Patterns(exceptions));
         var route = rules.Last()!;
         Assert.Equal("vpn", (string)route["outbound"]!);
-        Assert.Equal(new[] { Tagged, DiscordPattern, ToolPattern }, Patterns(route));
+        Assert.Equal(new[] { Tagged, DiscordPattern, ToolPattern, CopyTagged }, Patterns(route));
         Assert.DoesNotContain(rules, r => (string)r!["action"]! == "reject");
 
         var dns = config["dns"]!["rules"]!.AsArray().Last()!;
         Assert.Equal("dns-vpn", (string)dns["server"]!);
-        Assert.Equal(new[] { Tagged, DiscordPattern, ToolPattern }, Patterns(dns));
+        Assert.Equal(new[] { Tagged, DiscordPattern, ToolPattern, CopyTagged }, Patterns(dns));
     }
 
     [Fact]
@@ -370,7 +388,7 @@ public class CoreConfigBuilderTests
         Assert.Equal(new[] { Tagged }, Patterns(route));
         var reject = rules.Last()!;
         Assert.Equal("reject", (string)reject["action"]!);
-        Assert.Equal(new[] { DiscordPattern }, Patterns(reject));
+        Assert.Equal(new[] { DiscordPattern, CopyTagged }, Patterns(reject));
         Assert.Equal(rules.IndexOf(route) + 1, rules.IndexOf(reject));
         Assert.All(config["dns"]!["rules"]!.AsArray().Where(r => r!["process_path_regex"] is not null),
             r => Assert.Equal(new[] { Tagged }, Patterns(r!)));
@@ -387,7 +405,7 @@ public class CoreConfigBuilderTests
             Program(@"C:\Program Files\Vendor", "agent.exe", subfolders: true), // программа службы
             Program(@"D:\", "tool.exe"));
 
-        Assert.Equal(new[] { Tagged, @"(?i)^D:\\tool\.exe$" }, Patterns(Rules(Svc.CoreConfigBuilder.Build(request, null, services)).Last()!));
+        Assert.Equal(new[] { Tagged, @"(?i)^D:\\tool\.exe$", CopyTagged }, Patterns(Rules(Svc.CoreConfigBuilder.Build(request, null, services)).Last()!));
 
         // не осталось ни одной программы — как без программ, и блокировать нечего
         request.Apps[0].Programs!.RemoveAt(4);
@@ -404,6 +422,9 @@ public class CoreConfigBuilderTests
     [InlineData(@"C:\Apps\Discord\Discord.exe.old", false)]
     [InlineData(@"C:\Apps\Discord\Update.exe", false)]
     [InlineData(@"launcher:a1|C:\Apps\Discord\Discord.exe", false)]
+    [InlineData(@"launcher:discord|C:\Apps\Helper\helper.exe", false)]
+    [InlineData(@"launcher:discord-copy|C:\Users\me\AppData\Local\Helper\helper.exe", true)]
+    [InlineData(@"launcher:discord-copyx|C:\Users\me\AppData\Local\Helper\helper.exe", false)]
     [InlineData(@"D:\Tools (x86)\tool+1.exe", true)]
     [InlineData(@"D:\Tools (x86)\sub\tool+1.exe", false)]
     [InlineData(@"D:\Tools (x86)\toolx1.exe", false)]

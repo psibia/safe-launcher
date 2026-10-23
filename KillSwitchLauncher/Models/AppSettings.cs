@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Text.Json.Serialization;
 using KillSwitchLauncher.Services;
 using SafeLauncher.Logging;
 
@@ -16,13 +17,19 @@ public sealed class AppSettings
 
     public List<AppEntry> Apps { get; set; } = new();
 
-    /// <summary>«Закрывать при обрыве» для приложений, у которых это не задано отдельно (Kill-Switch).</summary>
+    /// <summary>
+    /// «Закрывать при обрыве» для приложений, у которых это не задано отдельно (Kill-Switch). При новой установке выключен
+    /// (SettingsStorage.Load). true здесь — для файлов без этого значения и повреждённых: прежний выбор не меняется.
+    /// </summary>
     public bool KillSwitchEnabled { get; set; } = true;
 
-    /// <summary>Как лаунчер понимает, что VPN есть: адаптеры другой программы или своё подключение.</summary>
-    public GlobalNetworkMode NetworkMode { get; set; } = GlobalNetworkMode.SystemVpn;
+    /// <summary>
+    /// Общее условие запуска. Системного VPN в интерфейсе больше нет: при загрузке он заменяется подключением лаунчера
+    /// (SettingsStorage.Migrate), значение остаётся только для чтения старых файлов.
+    /// </summary>
+    public GlobalNetworkMode NetworkMode { get; set; } = GlobalNetworkMode.LauncherConnection;
 
-    /// <summary>Подключение лаунчера в общих настройках (<see cref="GlobalNetworkMode.LauncherConnection"/>).</summary>
+    /// <summary>Основное подключение: через него идут приложения с условием «Основное подключение».</summary>
     public Guid? ConnectionId { get; set; }
 
     /// <summary>Все подключения лаунчера: общее и подключения отдельных приложений.</summary>
@@ -76,7 +83,17 @@ public sealed class AppSettings
 
     /// <summary>Обновления лаунчера (раздел «Обновления»).</summary>
     public UpdateSettings Updates { get; set; } = new();
+
+    /// <summary>
+    /// Загрузка перевела настройки с системного VPN на подключение лаунчера; null — переводить было нечего. Не сохраняется:
+    /// главное окно один раз сообщает об этом и сохраняет настройки.
+    /// </summary>
+    [JsonIgnore]
+    public SystemVpnMigration? MovedFromSystemVpn { get; set; }
 }
+
+/// <summary>Приложения, которые шли через системный VPN («Как в общих» или «Свои адаптеры») и теперь идут через основное подключение.</summary>
+public sealed record SystemVpnMigration(IReadOnlyList<string> Apps);
 
 /// <summary>Откуда скачивать обновления.</summary>
 public enum UpdateRoute

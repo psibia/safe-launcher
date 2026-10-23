@@ -133,7 +133,9 @@ public static class CorePlanDiff
     internal static bool SamePrograms(List<CoreProgram>? a, List<CoreProgram>? b) =>
         (a ?? new List<CoreProgram>()).Select(Key).SequenceEqual((b ?? new List<CoreProgram>()).Select(Key), StringComparer.OrdinalIgnoreCase);
 
-    private static string Key(CoreProgram program) => program.Folder + "\\" + program.Name + (program.Subfolders ? "\\…" : string.Empty);
+    // Версия пакета Store не в счёт: служба узнаёт копии в любой его версии.
+    private static string Key(CoreProgram program) =>
+        StorePackage.WithoutVersion(program.Folder) + "\\" + program.Name + (program.Subfolders ? "\\…" : string.Empty);
 
     private static string Tag(JsonObject outbound) => outbound["tag"]?.ToString() ?? "?";
 

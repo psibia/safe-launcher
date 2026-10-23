@@ -85,6 +85,12 @@ public sealed record GuardReply(string? Notice, IReadOnlyList<string> Unguarded)
 /// </summary>
 public sealed class CoreAppRoute
 {
+    /// <summary>Чем метка копий отличается от метки приложения (служба ревизии 12, ControlProtocol.CopyTagSuffix).</summary>
+    public const string CopyTagSuffix = "-copy";
+
+    /// <summary>Метка, которой лаунчер отвечает ядру за процессы, отнесённые к копии приложения: идут как его копии.</summary>
+    public static string CopyTag(string tag) => tag + CopyTagSuffix;
+
     public string Tag { get; set; } = string.Empty;
 
     public string Outbound { get; set; } = string.Empty;

@@ -233,6 +233,7 @@ public partial class ExportWindow : Window
             Period = period,
             HideAddresses = HideAddressesBox.IsChecked == true,
             HideSites = HideSitesBox.IsChecked == true,
+            HideNames = HideNamesBox.IsChecked == true,
             IncludeDns = DnsBox.IsVisible && DnsBox.IsChecked == true,
             CoreErrorsOnly = CoreErrorsBox.IsVisible && CoreErrorsBox.IsChecked == true,
             Note = NoteBox.Text
@@ -296,7 +297,7 @@ public partial class ExportWindow : Window
             SaveButton.Content = "Сохранить";
         PeriodsPanel.IsEnabled = CustomRadio.IsEnabled = CustomPanel.IsEnabled = NoteBox.IsEnabled = !busy;
         HideAddressesBox.IsEnabled = !busy && !_choices.AddressesHidden;
-        HideSitesBox.IsEnabled = DnsBox.IsEnabled = CoreErrorsBox.IsEnabled = !busy;
+        HideSitesBox.IsEnabled = HideNamesBox.IsEnabled = DnsBox.IsEnabled = CoreErrorsBox.IsEnabled = !busy;
     }
 
     private static void TryDelete(string path)

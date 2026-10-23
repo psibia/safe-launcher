@@ -297,9 +297,9 @@ public partial class MainWindow : Window
 
     private string BuildTrayToolTip() =>
         $"Безопасный лаунчер\n{_viewModel.SummaryTitle} · {_viewModel.SummarySubtitle}" +
-        (_viewModel.IsKillSwitchOff ? "\nKill-Switch выключен" : string.Empty);
+        (_viewModel.IsDnsLeakPossible ? "\nВозможна утечка DNS" : string.Empty);
 
-    /// <summary>Красный значок: есть приложения без защиты или ждущие сеть, либо системный VPN нужен и не подключён.</summary>
+    /// <summary>Красный значок: есть приложения без защиты или ждущие сеть.</summary>
     private bool IsTrayAlert => _viewModel.SummaryTone is SummaryTone.Danger or SummaryTone.Warn;
 
     private void OnViewModelPropertyChanged(object? sender, PropertyChangedEventArgs e)
@@ -309,7 +309,7 @@ public partial class MainWindow : Window
             case nameof(MainViewModel.SummaryTitle):
             case nameof(MainViewModel.SummarySubtitle):
             case nameof(MainViewModel.SummaryTone):
-            case nameof(MainViewModel.IsKillSwitchOff):
+            case nameof(MainViewModel.IsDnsLeakPossible):
                 _tray.Update(BuildTrayToolTip(), alert: IsTrayAlert);
                 break;
         }

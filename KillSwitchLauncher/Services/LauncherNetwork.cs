@@ -244,6 +244,18 @@ public sealed class LauncherNetwork : IDisposable
             return _applied is { } plan && plan.Apps.TryGetValue(appId, out var app) ? app.Tag : null;
     }
 
+    /// <summary>
+    /// Метка копий приложения для ядра (<see cref="CoreAppRoute.CopyTag"/>): процессы, которые лаунчер отнёс к копии, открытой
+    /// не из лаунчера (её помощники, программа того же издателя в другой папке). Ядро ведёт их, как копии приложения: как
+    /// выбрано в «Если открыто не из лаунчера». Служба старше ревизии 12 такой метки не знает, и они идут напрямую, как и без
+    /// неё. Любой поток.
+    /// </summary>
+    public string? CopyTagFor(Guid appId)
+    {
+        lock (_state)
+            return _applied is { } plan && plan.Apps.TryGetValue(appId, out var app) ? CoreAppRoute.CopyTag(app.Tag) : null;
+    }
+
     /// <summary>Идёт ли приложение через ядро при текущих настройках.</summary>
     public bool IsViaCore(Guid appId)
     {

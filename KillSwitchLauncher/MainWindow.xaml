@@ -51,7 +51,7 @@
             <StackPanel Grid.Column="1" Margin="12,0,16,0" VerticalAlignment="Center">
                 <TextBlock Text="Безопасный лаунчер" FontSize="18" FontWeight="Bold" TextTrimming="CharacterEllipsis" />
 
-                <!-- Вторая строка: подпись, а при выключенном Kill-Switch — красная метка на её месте -->
+                <!-- Вторая строка: подпись, а при выключенной «Защите от утечки DNS» — красная метка на её месте -->
                 <Grid Margin="0,2,0,0">
                     <TextBlock Text="Приложения выходят в интернет только под защитой" Foreground="{StaticResource TextMuted}" FontSize="12"
                                TextTrimming="CharacterEllipsis" VerticalAlignment="Center">
@@ -59,7 +59,7 @@
                             <Style TargetType="TextBlock">
                                 <Setter Property="Visibility" Value="Visible" />
                                 <Style.Triggers>
-                                    <DataTrigger Binding="{Binding IsKillSwitchOff}" Value="True">
+                                    <DataTrigger Binding="{Binding IsDnsLeakPossible}" Value="True">
                                         <Setter Property="Visibility" Value="Hidden" />
                                     </DataTrigger>
                                 </Style.Triggers>
@@ -67,15 +67,15 @@
                         </TextBlock.Style>
                     </TextBlock>
 
-                    <!-- Kill-Switch в настройках, поэтому выключенное состояние подсвечиваем здесь -->
+                    <!-- «Защита от утечки DNS» в настройках, поэтому выключенное состояние подсвечиваем здесь -->
                     <Border HorizontalAlignment="Left" VerticalAlignment="Center" CornerRadius="9" Padding="9,2"
                             Background="{StaticResource Danger}" Cursor="Hand"
-                            Visibility="{Binding IsKillSwitchOff, Converter={StaticResource BoolToVis}}"
-                            ToolTip="При обрыве VPN приложения не будут закрыты. Включить можно в настройках.">
+                            Visibility="{Binding IsDnsLeakPossible, Converter={StaticResource BoolToVis}}"
+                            ToolTip="Провайдер может видеть имена сайтов, которые открывают приложения. Включить «Защиту от утечки DNS» можно в настройках, раздел «Защита».">
                         <Border.InputBindings>
                             <MouseBinding MouseAction="LeftClick" Command="{Binding OpenSettingsCommand}" CommandParameter="Protection" />
                         </Border.InputBindings>
-                        <TextBlock Text="Kill-Switch выключен" Foreground="White" FontWeight="SemiBold" FontSize="11" />
+                        <TextBlock Text="Возможна утечка DNS" Foreground="White" FontWeight="SemiBold" FontSize="11" />
                     </Border>
                 </Grid>
             </StackPanel>
@@ -145,39 +145,12 @@
                 <Border Margin="16,4,16,24" Width="360" Background="{StaticResource CardBg}" CornerRadius="20" Padding="18,16"
                         Effect="{StaticResource PopupShadow}">
                     <StackPanel>
-                        <!-- Системный VPN: включён ли и какой -->
-                        <Grid>
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="*" />
-                            </Grid.ColumnDefinitions>
-                            <Ellipse Grid.Column="0" Width="8" Height="8" VerticalAlignment="Top" Margin="0,5,10,0">
-                                <Ellipse.Style>
-                                    <Style TargetType="Ellipse">
-                                        <Setter Property="Fill" Value="{StaticResource TextMuted}" />
-                                        <Style.Triggers>
-                                            <DataTrigger Binding="{Binding IsVpnConnected}" Value="True">
-                                                <Setter Property="Fill" Value="{StaticResource Success}" />
-                                            </DataTrigger>
-                                        </Style.Triggers>
-                                    </Style>
-                                </Ellipse.Style>
-                            </Ellipse>
-                            <StackPanel Grid.Column="1">
-                                <TextBlock FontWeight="SemiBold" FontSize="12.5">
-                                    <Run Text="Системный VPN: " />
-                                    <Run Text="{Binding VpnStatusText, Mode=OneWay}" />
-                                </TextBlock>
-                                <TextBlock Text="{Binding VpnSubtitle}" Style="{StaticResource Caption}" Margin="0,1,0,0" />
-                            </StackPanel>
-                        </Grid>
-
-                        <Border Style="{StaticResource WarnBox}" Margin="0,12,0,0" Padding="12,10"
+                        <!-- Включён ещё один VPN на весь компьютер -->
+                        <Border Style="{StaticResource WarnBox}" Margin="0,0,0,14" Padding="12,10"
                                 Visibility="{Binding HasOtherVpnWarning, Converter={StaticResource BoolToVis}}">
                             <TextBlock Text="{Binding OtherVpnWarning}" Foreground="{StaticResource Warn}" FontSize="12" TextWrapping="Wrap" />
                         </Border>
 
-                        <Border Height="1" Background="{StaticResource Divider}" Margin="0,14,0,12" />
                         <TextBlock Text="ПРИЛОЖЕНИЯ" Style="{StaticResource GroupTitle}" Margin="0,0,0,8" />
                         <TextBlock Text="Приложений пока нет" Style="{StaticResource Caption}"
                                    Visibility="{Binding HasNoApps, Converter={StaticResource BoolToVis}}" />

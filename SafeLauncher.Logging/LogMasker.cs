@@ -227,6 +227,16 @@ public sealed class LogMasker
         });
     }
 
+    /// <summary>
+    /// Метка названия для выгрузки (<see cref="NameMasker"/>): <c>{вид-xxxxxx}</c>, одинаковая для одного названия без учета регистра.
+    /// </summary>
+    public string NameLabel(string kind, string value) =>
+        "{" + kind + "-" + Hash(_state.Key, kind + ":" + value.Trim().ToLowerInvariant(), 3) + "}";
+
+    /// <summary>Метка приложения или подключения по его тегу (a… или c… + 32 hex): <c>{app-8 hex}</c>, как у серверов.</summary>
+    public static string TagLabel(string kind, string tag) =>
+        "{" + kind + "-" + (tag.Length > 8 ? tag.Substring(1, 8) : tag) + "}";
+
     public static string ServerLabel(string tag)
     {
         var hex = tag.StartsWith('c') && tag.Length > 8 ? tag.Substring(1, 8) : tag.Length > 8 ? tag[..8] : tag;

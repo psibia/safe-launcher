@@ -92,16 +92,17 @@ public class PagesTests : IDisposable
     }
 
     [Fact]
-    public void Welcome_HaveVpnProgram_ChoosesSystemVpn_AndGoesToApps()
+    public void Welcome_BackFromStep3_GoesToCheck()
     {
-        Preset(s => s.NetworkMode = GlobalNetworkMode.LauncherConnection);
-
         WithViewModel(vm =>
         {
-            vm.Welcome!.UseSystemVpnCommand.Execute(null);
-
+            vm.Welcome!.NextCommand.Execute(null);
+            vm.Welcome.NextCommand.Execute(null);
             Assert.Equal(3, vm.Welcome.Step);
-            Assert.Equal(GlobalNetworkMode.SystemVpn, Storage.Load().NetworkMode);
+
+            vm.Welcome.BackCommand.Execute(null);
+
+            Assert.Equal(2, vm.Welcome.Step);
         });
     }
 
@@ -172,22 +173,123 @@ public class PagesTests : IDisposable
     }
 
     [Fact]
-    public void Settings_LauncherConnectionWithoutConnection_IsNotApplied()
+    public void Settings_WithoutConnections_OtherChangesAreApplied()
     {
         Preset(s => s.WelcomeDone = true);
 
         WithViewModel(vm =>
         {
-            vm.OpenSettings(SettingsSection.Connection);
-            vm.NetworkMode = GlobalNetworkMode.LauncherConnection;
-            Assert.True(vm.NeedsConnectionSelection);
+            vm.OpenSettings(SettingsSection.Window);
+            Assert.False(vm.NeedsMainConnection); // подключений нет вовсе: просить выбрать основное нечего
+            vm.HideBehavior = HideBehavior.Tray;
 
             vm.ApplySettingsCommand.Execute(null);
 
-            Assert.True(vm.HasPendingChanges);
+            Assert.False(vm.HasPendingChanges);
         });
 
-        Assert.Equal(GlobalNetworkMode.SystemVpn, Storage.Load().NetworkMode);
+        Assert.Equal(HideBehavior.Tray, Storage.Load().HideBehavior);
+    }
+
+    [Fact]
+    public void Connections_FirstBecomesMain_MakeDefaultSwitchesAtOnce()
+    {
+        Preset(s => s.WelcomeDone = true);
+
+        WithViewModel(vm =>
+        {
+            vm.OpenSettings(SettingsSection.Connections);
+            vm.AddConnection.Text = SampleConnections.Trojan;
+            vm.AddConnection.AddCommand.Execute(null);
+            vm.AddConnection.Text = SampleConnections.VlessGrpc;
+            vm.AddConnection.AddCommand.Execute(null);
+
+            Assert.Equal(2, vm.Connections.Count);
+            Assert.True(vm.Connections[0].IsDefault);
+            Assert.False(vm.Connections[1].IsDefault);
+
+            vm.Connections[1].MakeDefaultCommand.Execute(null);
+
+            Assert.False(vm.Connections[0].IsDefault);
+            Assert.True(vm.Connections[1].IsDefault);
+            Assert.False(vm.HasPendingChanges); // действует сразу, без «Применить»
+        });
+
+        var settings = Storage.Load();
+        Assert.Equal(GlobalNetworkMode.LauncherConnection, settings.NetworkMode);
+        Assert.Equal(settings.Connections[1].Id, settings.ConnectionId);
+    }
+
+    [Fact]
+    public void Connections_MainDeleted_AsksToChooseAnother_NewOneBecomesMain()
+    {
+        Preset(s =>
+        {
+            s.WelcomeDone = true;
+            var a = new VpnConnection { Name = "A", Kind = ConnectionKind.Link, Link = "trojan://secret@5.6.7.8:443#A" };
+            s.Connections.Add(a);
+            s.Connections.Add(new VpnConnection { Name = "B", Kind = ConnectionKind.Link, Link = "trojan://secret@5.6.7.9:443#B" });
+            s.ConnectionId = a.Id;
+        });
+
+        WithViewModel(vm =>
+        {
+            vm.Connections[0].DeleteCommand.Execute(null);
+
+            Assert.True(vm.NeedsMainConnection);
+            Assert.False(vm.Connections.Single().IsDefault);
+
+            vm.AddConnection.Text = SampleConnections.Trojan;
+            vm.AddConnection.AddCommand.Execute(null);
+
+            Assert.False(vm.NeedsMainConnection);
+            Assert.True(vm.Connections[1].IsDefault);
+        });
+    }
+
+    [Fact]
+    public void FromSystemVpn_WithoutConnections_OpensConnections_AndTells()
+    {
+        Preset(s =>
+        {
+            s.NetworkMode = GlobalNetworkMode.SystemVpn;
+            s.Apps.Add(new AppEntry { Name = "Discord", ExePath = @"C:\Apps\Discord.exe" });
+        });
+
+        WithViewModel(vm =>
+        {
+            Assert.Equal(GlobalNetworkMode.LauncherConnection, Storage.Load().NetworkMode); // сохранено сразу
+
+            vm.ReportSystemVpnRemoved();
+
+            Assert.True(vm.IsSettingsOpen);
+            Assert.Equal(SettingsSection.Connections, vm.Section);
+            Assert.Contains(_dialogs.Warnings, w => w.Contains("Discord") && w.Contains("не запустятся"));
+            Assert.Equal("Нет подключения", vm.Apps.Single().Subtitle);
+
+            vm.ReportSystemVpnRemoved(); // один раз
+            Assert.Single(_dialogs.Warnings);
+        });
+    }
+
+    [Fact]
+    public void FromSystemVpn_WithConnection_SaysWhereAppsGo()
+    {
+        Preset(s =>
+        {
+            s.NetworkMode = GlobalNetworkMode.SystemVpn;
+            s.Connections.Add(new VpnConnection { Name = "Германия", Kind = ConnectionKind.Link, Link = "trojan://secret@5.6.7.8:443#A" });
+            s.Apps.Add(new AppEntry { Name = "Discord", ExePath = @"C:\Apps\Discord.exe" });
+        });
+
+        WithViewModel(vm =>
+        {
+            vm.ReportSystemVpnRemoved();
+
+            Assert.True(vm.IsAppsPage);
+            Assert.Contains(_dialogs.Infos, i => i.Contains("Discord") && i.Contains("«Германия»"));
+            Assert.True(vm.Connections.Single().IsDefault);
+        });
     }
 
     // ---------------------------------------------------------------- добавление приложения
@@ -464,8 +566,6 @@ public class PagesTests : IDisposable
             vm.Apps[0].OpenSettingsCommand.Execute(null);
             var page = vm.AppPage!;
             page.Name = "Мой Tool";
-            page.Mode = AppNetworkMode.OwnAdapters;
-            page.RuleMode = VpnRuleMode.AnyVpn;
             page.CloseOnDrop = ProtectionOverride.On;
             page.OutsideCopies = OutsideCopiesOverride.Block;
             page.DomainsText = "kaspi.kz\nhttps://www.Gosuslugi.ru/help";
@@ -480,7 +580,7 @@ public class PagesTests : IDisposable
 
         var app = Storage.Load().Apps[0];
         Assert.Equal("Мой Tool", app.Name);
-        Assert.Equal(AppNetworkMode.OwnAdapters, app.Network.Mode);
+        Assert.Equal(AppNetworkMode.Inherit, app.Network.Mode);
         Assert.Equal(ProtectionOverride.On, app.Network.CloseOnDrop);
         Assert.Equal(OutsideCopiesOverride.Block, app.Network.OutsideCopies);
         Assert.Equal(2, app.Network.DirectDomains.Count);
@@ -571,27 +671,27 @@ public class PagesTests : IDisposable
     }
 
     [Fact]
-    public void AppPage_OwnAdaptersWithoutAdapter_IsNotSaved()
+    public void AppPage_KeepsDnsJournalAndArguments_ItDoesNotShow()
     {
         var exe = FakeExe("Tool");
         Preset(s =>
         {
             s.WelcomeDone = true;
-            s.Apps.Add(new AppEntry { Name = "Tool", ExePath = exe });
+            s.Apps.Add(new AppEntry { Name = "Tool", ExePath = exe, Arguments = "--profile=Work", TrackDns = true });
         });
 
         WithViewModel(vm =>
         {
             vm.Apps[0].OpenSettingsCommand.Execute(null);
             var page = vm.AppPage!;
-            page.Mode = AppNetworkMode.OwnAdapters;
-            page.RuleMode = VpnRuleMode.AnyOfSelected;
-            foreach (var adapter in page.Adapters)
-                adapter.IsSelected = false;
-
-            Assert.True(page.NeedsAdapterSelection);
+            page.Name = "Tool Work";
             page.SaveCommand.Execute(null);
-            Assert.NotNull(page.Error);
+            Assert.Null(page.Error);
         });
+
+        var app = Storage.Load().Apps.Single();
+        Assert.Equal("Tool Work", app.Name);
+        Assert.Equal("--profile=Work", app.Arguments);
+        Assert.True(app.TrackDns);
     }
 }

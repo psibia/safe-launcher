@@ -14,9 +14,11 @@ namespace KillSwitchLauncher.Services;
 ///
 /// Процесс считается своим, если одновременно:
 ///   1. имя его .exe совпадает с запускаемым (для Squirrel-ярлыков ещё и с целью --processStart);
-///   2. он запущен из папки приложения (для Squirrel — из общей папки над app-x.y.z).
-/// Если папка общая (Program Files, System32, Загрузки и т.п.) или программа — общий «движок»
-/// (java, python, cmd…), семейства нет: тогда под контролем только то, что запустил сам лаунчер.
+///   2. он запущен из папки приложения (для Squirrel — из общей папки над app-x.y.z) или, в любой папке, кроме папки
+///      Windows, его программа подписана тем же издателем, что и программа приложения (<see cref="Publisher"/>).
+/// Если программа — общий «движок» (java, python, cmd…), семейства нет: тогда под контролем только то, что запустил сам
+/// лаунчер. Если папка общая (Program Files, System32, Загрузки и т.п.), процессы узнаются только по подписи издателя.
+/// У приложения Microsoft Store папка приложения — папка его пакета в любой версии (<see cref="StorePackage"/>).
 /// </summary>
 public sealed class AppFamily
 {
@@ -37,15 +39,22 @@ public sealed class AppFamily
 
     private readonly HashSet<string> _names;
     private readonly string[] _roots; // с завершающим «\»
+    private readonly StorePackage? _package;
+    private readonly string? _publisher;
 
-    private AppFamily(HashSet<string> names, string[] roots)
+    private AppFamily(HashSet<string> names, string[] roots, StorePackage? package, string? publisher)
     {
         _names = names;
         _roots = roots;
+        _package = package;
+        _publisher = publisher;
     }
 
-    /// <summary>Семейство для приложения или null, если узнавать его процессы «со стороны» небезопасно.</summary>
-    public static AppFamily? For(AppEntry entry)
+    /// <summary>
+    /// Семейство для приложения или null, если узнавать его процессы «со стороны» небезопасно.
+    /// </summary>
+    /// <param name="publisher">Издатель из проверенной подписи программы приложения (<see cref="Signatures"/>); null — нет подписи.</param>
+    public static AppFamily? For(AppEntry entry, string? publisher = null)
     {
         try
         {
@@ -61,7 +70,7 @@ public sealed class AppFamily
             if (GetProcessStartTarget(entry.Arguments) is { } target)
                 names.Add(target);
 
-            return Build(dir, names);
+            return Build(dir, names, publisher);
         }
         catch (Exception)
         {
@@ -73,14 +82,14 @@ public sealed class AppFamily
     /// Семейство по уже запущенному процессу. Для приложений Microsoft Store: путь к их .exe
     /// (в C:\Program Files\WindowsApps\…) становится известен только после запуска.
     /// </summary>
-    public static AppFamily? ForImage(string imagePath)
+    public static AppFamily? ForImage(string imagePath, string? publisher = null)
     {
         try
         {
             var dir = Path.GetDirectoryName(imagePath);
             return string.IsNullOrEmpty(dir)
                 ? null
-                : Build(dir, new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Path.GetFileName(imagePath) });
+                : Build(dir, new HashSet<string>(StringComparer.OrdinalIgnoreCase) { Path.GetFileName(imagePath) }, publisher);
         }
         catch (Exception)
         {
@@ -88,13 +97,40 @@ public sealed class AppFamily
         }
     }
 
-    private static AppFamily? Build(string dir, HashSet<string> names)
+    private static AppFamily? Build(string dir, HashSet<string> names, string? publisher)
     {
-        if (IsTooBroad(dir))
+        names.ExceptWith(GenericHosts);
+        if (names.Count == 0)
             return null;
 
-        names.ExceptWith(GenericHosts);
-        return names.Count == 0 ? null : new AppFamily(names, CanonicalForms(dir));
+        publisher = string.IsNullOrWhiteSpace(publisher) ? null : publisher.Trim();
+        // По общей папке копию не узнать: в ней лежат и чужие программы. Остаётся подпись издателя, кроме программ Windows.
+        if (IsTooBroad(dir))
+            return publisher is null || IsWindowsPath(Trim(dir) + "\\") ? null : new AppFamily(names, Array.Empty<string>(), null, publisher);
+        return new AppFamily(names, CanonicalForms(dir), StorePackage.Find(dir), publisher);
+    }
+
+    /// <summary>То же семейство с другим издателем (подпись программы приложения проверена позже, в фоне).</summary>
+    public AppFamily WithPublisher(string? publisher) =>
+        new(_names, _roots, _package, string.IsNullOrWhiteSpace(publisher) ? null : publisher.Trim());
+
+    /// <summary>Издатель из проверенной подписи программы приложения; null — подписи нет или она ещё не проверена.</summary>
+    public string? Publisher => _publisher;
+
+    /// <summary>
+    /// Программа того же издателя с тем же именем exe в любой папке, кроме папки Windows: приложение переехало или
+    /// обновилось в другую папку. <paramref name="publisher"/> — издатель из проверенной подписи этой программы.
+    /// </summary>
+    public bool SignedBySame(string imagePath, string? publisher) =>
+        _publisher is not null && publisher is not null &&
+        string.Equals(_publisher, publisher.Trim(), StringComparison.OrdinalIgnoreCase) &&
+        HasName(Path.GetFileName(imagePath)) && !IsWindowsPath(imagePath);
+
+    /// <summary>Путь в папке Windows: её программы лаунчер своими не считает, даже с той же подписью.</summary>
+    public static bool IsWindowsPath(string path)
+    {
+        var windows = Trim(Environment.GetFolderPath(Environment.SpecialFolder.Windows));
+        return windows.Length > 0 && path.StartsWith(windows + "\\", StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>Быстрая проверка по имени файла из списка процессов, до открытия самого процесса.</summary>
@@ -114,11 +150,13 @@ public sealed class AppFamily
     /// и сам Discord.exe из папки app-x.y.z).
     /// </summary>
     public bool Overlaps(AppFamily other) =>
-        _names.Overlaps(other._names) && _roots.Any(r => other._roots.Contains(r, StringComparer.OrdinalIgnoreCase));
+        _names.Overlaps(other._names) &&
+        (_roots.Any(r => other._roots.Contains(r, StringComparer.OrdinalIgnoreCase)) ||
+         _package is not null && other._package is not null && _package.SameAs(other._package));
 
-    /// <summary>Полный путь к образу процесса лежит в папке приложения.</summary>
+    /// <summary>Полный путь к образу процесса лежит в папке приложения (у приложения Store — в папке его пакета любой версии).</summary>
     public bool ContainsPath(string imagePath) =>
-        _roots.Any(r => imagePath.StartsWith(r, StringComparison.OrdinalIgnoreCase));
+        _roots.Any(r => imagePath.StartsWith(r, StringComparison.OrdinalIgnoreCase)) || _package?.Contains(imagePath) == true;
 
     /// <summary>
     /// Программа, которую запускает Squirrel-ярлык (Update.exe --processStart Discord.exe), в самой новой папке app-x.y.z
@@ -215,9 +253,7 @@ public sealed class AppFamily
             return true;
 
         // Всё внутри Windows — системные программы, их не трогаем.
-        var windows = Trim(Environment.GetFolderPath(Environment.SpecialFolder.Windows));
-        if (windows.Length > 0 && (string.Equals(d, windows, StringComparison.OrdinalIgnoreCase) ||
-                                   d.StartsWith(windows + "\\", StringComparison.OrdinalIgnoreCase)))
+        if (IsWindowsPath(d + "\\"))
             return true;
 
         return BroadFolders.Value.Contains(d);
@@ -322,4 +358,65 @@ public sealed class AppFamily
     }
 
     private static string Trim(string path) => path.TrimEnd('\\', '/');
+}
+
+/// <summary>
+/// Папка пакета Microsoft Store: …\WindowsApps\Имя_Версия_Архитектура_Ресурс_Издатель\…. Обновляясь, приложение Store
+/// переезжает в папку новой версии и само перезапускается оттуда, а прежнюю папку Windows удаляет. Поэтому его процессы
+/// узнаются по имени пакета и издателю в любой версии, а не по папке, найденной при запуске. То же правило у службы для
+/// ядра (CoreConfigBuilder, копии мимо лаунчера).
+/// </summary>
+/// <param name="Parent">Папка WindowsApps с «\» в конце.</param>
+/// <param name="Rest">Путь от папки пакета до папки программы, с «\» в конце («\app\» или «\»).</param>
+internal sealed record StorePackage(string Parent, string Name, string Publisher, string Rest)
+{
+    private static readonly Regex FullName = new(@"^(?<name>[^_\\]+)_(?<version>\d+(?:\.\d+){3})_[^_\\]*_[^_\\]*_(?<publisher>[a-z0-9]{13})$",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    /// <summary>Пакет, в папке которого лежит <paramref name="dir"/>, или null.</summary>
+    public static StorePackage? Find(string dir)
+    {
+        var parts = dir.TrimEnd('\\').Split('\\');
+        for (var i = 1; i < parts.Length; i++)
+        {
+            if (!string.Equals(parts[i - 1], "WindowsApps", StringComparison.OrdinalIgnoreCase) || FullName.Match(parts[i]) is not { Success: true } match)
+                continue;
+            var rest = "\\" + string.Concat(parts.Skip(i + 1).Select(p => p + "\\"));
+            return new StorePackage(string.Join("\\", parts.Take(i)) + "\\", match.Groups["name"].Value, match.Groups["publisher"].Value, rest);
+        }
+
+        return null;
+    }
+
+    /// <summary>Программа лежит в той же папке этого пакета, в любой его версии.</summary>
+    public bool Contains(string imagePath)
+    {
+        if (!imagePath.StartsWith(Parent, StringComparison.OrdinalIgnoreCase))
+            return false;
+        var tail = imagePath[Parent.Length..];
+        var slash = tail.IndexOf('\\');
+        return slash > 0 && FullName.Match(tail[..slash]) is { Success: true } match && Same(match) &&
+               tail[slash..].StartsWith(Rest, StringComparison.OrdinalIgnoreCase);
+    }
+
+    public bool SameAs(StorePackage other) =>
+        string.Equals(Parent, other.Parent, StringComparison.OrdinalIgnoreCase) && string.Equals(Rest, other.Rest, StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(Name, other.Name, StringComparison.OrdinalIgnoreCase) && string.Equals(Publisher, other.Publisher, StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>Путь без версии пакета (для сравнения программ приложения): «…\WindowsApps\Claude_*_pzs8sxrjxfjjc\app».</summary>
+    public static string WithoutVersion(string path)
+    {
+        var parts = path.Split('\\');
+        for (var i = 1; i < parts.Length; i++)
+        {
+            if (string.Equals(parts[i - 1], "WindowsApps", StringComparison.OrdinalIgnoreCase) && FullName.Match(parts[i]) is { Success: true } match)
+                parts[i] = match.Groups["name"].Value + "_*_" + match.Groups["publisher"].Value;
+        }
+
+        return string.Join("\\", parts);
+    }
+
+    private bool Same(Match match) =>
+        string.Equals(match.Groups["name"].Value, Name, StringComparison.OrdinalIgnoreCase) &&
+        string.Equals(match.Groups["publisher"].Value, Publisher, StringComparison.OrdinalIgnoreCase);
 }

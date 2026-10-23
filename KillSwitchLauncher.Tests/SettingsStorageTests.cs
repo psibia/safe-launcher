@@ -17,7 +17,7 @@ public class SettingsStorageTests
         using var dir = new TempDir();
         var settings = new SettingsStorage(dir.File("settings.json")).Load();
 
-        Assert.True(settings.KillSwitchEnabled);
+        Assert.False(settings.KillSwitchEnabled); // новая установка: Kill-Switch выключен
         Assert.Equal(VpnRuleMode.AnyVpn, settings.RuleMode);
         Assert.Equal(HideBehavior.Ask, settings.HideBehavior);
         Assert.False(settings.TrayHintShown);

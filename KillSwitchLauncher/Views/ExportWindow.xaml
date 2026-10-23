@@ -95,6 +95,9 @@
                 <TextBlock x:Name="HideAddressesNote" Text="Адреса в журналах уже скрыты" Foreground="{StaticResource TextMuted}" FontSize="11.5"
                            Margin="27,2,0,0" Visibility="Collapsed" />
                 <CheckBox x:Name="HideSitesBox" Style="{StaticResource SoftCheckBox}" Content="Скрыть имена сайтов" Margin="0,10,0,0" />
+                <CheckBox x:Name="HideNamesBox" Style="{StaticResource SoftCheckBox}" Content="Скрыть названия программ и подключений" Margin="0,10,0,0" />
+                <TextBlock Text="Приложения, подключения, программы, процессы, папки и сетевые адаптеры заменятся метками" Foreground="{StaticResource TextMuted}"
+                           FontSize="11.5" Margin="27,2,0,0" TextWrapping="Wrap" />
                 <CheckBox x:Name="DnsBox" Style="{StaticResource SoftCheckBox}" Content="Добавить журналы DNS приложений" Margin="0,10,0,0" />
                 <CheckBox x:Name="CoreErrorsBox" Style="{StaticResource SoftCheckBox}" Margin="0,10,0,0" Visibility="Collapsed"
                           Content="Подключения: только ошибки, кроме 15 минут вокруг отметок" />

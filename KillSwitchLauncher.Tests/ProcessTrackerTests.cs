@@ -298,6 +298,96 @@ public class ProcessTrackerTests : IDisposable
         Assert.True(AllClosed());
     }
 
+    // ---------------------------------------------------------------- приложение перезапустилось само
+
+    [Fact]
+    public void SelfRestart_AfterAppExits_IsTheSameLaunch()
+    {
+        // Как приложение Microsoft Store после обновления: процессы закончились, и сразу же новая программа запущена не
+        // лаунчером (Windows). Это тот же запуск: она в задании, а не копия мимо лаунчера, даже через подключение лаунчера.
+        using var tracker = new ProcessTracker();
+        var entry = Entry("--sleep 3");
+        var restarted = new List<Guid>();
+        tracker.Restarted += (appId, _) =>
+        {
+            lock (restarted)
+                restarted.Add(appId);
+        };
+        tracker.SetPolicy(entry, viaCore: true, killOnClose: true);
+        tracker.Launch(entry);
+        Assert.True(Wait.Until(() => tracker.CountFor(entry.Id) == 1, Timeout));
+        Assert.True(Wait.Until(() => tracker.CountFor(entry.Id) == 0, Timeout), "Приложение должно закрыться само");
+
+        using var external = TestAppProcess.StartExternal();
+
+        Assert.True(Wait.Until(() => tracker.CountFor(entry.Id) == 1, Timeout), "Перезапуск нужно взять под контроль");
+        Assert.True(Wait.Until(() =>
+        {
+            lock (restarted)
+                return restarted.Count == 1;
+        }, Timeout));
+        Assert.Equal(entry.Id, restarted[0]);
+        Thread.Sleep(2500); // копия мимо лаунчера считается, когда работает дольше 2 секунд
+        Assert.Equal(0, tracker.OutsideFor(entry.Id));
+
+        tracker.KillAll(blockRelaunch: false);
+        Assert.True(external.WaitForExit(5000), "Перезапущенное приложение закрывается вместе с запуском");
+    }
+
+    [Fact]
+    public void ClosedFromLauncher_NewCopy_IsNotARestart()
+    {
+        // Приложение закрыто из лаунчера: копия, открытая после этого с ярлыка, — копия мимо лаунчера.
+        using var tracker = new ProcessTracker();
+        var entry = Entry();
+        tracker.SetPolicy(entry, viaCore: true, killOnClose: true);
+        tracker.Launch(entry);
+        Assert.True(Wait.Until(() => tracker.CountFor(entry.Id) == 1, Timeout));
+        tracker.Kill(entry.Id);
+        Assert.True(AllClosed());
+
+        using var external = TestAppProcess.StartExternal();
+
+        Assert.True(Wait.Until(() => tracker.OutsideFor(entry.Id) == 1, Timeout));
+        Assert.Equal(0, tracker.CountFor(entry.Id));
+    }
+
+    [Fact]
+    public void CopyOpenedBefore_IsNotARestart_WhenAppExits()
+    {
+        // Копия мимо лаунчера работала раньше: когда запуск из лаунчера закончился, она не становится его перезапуском.
+        using var external = TestAppProcess.StartExternal();
+        Thread.Sleep(200);
+        using var tracker = new ProcessTracker { RestartLead = TimeSpan.Zero };
+        var entry = Entry("--sleep 3");
+        tracker.SetPolicy(entry, viaCore: true, killOnClose: true);
+        tracker.Launch(entry);
+        Assert.True(Wait.Until(() => tracker.CountFor(entry.Id) == 1, Timeout));
+        Assert.True(Wait.Until(() => tracker.CountFor(entry.Id) == 0, Timeout), "Приложение должно закрыться само");
+
+        Thread.Sleep(2500);
+
+        Assert.Equal(0, tracker.CountFor(entry.Id));
+        Assert.Equal(1, tracker.OutsideFor(entry.Id));
+    }
+
+    [Fact]
+    public void CopyOpenedLongAfterExit_IsNotARestart()
+    {
+        using var tracker = new ProcessTracker { RestartWindow = TimeSpan.FromSeconds(1) };
+        var entry = Entry("--sleep 2");
+        tracker.SetPolicy(entry, viaCore: true, killOnClose: true);
+        tracker.Launch(entry);
+        Assert.True(Wait.Until(() => tracker.CountFor(entry.Id) == 1, Timeout));
+        Assert.True(Wait.Until(() => tracker.CountFor(entry.Id) == 0, Timeout));
+        Thread.Sleep(2000);
+
+        using var external = TestAppProcess.StartExternal();
+
+        Assert.True(Wait.Until(() => tracker.OutsideFor(entry.Id) == 1, Timeout));
+        Assert.Equal(0, tracker.CountFor(entry.Id));
+    }
+
     [Fact]
     public void Launch_MissingProgram_Throws()
     {

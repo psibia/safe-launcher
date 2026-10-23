@@ -76,9 +76,9 @@ public sealed class FakeDialogs : IDialogService
 
     public List<string> Warnings { get; } = new();
 
-    public void ShowInfo(string message, string title)
-    {
-    }
+    public List<string> Infos { get; } = new();
+
+    public void ShowInfo(string message, string title) => Infos.Add(message);
 
     public void ShowWarning(string message, string title = "Внимание") => Warnings.Add(message);
 

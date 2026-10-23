@@ -10,7 +10,7 @@
     <AssemblyName>SafeLauncher.Logging</AssemblyName>
     <RootNamespace>SafeLauncher.Logging</RootNamespace>
     <Product>Безопасный лаунчер</Product>
-    <Version>2.3.7</Version>
+    <Version>2.3.9</Version>
   </PropertyGroup>
 
   <ItemGroup>

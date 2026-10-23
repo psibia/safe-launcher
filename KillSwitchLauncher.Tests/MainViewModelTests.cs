@@ -270,6 +270,7 @@ public class MainViewModelTests : IDisposable
     public void KillSwitchOff_RequiresConfirmation()
     {
         _dialogs.ConfirmAnswer = false;
+        Preset(s => s.KillSwitchEnabled = true);
 
         WithViewModel((vm, _) =>
         {
@@ -285,15 +286,14 @@ public class MainViewModelTests : IDisposable
     public void KillSwitchOffAndOn_IsSavedAndLogged()
     {
         _dialogs.ConfirmAnswer = true;
+        Preset(s => s.KillSwitchEnabled = true);
 
         WithViewModel((vm, log) =>
         {
             vm.KillSwitchEnabled = false;
             Assert.True(vm.HasPendingChanges);
-            Assert.False(vm.IsKillSwitchOff); // до «Применить» защита ещё работает
 
             vm.ApplySettingsCommand.Execute(null);
-            Assert.True(vm.IsKillSwitchOff);
             Assert.False(Storage.Load().KillSwitchEnabled);
             Assert.Equal("Kill-Switch выключен", log.Snapshot()[^1].Text);
 
@@ -301,24 +301,8 @@ public class MainViewModelTests : IDisposable
             vm.KillSwitchEnabled = true;
             vm.ApplySettingsCommand.Execute(null);
             Assert.Equal(1, _dialogs.ConfirmCalls);
-            Assert.False(vm.IsKillSwitchOff);
             Assert.True(Storage.Load().KillSwitchEnabled);
             Assert.Equal("Kill-Switch включён", log.Snapshot()[^1].Text);
-        });
-    }
-
-    [Fact]
-    public void RuleChange_IsSavedAndLogged()
-    {
-        WithViewModel((vm, log) =>
-        {
-            vm.RuleMode = VpnRuleMode.AllOfSelected;
-            Assert.True(vm.HasPendingChanges);
-
-            vm.ApplySettingsCommand.Execute(null);
-
-            Assert.Equal(VpnRuleMode.AllOfSelected, Storage.Load().RuleMode);
-            Assert.StartsWith("Новое правило: VPN: все выбранные", log.Snapshot()[^1].Text);
         });
     }
 
@@ -436,19 +420,36 @@ public class MainViewModelTests : IDisposable
         {
             var start = log.Snapshot().Single();
             Assert.Equal(LogKind.Info, start.Kind);
-            Assert.StartsWith($"Лаунчер {UpdateService.Format(UpdateService.CurrentVersion)} запущен · VPN ", start.Text);
-            Assert.DoesNotContain("Kill-Switch выключен", start.Text);
+            Assert.Equal($"Лаунчер {UpdateService.Format(UpdateService.CurrentVersion)} запущен", start.Text);
         });
 
         Assert.Equal("Лаунчер закрыт", Log.Snapshot()[^1].Text);
     }
 
     [Fact]
-    public void Log_StartMentionsKillSwitchOff()
+    public void NewInstall_KillSwitchOff_MainScreenWarnsAboutDnsLeak()
     {
-        Preset(s => s.KillSwitchEnabled = false);
+        WithViewModel((vm, _) =>
+        {
+            Assert.False(vm.KillSwitchEnabled);
+            Assert.True(vm.IsDnsLeakPossible);
+        });
+    }
 
-        WithViewModel((_, log) => Assert.EndsWith(" · Kill-Switch выключен", log.Snapshot().Single().Text));
+    [Fact]
+    public void DnsLeakWarning_GoesAwayWhenProtectionApplied()
+    {
+        _dialogs.ConfirmAnswer = true;
+
+        WithViewModel((vm, _) =>
+        {
+            vm.HideDns = true;
+            Assert.True(vm.IsDnsLeakPossible); // до «Применить» защита ещё не действует
+
+            vm.ApplySettingsCommand.Execute(null);
+            Assert.False(vm.IsDnsLeakPossible);
+            Assert.True(Storage.Load().HideDns);
+        });
     }
 
     [Fact]

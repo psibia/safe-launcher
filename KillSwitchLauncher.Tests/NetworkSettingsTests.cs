@@ -8,7 +8,10 @@ using Xunit;
 
 namespace KillSwitchLauncher.Tests;
 
-/// <summary>Переход с настроек лаунчера 1.x: поведение остаётся прежним.</summary>
+/// <summary>
+/// Переход со старых настроек: лаунчер 1.x и системный VPN. Системного VPN больше нет: то, что шло через него, идёт через
+/// основное подключение, а без подключений не запускается.
+/// </summary>
 public class SettingsMigrationTests
 {
     // settings.json лаунчера 1.x: без версии и сетевых настроек
@@ -45,7 +48,8 @@ public class SettingsMigrationTests
 
             Assert.Equal(SettingsStorage.CurrentVersion, settings.SettingsVersion);
             Assert.False(settings.KillSwitchEnabled);
-            Assert.Equal(GlobalNetworkMode.SystemVpn, settings.NetworkMode);
+            Assert.Equal(GlobalNetworkMode.LauncherConnection, settings.NetworkMode);
+            Assert.Equal(new[] { "Discord", "Telegram" }, settings.MovedFromSystemVpn!.Apps);
             Assert.Equal(VpnRuleMode.AnyOfSelected, settings.RuleMode);
             Assert.Equal(new[] { "WireGuard" }, settings.SelectedAdapters);
             Assert.Empty(settings.Connections);
@@ -66,9 +70,9 @@ public class SettingsMigrationTests
     }
 
     [Fact]
-    public void OldSettings_BehaveAsBefore()
+    public void OldSettings_WithoutConnections_DoNotLaunch()
     {
-        // Прежнее поведение: запуск только при VPN по общему правилу адаптеров, Kill-Switch — общий флаг.
+        // Подключений у лаунчера 1.x не было: приложения ждут основное подключение, Kill-Switch — общий флаг.
         var (storage, dir) = WithOldFile();
         using (dir)
         {
@@ -77,12 +81,11 @@ public class SettingsMigrationTests
             foreach (var app in settings.Apps)
             {
                 var plan = NetworkPlan.For(app, settings);
-                Assert.Equal(NetworkPlanKind.SystemAdapters, plan.Kind);
+                Assert.Equal(NetworkPlanKind.MissingConnection, plan.Kind);
                 Assert.Equal(NetworkPlanSource.Global, plan.Source);
-                Assert.Equal(VpnRuleMode.AnyOfSelected, plan.AdapterRule!.Mode);
-                Assert.Contains("wireguard", plan.AdapterRule.SelectedAdapters, StringComparer.OrdinalIgnoreCase);
+                Assert.Null(plan.AdapterRule);
                 Assert.False(plan.CloseOnDrop);
-                Assert.False(plan.UsesLauncherCore);
+                Assert.True(plan.UsesLauncherCore);
             }
         }
     }
@@ -95,13 +98,17 @@ public class SettingsMigrationTests
         {
             var settings = storage.Load();
             Assert.Equal(OldSettings, File.ReadAllText(storage.FilePath + ".v0.bak"));
+            Assert.Equal(OldSettings, File.ReadAllText(storage.FilePath + ".system-vpn.bak"));
 
             storage.Save(settings);
             File.Delete(storage.FilePath + ".v0.bak");
-            storage.Load();
+            File.Delete(storage.FilePath + ".system-vpn.bak");
+            var again = storage.Load();
 
             Assert.Contains("\"SettingsVersion\": 1", File.ReadAllText(storage.FilePath));
             Assert.False(File.Exists(storage.FilePath + ".v0.bak")); // уже новый формат — копия не нужна
+            Assert.False(File.Exists(storage.FilePath + ".system-vpn.bak"));
+            Assert.Null(again.MovedFromSystemVpn); // переход один раз
         }
     }
 
@@ -112,7 +119,121 @@ public class SettingsMigrationTests
         var settings = new SettingsStorage(dir.File("settings.json")).Load();
 
         Assert.Equal(SettingsStorage.CurrentVersion, settings.SettingsVersion);
-        Assert.Equal(GlobalNetworkMode.SystemVpn, settings.NetworkMode);
+        Assert.Equal(GlobalNetworkMode.LauncherConnection, settings.NetworkMode);
+        Assert.Null(settings.MovedFromSystemVpn);
+    }
+
+    private static AppSettings SaveAndLoad(TempDir dir, AppSettings settings)
+    {
+        var storage = new SettingsStorage(dir.File("settings.json"));
+        storage.Save(settings);
+        return storage.Load();
+    }
+
+    [Fact]
+    public void SystemVpn_GoesThroughFirstConnection_WhenNoneWasMain()
+    {
+        using var dir = new TempDir();
+        var first = new VpnConnection { Name = "Германия", Kind = ConnectionKind.Link };
+        var second = new VpnConnection { Name = "Польша", Kind = ConnectionKind.Link };
+        var settings = SaveAndLoad(dir, new AppSettings
+        {
+            NetworkMode = GlobalNetworkMode.SystemVpn,
+            ConnectionId = Guid.NewGuid(), // подключение, которого уже нет
+            Connections = { first, second },
+            Apps =
+            {
+                new AppEntry { Name = "Discord" },
+                new AppEntry { Name = "Steam", Network = new AppNetwork { Mode = AppNetworkMode.OwnAdapters } },
+                new AppEntry { Name = "Chrome", Network = new AppNetwork { Mode = AppNetworkMode.OwnConnection, ConnectionId = second.Id } },
+                new AppEntry { Name = "Игра", Network = new AppNetwork { Mode = AppNetworkMode.Offline } }
+            }
+        });
+
+        Assert.Equal(GlobalNetworkMode.LauncherConnection, settings.NetworkMode);
+        Assert.Equal(first.Id, settings.ConnectionId);
+        Assert.Equal(new[] { "Discord", "Steam" }, settings.MovedFromSystemVpn!.Apps);
+        Assert.Equal(new[] { AppNetworkMode.Inherit, AppNetworkMode.Inherit, AppNetworkMode.OwnConnection, AppNetworkMode.Offline },
+            settings.Apps.Select(a => a.Network.Mode));
+        Assert.Equal(new[] { first.Id, first.Id, second.Id }, settings.Apps.Take(3).Select(a => NetworkPlan.For(a, settings).Connection!.Id));
+        Assert.True(File.Exists(dir.File("settings.json") + ".system-vpn.bak"));
+    }
+
+    [Fact]
+    public void SystemVpn_KeepsMainChosenBefore()
+    {
+        using var dir = new TempDir();
+        var first = new VpnConnection { Name = "Германия", Kind = ConnectionKind.Link };
+        var second = new VpnConnection { Name = "Польша", Kind = ConnectionKind.Link };
+        var settings = SaveAndLoad(dir, new AppSettings
+        {
+            NetworkMode = GlobalNetworkMode.SystemVpn,
+            ConnectionId = second.Id,
+            Connections = { first, second },
+            Apps = { new AppEntry { Name = "Discord" } }
+        });
+
+        Assert.Equal(second.Id, settings.ConnectionId);
+        Assert.Equal(second.Id, NetworkPlan.For(settings.Apps[0], settings).Connection!.Id);
+    }
+
+    [Fact]
+    public void SystemVpn_WithoutConnections_NothingLaunchesOrUsesAdapters()
+    {
+        using var dir = new TempDir();
+        var settings = SaveAndLoad(dir, new AppSettings
+        {
+            NetworkMode = GlobalNetworkMode.SystemVpn,
+            KillSwitchEnabled = true,
+            Apps =
+            {
+                new AppEntry { Name = "Discord" },
+                new AppEntry { Name = "Steam", Network = new AppNetwork { Mode = AppNetworkMode.OwnAdapters, CloseOnDrop = ProtectionOverride.Off } }
+            }
+        });
+
+        Assert.Null(settings.ConnectionId);
+        Assert.Equal(new[] { "Discord", "Steam" }, settings.MovedFromSystemVpn!.Apps);
+        Assert.All(settings.Apps, a => Assert.Equal(NetworkPlanKind.MissingConnection, NetworkPlan.For(a, settings).Kind));
+    }
+
+    [Fact]
+    public void OwnAdapters_UnderLauncherConnection_GoThroughMain()
+    {
+        using var dir = new TempDir();
+        var main = new VpnConnection { Name = "Германия", Kind = ConnectionKind.Link };
+        var settings = SaveAndLoad(dir, new AppSettings
+        {
+            NetworkMode = GlobalNetworkMode.LauncherConnection,
+            ConnectionId = main.Id,
+            Connections = { main },
+            Apps =
+            {
+                new AppEntry { Name = "Discord" },
+                new AppEntry { Name = "Steam", Network = new AppNetwork { Mode = AppNetworkMode.OwnAdapters } }
+            }
+        });
+
+        Assert.Equal(new[] { "Steam" }, settings.MovedFromSystemVpn!.Apps);
+        Assert.Equal(main.Id, settings.ConnectionId);
+        Assert.All(settings.Apps, a => Assert.Equal(NetworkPlanKind.LauncherConnection, NetworkPlan.For(a, settings).Kind));
+    }
+
+    [Fact]
+    public void LauncherConnection_WithoutMain_IsLeftAsIs()
+    {
+        // Основное удалили сами: его не выбираем за пользователя, раздел «Подключения» попросит выбрать.
+        using var dir = new TempDir();
+        var settings = SaveAndLoad(dir, new AppSettings
+        {
+            NetworkMode = GlobalNetworkMode.LauncherConnection,
+            Connections = { new VpnConnection { Name = "Германия", Kind = ConnectionKind.Link } },
+            Apps = { new AppEntry { Name = "Discord" } }
+        });
+
+        Assert.Null(settings.MovedFromSystemVpn);
+        Assert.Null(settings.ConnectionId);
+        Assert.False(File.Exists(dir.File("settings.json") + ".system-vpn.bak"));
     }
 
     [Fact]
@@ -221,11 +342,7 @@ public class SettingsMigrationTests
                 DirectDomains = new List<string> { "cdn.discordapp.com" }
             }
         };
-        var other = new AppEntry
-        {
-            Name = "Telegram",
-            Network = new AppNetwork { Mode = AppNetworkMode.OwnAdapters, RuleMode = VpnRuleMode.AllOfSelected, SelectedAdapters = new List<string> { "Рабочий VPN" } }
-        };
+        var other = new AppEntry { Name = "Telegram", Network = new AppNetwork { Mode = AppNetworkMode.Offline } };
         storage.Save(new AppSettings
         {
             NetworkMode = GlobalNetworkMode.LauncherConnection,
@@ -252,9 +369,8 @@ public class SettingsMigrationTests
         Assert.Equal(OutsideCopiesOverride.Block, network.OutsideCopies);
         Assert.Equal(new[] { "cdn.discordapp.com" }, network.DirectDomains);
 
-        Assert.Equal(AppNetworkMode.OwnAdapters, loaded.Apps[1].Network.Mode);
-        Assert.Equal(VpnRuleMode.AllOfSelected, loaded.Apps[1].Network.RuleMode);
-        Assert.Equal(new[] { "Рабочий VPN" }, loaded.Apps[1].Network.SelectedAdapters);
+        Assert.Equal(AppNetworkMode.Offline, loaded.Apps[1].Network.Mode);
+        Assert.Null(loaded.MovedFromSystemVpn);
 
         var json = File.ReadAllText(storage.FilePath);
         Assert.Contains("\"Mode\": \"OwnConnection\"", json);
@@ -268,10 +384,12 @@ public class NetworkPlanTests
     private static readonly VpnConnection Shared = new() { Name = "Общее", Kind = ConnectionKind.Link };
     private static readonly VpnConnection Own = new() { Name = "Своё", Kind = ConnectionKind.WireGuard };
 
+    // Код системного VPN остаётся до второго шага удаления: здесь он проверяется напрямую, без загрузки настроек.
     private static AppSettings Settings(Action<AppSettings>? setup = null)
     {
         var settings = new AppSettings
         {
+            NetworkMode = GlobalNetworkMode.SystemVpn,
             RuleMode = VpnRuleMode.AnyOfSelected,
             SelectedAdapters = new List<string> { "WireGuard" },
             Connections = new List<VpnConnection> { Shared, Own }

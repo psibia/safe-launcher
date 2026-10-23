@@ -157,6 +157,18 @@ internal static class NativeMethods
         [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szExeFile;
     }
 
+    /// <summary>Основные сведения о процессе (NtQueryInformationProcess, класс 0): нужен PID родителя.</summary>
+    [StructLayout(LayoutKind.Sequential)]
+    public struct ProcessBasicInformation
+    {
+        public IntPtr ExitStatus;
+        public IntPtr PebBaseAddress;
+        public IntPtr AffinityMask;
+        public IntPtr BasePriority;
+        public IntPtr UniqueProcessId;
+        public IntPtr InheritedFromUniqueProcessId;
+    }
+
     [DllImport("kernel32.dll", SetLastError = true)]
     public static extern bool CloseHandle(IntPtr hObject);
 
@@ -250,6 +262,11 @@ internal static class NativeMethods
 
     [DllImport("ntdll.dll")]
     public static extern int NtResumeProcess(SafeHandle process);
+
+    /// <summary>Сведения о процессе; класс 0 — <see cref="ProcessBasicInformation"/>. 0 — успех.</summary>
+    [DllImport("ntdll.dll")]
+    public static extern int NtQueryInformationProcess(SafeHandle process, int informationClass,
+        ref ProcessBasicInformation information, int length, out int returnLength);
 
     /// <summary>Порядок завершения при выходе из Windows: 0x100 — последними среди программ.</summary>
     [DllImport("kernel32.dll", SetLastError = true)]

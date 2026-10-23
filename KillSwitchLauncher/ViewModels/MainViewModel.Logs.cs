@@ -6,6 +6,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Input;
@@ -451,6 +452,7 @@ public sealed partial class MainViewModel
         // Снимки берутся сразу, в UI-потоке: состояние лаунчера меняется только в нем.
         var settings = SettingsSnapshot.ToJson(_settings, s => s);
         var tags = SettingsSnapshot.Tags(_settings);
+        var names = options.HideNames ? NamesForExport() : new List<KeyValuePair<string, string>>();
         var state = DescribeStateForExport();
         var environment = DescribeEnvironmentForExport();
         var events = _log.Snapshot();
@@ -509,6 +511,7 @@ public sealed partial class MainViewModel
             Environment = environment,
             State = state,
             Tags = tags,
+            Names = names,
             Logging = logging,
             MaskKeyShared = TechLog.MaskKeyShared,
             LauncherVersion = UpdateService.Format(UpdateService.CurrentVersion),
@@ -517,6 +520,62 @@ public sealed partial class MainViewModel
             LauncherDropped = TechLog.Store?.Dropped ?? 0,
             ServiceDropped = ServiceLogs.LastState?.Dropped
         };
+    }
+
+    /// <summary>Адаптеры с такими именами Windows называет сама: по ним ничего не узнать.</summary>
+    private static readonly Regex GenericAdapter = new(
+        @"^(Ethernet|Wi-?Fi|Беспроводная сеть|Подключение по локальной сети|Local Area Connection|Сетевое подключение Bluetooth|Bluetooth Network Connection|vEthernet \(.*\)|Loopback.*|Teredo.*|isatap.*|6to4.*|" +
+        VpnAdapterDetector.OwnTunnelName + @")( ?\*? ?\d+)?$",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    /// <summary>
+    /// Названия для галочки «Скрыть названия программ и подключений»: приложения (имя, программа, ярлык, приложение Store),
+    /// подключения, адаптеры (кроме названных самой Windows), параметры запуска.
+    /// </summary>
+    private List<KeyValuePair<string, string>> NamesForExport()
+    {
+        var names = new List<KeyValuePair<string, string>>();
+        void Add(string? name, string label)
+        {
+            if (!string.IsNullOrWhiteSpace(name))
+                names.Add(new(name.Trim(), label));
+        }
+
+        foreach (var app in _settings.Apps)
+        {
+            var label = LogMasker.TagLabel("app", CorePlan.AppTag(app.Id));
+            Add(app.Name, label);
+            foreach (var path in new[] { app.ExePath, app.SourcePath })
+            {
+                if (string.IsNullOrWhiteSpace(path))
+                    continue;
+                var file = Path.GetFileName(path.Trim());
+                Add(file.EndsWith(".exe", StringComparison.OrdinalIgnoreCase) ? file : Path.GetFileNameWithoutExtension(file), label);
+            }
+            Add(app.AppUserModelId, label);
+            Add(app.Arguments, "[параметры запуска]");
+        }
+
+        foreach (var connection in _settings.Connections)
+            Add(connection.Name, LogMasker.TagLabel("conn", CorePlan.ConnectionTag(connection.Id)));
+
+        var adapters = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        adapters.UnionWith(_settings.KnownAdapters.Select(a => a.Name));
+        adapters.UnionWith(_settings.SelectedAdapters);
+        adapters.UnionWith(_settings.Apps.SelectMany(a => a.Network.SelectedAdapters));
+        adapters.UnionWith(_monitor.Current.ActiveVpnNames);
+        try
+        {
+            adapters.UnionWith(NetworkSnapshot.Adapters().Select(a => a.Name));
+        }
+        catch (Exception)
+        {
+            // список адаптеров не прочитан: останутся те, что в настройках
+        }
+        var masker = TechLog.Masker;
+        foreach (var adapter in adapters.Where(a => !string.IsNullOrWhiteSpace(a) && !GenericAdapter.IsMatch(a.Trim())))
+            Add(adapter, masker.NameLabel("adapter", adapter));
+        return names;
     }
 
     private static ExportFile? ReadFile(string path, DateTime utc)

@@ -268,7 +268,8 @@ public class LoggingTests
     public void Store_MemoryMode_DeletesFiles_AndKeepsRing()
     {
         using var dir = new TempDir();
-        using var store = new LogStore(dir.Root, "launcher", LogSources.Launcher, 10_000_000, 150, null, background: false);
+        var clock = new Clock();
+        using var store = new LogStore(dir.Root, "launcher", LogSources.Launcher, 10_000_000, 150, clock.Get, background: false);
         store.Append(Line(T0, "в файле"));
         Assert.Single(store.Files());
 

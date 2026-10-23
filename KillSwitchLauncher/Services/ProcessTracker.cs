@@ -9,6 +9,7 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 using KillSwitchLauncher.Models;
 using static KillSwitchLauncher.Services.NativeMethods;
 
@@ -66,6 +67,18 @@ public sealed record LaunchResult(int ProcessId, bool Contained, bool Elevated, 
 ///      в задание, в том числе у приложения через подключение лаунчера, иначе сразу закрывается. Копии, открытые раньше
 ///      (до открытия лаунчера, в первые <see cref="AdoptGrace"/> после него или до выбора варианта), не закрываются, а ждут
 ///      условия запуска: при входе в Windows программы из автозагрузки открываются раньше, чем подключится VPN.
+///  10. Приложение перезапустилось само (<see cref="Restarted"/>). Приложение Microsoft Store, обновляясь, закрывается, и Windows
+///      запускает новую версию из папки нового пакета: она не потомок прежних процессов и в задание не попадает. Поэтому,
+///      если процессы приложения закончились, а в течение <see cref="RestartWindow"/> появилась его программа, запущенная
+///      не раньше этого (за <see cref="RestartLead"/> до последнего прохода с процессами), это тот же запуск: она и её
+///      потомки берутся в задание, при любом варианте «Если открыто не из лаунчера». Раньше лаунчер терял такое
+///      приложение, и оно работало как копия мимо лаунчера, а копия новой версии пакета Store шла напрямую.
+///  11. Подпись издателя (<see cref="AppFamily.Publisher"/>). Программа приложения с тем же именем exe и той же подписью
+///      издателя узнаётся в любой папке: приложение переустановили или обновили в другую папку. Подпись программы
+///      приложения проверяется в фоне (<see cref="Signatures"/>), а новая подпись запоминается сама.
+///  12. Процессы, которые запустила копия приложения, открытая не из лаунчера (<see cref="TryGetKin"/>): помощники из других
+///      папок. Ядро по папке приложения их не узнаёт, поэтому лаунчер отвечает ядру за них меткой копий, и они идут, как
+///      выбрано в «Если открыто не из лаунчера». При «Через лаунчер» копия берётся в задание вместе с ними.
 /// </summary>
 public sealed class ProcessTracker : IAppProcesses, IDisposable
 {
@@ -147,6 +160,24 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
     internal TimeSpan AdoptGrace { get; init; } = TimeSpan.FromSeconds(30);
 
     /// <summary>
+    /// Сколько после того, как процессы приложения закончились, его новая программа считается перезапуском того же запуска.
+    /// Обновление приложения Store укладывается в несколько секунд; приложение, закрытое из лаунчера, не ждёт.
+    /// </summary>
+    internal TimeSpan RestartWindow { get; init; } = TimeSpan.FromSeconds(60);
+
+    /// <summary>
+    /// Перезапуском считается программа, запущенная не раньше, чем за это время до последнего прохода, когда у приложения
+    /// были процессы: новая версия может стартовать чуть раньше, чем закроется прежняя. Копия, открытая раньше, — нет.
+    /// </summary>
+    internal TimeSpan RestartLead { get; init; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>
+    /// Приложение перезапустилось само (например, после обновления), и новая программа взята под контроль как тот же запуск.
+    /// Аргументы — приложение и удалось ли поместить процесс в задание. Поток наблюдения.
+    /// </summary>
+    public event Action<Guid, bool>? Restarted;
+
+    /// <summary>
     /// «Через лаунчер»: приложение не работало, его копию открыли не из лаунчера, и она взята под контроль, как запуск
     /// с плитки. Аргументы — приложение и удалось ли поместить процесс в задание. Поток наблюдения.
     /// </summary>
@@ -159,6 +190,19 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
     public event Action<string, string>? OutsideRejected;
 
     private readonly ConcurrentDictionary<Guid, AppFamily> _families = new();
+
+    /// <summary>Издатели программ приложений из проверенных подписей (<see cref="LearnPublisherLocked"/>).</summary>
+    private readonly ConcurrentDictionary<Guid, string> _publishers = new();
+
+    /// <summary>
+    /// Ответы <see cref="TryGetKin"/> по PID и времени создания процесса. Сбрасываются, когда меняется семейство приложения.
+    /// </summary>
+    private readonly ConcurrentDictionary<int, KinAnswer> _kin = new();
+
+    private readonly record struct KinAnswer(DateTime Created, Guid App, ProcessKin.Kind Kind, DateTime At);
+
+    private static readonly TimeSpan KinKeep = TimeSpan.FromSeconds(30);
+    private const int MaxKinAnswers = 4096;
 
     /// <summary>Имя exe самого приложения: его процессы — не «браузер, открытый по ссылке», даже если приложение — браузер.</summary>
     private readonly ConcurrentDictionary<Guid, string> _exeNames = new();
@@ -260,7 +304,8 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
 
     /// <summary>
     /// У приложения действует «Через лаунчер»: лаунчер узнаёт его копии и берёт их под контроль. У программы в общей папке
-    /// (Program Files, System32, «Загрузки») и общего «движка» (java, cmd) копии не узнаются. Любой поток.
+    /// (Program Files, System32, «Загрузки») копии узнаются только по подписи издателя, у общего «движка» (java, cmd) — никак.
+    /// Любой поток.
     /// </summary>
     public bool AdoptsCopies(Guid appId)
     {
@@ -290,7 +335,8 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
             if (slot.Family is null)
                 SetFamilyLocked(slot, entry.IsPackaged
                     ? PackagedApps.ExecutablePath(entry.AppUserModelId) is { } packaged ? AppFamily.ForImage(packaged) : null
-                    : AppFamily.For(entry));
+                    : AppFamily.For(entry, KnownPublisher(entry.Id)));
+            LearnPublisherLocked(slot, entry);
             if (!viaCore)
                 slot.Outside = 0;
             // Копии, которые уже работают, вариант не закрывает: они ждут условия запуска.
@@ -330,7 +376,7 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
         ThrowIfDisposed();
 
         var workDir = ResolveWorkingDirectory(entry);
-        var family = AppFamily.For(entry);
+        var family = AppFamily.For(entry, KnownPublisher(entry.Id));
         uint flags;
         lock (_gate)
         {
@@ -434,6 +480,7 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
             var slot = GetSlot(entry);
             slot.Name = entry.Name;
             SetFamilyLocked(slot, family);
+            LearnPublisherLocked(slot, entry);
             slot.Blocked = false;
 
             if (contained)
@@ -467,6 +514,8 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
             }
 
             slot.LastCount = CountLocked(slot);
+            if (slot.LastCount > 0)
+                slot.RunningUntil = DateTime.UtcNow;
             ScheduleLocked();
         }
 
@@ -561,6 +610,8 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
             }
 
             slot.LastCount = CountLocked(slot);
+            if (slot.LastCount > 0)
+                slot.RunningUntil = DateTime.UtcNow;
             ScheduleLocked();
         }
 
@@ -947,6 +998,8 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
                 slot.LastBlockedNotice = DateTime.UtcNow;
             }
 
+            // Закрыто лаунчером: новая копия после этого — не перезапуск приложения.
+            slot.RunningUntil = default;
             slot.LastCount = CountLocked(slot);
         }
 
@@ -996,6 +1049,7 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
             slot.Loose.Clear();
             SetFamilyLocked(slot, null);
             _exeNames.TryRemove(appId, out _);
+            _publishers.TryRemove(appId, out _);
         }
 
         lock (_membersGate)
@@ -1069,7 +1123,7 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
         if (_disposed || _timerScheduled)
             return;
 
-        if (_slots.Values.Any(s => s.IsArmed || s.Retired.Count > 0 || (s.Blocked || s.ViaCore || s.AdoptOutside) && s.Family is not null))
+        if (_slots.Values.Any(s => s.IsArmed || s.Retired.Count > 0 || (s.Blocked || s.ViaCore || s.AdoptOutside || MayRestart(s)) && s.Family is not null))
         {
             _timerScheduled = true;
             _timer.Change(WatchInterval, Timeout.InfiniteTimeSpan);
@@ -1130,6 +1184,8 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
                 RelaunchBlocked?.Invoke(this, name);
             foreach (var (appId, contained) in sweep.Launched)
                 OutsideLaunched?.Invoke(appId, contained);
+            foreach (var (appId, contained) in sweep.Restarted)
+                Restarted?.Invoke(appId, contained);
             foreach (var (name, reason) in sweep.Rejected)
                 OutsideRejected?.Invoke(name, reason);
         }
@@ -1155,6 +1211,8 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
         public readonly List<string> Blocked = new();
 
         public readonly List<(Guid AppId, bool Contained)> Launched = new();
+
+        public readonly List<(Guid AppId, bool Contained)> Restarted = new();
 
         public readonly List<(string Name, string Reason)> Rejected = new();
     }
@@ -1201,7 +1259,9 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
             });
         }
 
-        var watched = _slots.Values.Where(s => s.Family is not null && (s.IsArmed || s.Blocked || s.ViaCore || s.AdoptOutside)).ToList();
+        // Процессы приложения только что закончились: его новая программа — перезапуск того же запуска (обновление).
+        var restarting = _slots.Values.Where(s => s.Family is not null && !s.Blocked && MayRestart(s) && CountLocked(s) == 0).ToHashSet();
+        var watched = _slots.Values.Where(s => s.Family is not null && (s.IsArmed || s.Blocked || s.ViaCore || s.AdoptOutside || restarting.Contains(s))).ToList();
         // Приложения, которые сейчас не работают: первая взятая копия такого приложения — его запуск.
         var idle = watched.Where(s => s.AdoptOutside && CountLocked(s) == 0).ToHashSet();
         var outside = new Dictionary<AppSlot, int>();
@@ -1222,15 +1282,43 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
                     }
                 }
             }
+            else if (restarting.Contains(hit.Slot) && !hit.Foreign && !CreatedBefore(hit.Handle, hit.Slot.RunningUntil - RestartLead))
+            {
+                // Приложение перезапустилось само: та же сессия, что и запуск из лаунчера, вместе с уже запущенными потомками.
+                if (hit.Slot.Jobs.Any(j => j.Contains(hit.Handle)) || hit.Slot.Loose.Any(p => p.Pid == hit.Pid))
+                {
+                    hit.Handle.Dispose(); // уже взят как потомок перезапущенной программы
+                    continue;
+                }
+
+                var created = ProcessCreated(hit.Handle);
+                var contained = AdoptLocked(hit);
+                var children = AdoptChildrenLocked(hit.Slot, hit.Pid, created);
+                TechLog.Info(SafeLauncher.Logging.LogAreas.App, SafeLauncher.Logging.LogCodes.AppAdopt,
+                    $"«{hit.Slot.Name}» перезапустилось само (например, после обновления): процесс PID {hit.Pid} " +
+                    (contained ? "взят под контроль" : "взят под наблюдение вне задания") + (children > 0 ? $", его процессов {children}" : string.Empty));
+                if (!sweep.Restarted.Any(r => r.AppId == hit.Slot.Id))
+                    sweep.Restarted.Add((hit.Slot.Id, contained));
+            }
             else if (hit.Slot.AdoptOutside && !hit.Foreign && sweep.Verdicts.TryGetValue(hit.Slot.Id, out var refusal) &&
                      (refusal is null || hit.CanControl && !CreatedBefore(hit.Handle, hit.Slot.CloseOutsideFrom)))
             {
                 if (refusal is null)
                 {
-                    // «Через лаунчер», запускать можно: копия — запуск приложения.
+                    if (hit.Slot.Jobs.Any(j => j.Contains(hit.Handle)) || hit.Slot.Loose.Any(p => p.Pid == hit.Pid))
+                    {
+                        hit.Handle.Dispose(); // уже взят как потомок копии
+                        continue;
+                    }
+
+                    // «Через лаунчер», запускать можно: копия — запуск приложения, вместе с тем, что она уже запустила
+                    // (помощники из других папок).
+                    var created = ProcessCreated(hit.Handle);
                     var contained = AdoptLocked(hit);
+                    var children = AdoptChildrenLocked(hit.Slot, hit.Pid, created);
                     TechLog.Info(SafeLauncher.Logging.LogAreas.App, SafeLauncher.Logging.LogCodes.AppAdopt,
-                        $"«{hit.Slot.Name}»: процесс PID {hit.Pid}, открытый не из лаунчера, {(contained ? "взят под контроль" : "взят под наблюдение вне задания")} (через лаунчер)");
+                        $"«{hit.Slot.Name}»: процесс PID {hit.Pid}, открытый не из лаунчера, {(contained ? "взят под контроль" : "взят под наблюдение вне задания")} (через лаунчер)" +
+                        (children > 0 ? $", его процессов {children}" : string.Empty));
                     if (idle.Remove(hit.Slot))
                         sweep.Launched.Add((hit.Slot.Id, contained));
                 }
@@ -1285,9 +1373,15 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
             }
 
             var count = CountLocked(slot);
+            if (count > 0)
+                slot.RunningUntil = DateTime.UtcNow;
             if (count == slot.LastCount) continue;
-            TechLog.Debug(SafeLauncher.Logging.LogAreas.App, SafeLauncher.Logging.LogCodes.AppProcesses,
-                $"«{slot.Name}»: процессов {slot.LastCount} → {count}" + (copies > 0 ? $", копий мимо лаунчера {copies}" : string.Empty));
+            var text = $"«{slot.Name}»: процессов {slot.LastCount} → {count}" + (copies > 0 ? $", копий мимо лаунчера {copies}" : string.Empty);
+            // Закрытие приложения пишется всегда: без этого по журналу не понять, когда лаунчер перестал его вести.
+            if (count == 0)
+                TechLog.Info(SafeLauncher.Logging.LogAreas.App, SafeLauncher.Logging.LogCodes.AppExit, text + ", приложение закрылось");
+            else
+                TechLog.Debug(SafeLauncher.Logging.LogAreas.App, SafeLauncher.Logging.LogCodes.AppProcesses, text);
             slot.LastCount = count;
             changed = true;
         }
@@ -1315,7 +1409,7 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
         var ourJobs = _slots.Values.SelectMany(s => s.Jobs.Concat(s.Retired).Select(j => (Slot: s, Job: j))).ToList();
         var loosePids = new HashSet<int>(_slots.Values.SelectMany(s => s.Loose).Select(p => p.Pid));
 
-        foreach (var (pid, name) in SnapshotProcesses())
+        foreach (var (pid, name, _) in SnapshotProcesses())
         {
             if (pid == _ownPid || pid <= 4 || loosePids.Contains(pid))
                 continue;
@@ -1344,7 +1438,7 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
             }
 
             var path = GetImagePath(handle);
-            var owner = path is null ? null : candidates.FirstOrDefault(s => s.Family!.ContainsPath(path));
+            var owner = path is null ? null : candidates.FirstOrDefault(s => s.Family!.ContainsPath(path)) ?? SignedOwner(candidates, path);
             var containers = owner is null ? null : ourJobs.Where(j => j.Job.Contains(handle)).Select(j => j.Slot).Distinct().ToList();
             var foreign = containers is { Count: > 0 };
             if (owner is null || !IsAlive(handle) ||
@@ -1397,6 +1491,50 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
         return false;
     }
 
+    /// <summary>
+    /// Берёт под контроль уже запущенных потомков процесса (по родителю в списке процессов, созданных не раньше него):
+    /// перезапущенное приложение успевает запустить помощников до прохода наблюдения. Возвращает, сколько взято.
+    /// </summary>
+    private int AdoptChildrenLocked(AppSlot slot, int parentPid, DateTime? parentCreated)
+    {
+        var adopted = 0;
+        var processes = SnapshotProcesses();
+        var ourJobs = _slots.Values.SelectMany(s => s.Jobs.Concat(s.Retired)).ToList();
+        var parents = new Queue<(int Pid, DateTime? Created)>();
+        parents.Enqueue((parentPid, parentCreated));
+        var seen = new HashSet<int> { parentPid };
+        while (parents.Count > 0 && seen.Count < 1000)
+        {
+            var parent = parents.Dequeue();
+            foreach (var child in processes.Where(p => p.ParentPid == parent.Pid && p.Pid != _ownPid && p.Pid > 4 && seen.Add(p.Pid)))
+            {
+                if (!ProcessIdToSessionId((uint)child.Pid, out var session) || session != _ownSession)
+                    continue;
+                var handle = OpenProcess(ProcessQueryLimitedInformation | Synchronize | ProcessSetQuota | ProcessTerminate, false, (uint)child.Pid);
+                if (handle.IsInvalid)
+                {
+                    handle.Dispose();
+                    continue;
+                }
+
+                // PID родителя мог достаться другому процессу: потомок не может быть старше родителя.
+                var created = ProcessCreated(handle);
+                if (!IsAlive(handle) || parent.Created is { } since && created is { } at && at < since ||
+                    ourJobs.Any(j => j.Contains(handle)) || slot.Loose.Any(p => p.Pid == child.Pid))
+                {
+                    handle.Dispose();
+                    continue;
+                }
+
+                AdoptLocked(new FamilyHit(slot, child.Pid, handle, CanControl: true));
+                adopted++;
+                parents.Enqueue((child.Pid, created));
+            }
+        }
+
+        return adopted;
+    }
+
     /// <summary>Закрывает найденный процесс. null — успешно (или он уже завершился), иначе текст ошибки.</summary>
     private static string? TerminateHit(FamilyHit hit)
     {
@@ -1410,9 +1548,9 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
         return IsAlive(hit.Handle) ? new Win32Exception(error).Message : null;
     }
 
-    private static List<(int Pid, string Name)> SnapshotProcesses()
+    private static List<(int Pid, string Name, int ParentPid)> SnapshotProcesses()
     {
-        var list = new List<(int, string)>(512);
+        var list = new List<(int, string, int)>(512);
         using var snapshot = CreateToolhelp32Snapshot(Th32csSnapProcess, 0);
         if (snapshot.IsInvalid)
             return list;
@@ -1423,7 +1561,7 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
 
         do
         {
-            list.Add(((int)entry.th32ProcessID, entry.szExeFile ?? string.Empty));
+            list.Add(((int)entry.th32ProcessID, entry.szExeFile ?? string.Empty, (int)entry.th32ParentProcessID));
         } while (Process32NextW(snapshot, ref entry));
 
         return list;
@@ -1441,6 +1579,13 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
     /// <summary>Процесс создан раньше <paramref name="moment"/> (время не узнать — считается, что нет).</summary>
     private static bool CreatedBefore(SafeHandle process, DateTime moment) =>
         GetProcessTimes(process, out var created, out _, out _, out _) && DateTime.FromFileTimeUtc(created) < moment;
+
+    private static DateTime? ProcessCreated(SafeHandle process) =>
+        GetProcessTimes(process, out var created, out _, out _, out _) ? DateTime.FromFileTimeUtc(created) : null;
+
+    /// <summary>Процессы приложения закончились недавно: его новая программа может быть перезапуском (<see cref="Restarted"/>).</summary>
+    private bool MayRestart(AppSlot slot) =>
+        slot.RunningUntil != default && DateTime.UtcNow - slot.RunningUntil <= RestartWindow;
 
     /// <summary>Процесс работает не меньше <paramref name="age"/> (время не узнать — считается, что да).</summary>
     private static bool OlderThan(SafeHandle process, TimeSpan age) =>
@@ -1623,6 +1768,102 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
         return true;
     }
 
+    /// <summary>
+    /// Процесс не под контролем лаунчера, но относится к приложению (<see cref="ProcessKin"/>): программа приложения в другой
+    /// папке, узнанная по подписи издателя, или процесс, который запустила копия приложения, открытая не из лаунчера
+    /// (<paramref name="launched"/> = false: идёт как копия); процесс, который запустил процесс под контролем, но который
+    /// в задание не попал (launched = true: идёт как приложение). Для ответа ядру «чей процесс». Любой поток.
+    /// </summary>
+    public bool TryGetKin(int pid, out Guid appId, out bool launched)
+    {
+        appId = Guid.Empty;
+        launched = false;
+        if (pid == _ownPid || pid <= 4 || _families.IsEmpty && _appKeys.IsEmpty)
+            return false;
+
+        var self = KinInfo(pid);
+        if (self?.Created is not { } created)
+            return false;
+
+        var now = DateTime.UtcNow;
+        if (_kin.TryGetValue(pid, out var known) && known.Created == created && now - known.At < KinKeep)
+            return Answer(known, out appId, out launched);
+
+        // Подпись программы ещё не проверена (проверка идёт в фоне): такой ответ не запоминаем, следующий будет точнее.
+        var pending = false;
+        var (app, kind) = ProcessKin.Resolve(pid,
+            p => p == pid ? self : KinInfo(p),
+            p => TryGetOwner(p, out var owner, out _) ? owner : null,
+            image => FamilyOfImage(image, ref pending),
+            (owner, image) => IsBrowserOf(owner, Path.GetFileName(image), image));
+        var answer = new KinAnswer(created, app, kind, now);
+        if (!pending)
+        {
+            if (_kin.Count >= MaxKinAnswers)
+                _kin.Clear();
+            _kin[pid] = answer;
+        }
+
+        return Answer(answer, out appId, out launched);
+
+        static bool Answer(KinAnswer a, out Guid app, out bool launch)
+        {
+            app = a.App;
+            launch = a.Kind == ProcessKin.Kind.Launch;
+            return a.Kind != ProcessKin.Kind.None;
+        }
+    }
+
+    /// <summary>Путь программы, родитель и время создания процесса этого сеанса; null — процесса нет или его не открыть.</summary>
+    private ProcessKin.Info? KinInfo(int pid)
+    {
+        if (!ProcessIdToSessionId((uint)pid, out var session) || session != _ownSession)
+            return null;
+        using var handle = OpenProcess(ProcessQueryLimitedInformation, false, (uint)pid);
+        if (handle.IsInvalid || !IsAlive(handle))
+            return null;
+
+        var buffer = new char[4096];
+        var size = (uint)buffer.Length;
+        var image = QueryFullProcessImageNameW(handle, 0, buffer, ref size) ? new string(buffer, 0, (int)size) : null;
+        var basic = default(ProcessBasicInformation);
+        var parent = NtQueryInformationProcess(handle, 0, ref basic, Marshal.SizeOf<ProcessBasicInformation>(), out _) == 0
+            ? (int)basic.InheritedFromUniqueProcessId.ToInt64()
+            : 0;
+        return new ProcessKin.Info(image, parent, ProcessCreated(handle));
+    }
+
+    /// <summary>
+    /// Чья это программа: по папке приложения или, если нет, по подписи его издателя (BySignature). pending — подпись ещё
+    /// не проверена, проверка запущена в фоне.
+    /// </summary>
+    private (Guid App, bool BySignature)? FamilyOfImage(string image, ref bool pending)
+    {
+        var name = Path.GetFileName(image);
+        foreach (var (appId, family) in _families)
+        {
+            if (family.HasName(name) && family.ContainsPath(image))
+                return (appId, false);
+        }
+
+        var signed = _families.Where(f => f.Value.Publisher is not null && f.Value.HasName(name)).ToList();
+        if (signed.Count == 0)
+            return null;
+        if (!Signatures.TryPeek(image, out var publisher))
+        {
+            pending = true;
+            return null;
+        }
+
+        foreach (var (appId, family) in signed)
+        {
+            if (family.SignedBySame(image, publisher))
+                return (appId, true);
+        }
+
+        return null;
+    }
+
     // ---------------------------------------------------------------- состояние
 
     private AppSlot GetSlot(AppEntry entry)
@@ -1638,11 +1879,67 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
 
     private void SetFamilyLocked(AppSlot slot, AppFamily? family)
     {
+        if (!ReferenceEquals(slot.Family, family))
+            _kin.Clear();
         slot.Family = family;
         if (family is null)
             _families.TryRemove(slot.Id, out _);
         else
             _families[slot.Id] = family;
+    }
+
+    private string? KnownPublisher(Guid appId) => _publishers.TryGetValue(appId, out var publisher) ? publisher : null;
+
+    /// <summary>
+    /// Проверяет в фоне подпись программы приложения (у большого файла до секунды, поэтому не под блокировкой). Если издатель
+    /// новый (первая проверка или программу подписали сертификатом с другим именем), семейство пересобирается с ним. Приложению
+    /// Microsoft Store не нужно: его пакет и так узнаётся в любой версии.
+    /// </summary>
+    private void LearnPublisherLocked(AppSlot slot, AppEntry entry)
+    {
+        if (entry.IsPackaged || string.IsNullOrWhiteSpace(entry.ExePath))
+            return;
+
+        var before = slot.Family;
+        var known = KnownPublisher(entry.Id);
+        _ = Task.Run(() =>
+        {
+            string? publisher;
+            try
+            {
+                publisher = Signatures.PublisherOf(Path.GetFullPath(AppFamily.SquirrelTarget(entry) ?? entry.ExePath));
+            }
+            catch (Exception)
+            {
+                return;
+            }
+
+            if (publisher is null || string.Equals(publisher, known, StringComparison.OrdinalIgnoreCase) && before?.Publisher is not null)
+                return;
+
+            // Семейство в общей папке без издателя не строится: собираем заново, а не дополняем.
+            var family = before?.WithPublisher(publisher) ?? AppFamily.For(entry, publisher);
+            lock (_gate)
+            {
+                // Приложение убрали или его семейство уже сменилось (новый запуск): эта проверка устарела.
+                if (_disposed || !_exeNames.ContainsKey(entry.Id) || !ReferenceEquals(slot.Family, before))
+                    return;
+                _publishers[entry.Id] = publisher;
+                if (family is not null)
+                    SetFamilyLocked(slot, family);
+            }
+        });
+    }
+
+    /// <summary>
+    /// Приложение, чья программа подписана тем же издателем (<see cref="AppFamily.SignedBySame"/>), когда она лежит не в его
+    /// папке. Подпись, которую ещё не проверяли, проверяется в фоне: тогда процесс узнается на следующем проходе.
+    /// </summary>
+    private static AppSlot? SignedOwner(IReadOnlyList<AppSlot> candidates, string path)
+    {
+        if (!candidates.Any(s => s.Family!.Publisher is not null) || !Signatures.TryPeek(path, out var publisher))
+            return null;
+        return candidates.FirstOrDefault(s => s.Family!.SignedBySame(path, publisher));
     }
 
     /// <summary>
@@ -1765,6 +2062,9 @@ public sealed class ProcessTracker : IAppProcesses, IDisposable
 
         public DateTime LastBlockedNotice;
         public int LastCount;
+
+        /// <summary>Последний проход наблюдения, когда у приложения были процессы; default — закрыто лаунчером или не запускалось.</summary>
+        public DateTime RunningUntil;
 
         public bool IsArmed => Jobs.Count > 0 || Loose.Count > 0;
     }

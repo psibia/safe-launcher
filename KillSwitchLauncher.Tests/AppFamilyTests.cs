@@ -107,4 +107,19 @@ public class AppFamilyTests : IDisposable
         Assert.True(family!.HasName("Telegram.exe"));
         Assert.True(family.ContainsPath(image));
     }
+
+    [Fact]
+    public void ForImage_StoreApp_AnyVersionOfItsPackage()
+    {
+        // Приложение Store, обновляясь, переезжает в папку новой версии пакета и перезапускается оттуда.
+        var image = _dir.File("WindowsApps", "Claude_1.0.100.0_x64__pzs8sxrjxfjjc", "app", "claude.exe");
+        var family = AppFamily.ForImage(image)!;
+
+        Assert.True(family.ContainsPath(_dir.File("WindowsApps", "Claude_1.0.200.0_x64__pzs8sxrjxfjjc", "app", "claude.exe")));
+        Assert.True(family.ContainsPath(_dir.File("WindowsApps", "claude_1.1.0.0_x64__PZS8SXRJXFJJC", "app", "resources", "claude.exe")));
+        Assert.False(family.ContainsPath(_dir.File("WindowsApps", "Claude_1.0.200.0_x64__aaaaaaaaaaaaa", "app", "claude.exe")), "другой издатель");
+        Assert.False(family.ContainsPath(_dir.File("WindowsApps", "ClaudeX_1.0.200.0_x64__pzs8sxrjxfjjc", "app", "claude.exe")), "другой пакет");
+        Assert.False(family.ContainsPath(_dir.File("WindowsApps", "Claude_1.0.200.0_x64__pzs8sxrjxfjjc", "other", "claude.exe")), "другая папка пакета");
+        Assert.True(family.Overlaps(AppFamily.ForImage(_dir.File("WindowsApps", "Claude_1.0.200.0_x64__pzs8sxrjxfjjc", "app", "claude.exe"))!));
+    }
 }

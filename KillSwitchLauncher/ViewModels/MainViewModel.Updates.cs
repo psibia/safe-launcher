@@ -306,7 +306,7 @@ public sealed partial class MainViewModel
         {
             if (value && _draftUpdateConnectionId is null)
             {
-                _draftUpdateConnectionId = _draftConnectionId ?? _settings.ConnectionId ?? _settings.Connections.FirstOrDefault()?.Id;
+                _draftUpdateConnectionId = _settings.ConnectionId ?? _settings.Connections.FirstOrDefault()?.Id;
                 OnPropertyChanged(nameof(UpdateConnectionId));
             }
 
@@ -491,6 +491,7 @@ public sealed partial class MainViewModel
         var outcome = confirmed ? _updates.TakePendingOutcome() : null;
         if (outcome is not null)
             ReportUpdateOutcome(outcome);
+        ReportSystemVpnRemoved();
 
         var repeated = RepeatedApps();
         if (repeated.Count > 0 && outcome is null)

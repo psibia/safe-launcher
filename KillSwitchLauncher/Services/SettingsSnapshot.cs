@@ -28,7 +28,7 @@ public static class SettingsSnapshot
             ["Защита от утечки DNS"] = Yes(s.HideDns),
             ["Общие исключения доменов"] = s.DirectDomains.Count.ToString(),
             ["Как понимать, что VPN есть"] = s.NetworkMode.ToString(),
-            ["Общее подключение"] = Conn(s.ConnectionId),
+            ["Основное подключение"] = Conn(s.ConnectionId),
             ["Правило адаптеров"] = s.RuleMode.ToString(),
             ["Выбранные адаптеры"] = string.Join(", ", s.SelectedAdapters),
             ["Автозапуск"] = Yes(s.StartWithWindows),
@@ -46,7 +46,7 @@ public static class SettingsSnapshot
                 AppNetworkMode.OwnAdapters => "свои адаптеры (" + n.RuleMode + ": " + string.Join(", ", n.SelectedAdapters) + ")",
                 AppNetworkMode.OwnConnection => "свое подключение " + Conn(n.ConnectionId),
                 AppNetworkMode.Offline => "без сети",
-                _ => "как в общих"
+                _ => "основное подключение"
             };
             d[p + "закрывать при обрыве"] = n.CloseOnDrop.ToString();
             d[p + "копии мимо лаунчера"] = n.OutsideCopies.ToString();

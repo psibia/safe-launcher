@@ -28,36 +28,6 @@
                         <views:AddConnectionForm DataContext="{Binding AddConnection}" />
                     </Border>
 
-                    <Grid Margin="0,20,0,20">
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*" />
-                            <ColumnDefinition Width="Auto" />
-                            <ColumnDefinition Width="*" />
-                        </Grid.ColumnDefinitions>
-                        <Border Grid.Column="0" Height="1" Background="{StaticResource Divider}" VerticalAlignment="Center" />
-                        <TextBlock Grid.Column="1" Text="или" Foreground="{StaticResource TextMuted}" Margin="12,0" />
-                        <Border Grid.Column="2" Height="1" Background="{StaticResource Divider}" VerticalAlignment="Center" />
-                    </Grid>
-
-                    <Border Style="{StaticResource SettingRow}" Background="{StaticResource CardBg}" Effect="{StaticResource SmallShadow}">
-                        <Grid>
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto" />
-                                <ColumnDefinition Width="*" />
-                                <ColumnDefinition Width="Auto" />
-                            </Grid.ColumnDefinitions>
-                            <Border Grid.Column="0" Width="36" Height="36" CornerRadius="18" Background="{StaticResource AccentSoft}" VerticalAlignment="Center">
-                                <views:GlyphIcon Glyph="&#xE72E;" Size="14" Foreground="{StaticResource Accent}" HorizontalAlignment="Center" VerticalAlignment="Center" />
-                            </Border>
-                            <StackPanel Grid.Column="1" Margin="12,0,10,0" VerticalAlignment="Center">
-                                <TextBlock Text="У меня уже есть VPN-программа" FontWeight="Bold" FontSize="13.5" />
-                                <TextBlock Style="{StaticResource Caption}" Margin="0,1,0,0"
-                                           Text="Лаунчер будет следить, что она включена, и не запустит приложения без неё." />
-                            </StackPanel>
-                            <Button Grid.Column="2" Style="{StaticResource SecondaryButton}" Padding="16,8" VerticalAlignment="Center"
-                                    Content="Выбрать" Command="{Binding UseSystemVpnCommand}" />
-                        </Grid>
-                    </Border>
                 </StackPanel>
 
                 <!-- ===================== Шаг 2. Проверка ===================== -->

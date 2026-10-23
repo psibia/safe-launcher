@@ -112,11 +112,13 @@ public class LogExportTests
         return (result, Unzip(stream));
     }
 
-    private static ExportOptions Options(bool hideIps = false, bool hideSites = false, bool dns = false, bool coreErrors = false, string? note = null) => new()
+    private static ExportOptions Options(bool hideIps = false, bool hideSites = false, bool dns = false, bool coreErrors = false, string? note = null,
+        bool hideNames = false) => new()
     {
         Period = new ExportPeriod(ExportPeriods.LastHour, "Последний час", Now.AddHours(-1), Now),
         HideAddresses = hideIps,
         HideSites = hideSites,
+        HideNames = hideNames,
         IncludeDns = dns,
         CoreErrorsOnly = coreErrors,
         Note = note
@@ -161,6 +163,125 @@ public class LogExportTests
         Assert.Equal("Работа", (string)summary["tags"]!["c0123"]!["name"]!);
         Assert.Equal("summary.json", (string)summary["files"]![0]!);
         Assert.Contains("timeline.log", summary["files"]!.AsArray().Select(f => (string)f!));
+    }
+
+    // ---- названия ----
+
+    private static NameMasker Names(params (string Name, string Label)[] names)
+    {
+        var masker = new LogMasker();
+        masker.SetKey(new byte[32]);
+        return new NameMasker(masker, names.Select(n => new KeyValuePair<string, string>(n.Name, n.Label)));
+    }
+
+    [Fact]
+    public void Names_KnownNamesAndTheirPrograms_BecomeTheAppLabel()
+    {
+        var names = Names(("Рабочий портал", "{app-11111111}"), ("Portal.exe", "{app-11111111}"), ("Офис Москва", "{conn-22222222}"),
+            ("--profile ClientX", "[параметры запуска]"));
+
+        Assert.Equal("Запущено: {app-11111111} через «{conn-22222222}»", names.Mask("Запущено: Рабочий портал через «Офис Москва»"));
+        Assert.Equal("{app-11111111}.exe (PID 5): отказано", names.Mask("Portal.exe (PID 5): отказано"));
+        Assert.Equal("аргументы: [параметры запуска]", names.Mask("аргументы: --profile ClientX"));
+        Assert.Equal("{app-11111111}.exe", names.MaskProcess("portal.exe"));
+        Assert.Equal("{app-11111111}", names.MaskProcess("Portal"));
+        // «Portal» само по себе в тексте не название: имя программы ищется только как программа
+        Assert.Equal("portal opened", names.Mask("portal opened"));
+    }
+
+    [Fact]
+    public void Names_PathsAndPrograms_Hidden_WindowsAndLauncherKept()
+    {
+        var names = Names(("Portal.exe", "{app-11111111}"));
+
+        var path = names.Mask(@"запуск C:\Program Files\Acme Corp\Client Tools\Portal.exe (PID 7)");
+        Assert.StartsWith(@"запуск C:\Program Files\{dir-", path);
+        Assert.EndsWith(@"\{app-11111111}.exe (PID 7)", path);
+        Assert.DoesNotContain("Acme", path);
+        Assert.DoesNotContain("Client Tools", path);
+
+        var other = names.Mask(@"%USERPROFILE%\AppData\Local\SecretTool\app-1.2\secret_tool.exe и D:\Work\ClientX\отчёт.docx");
+        Assert.StartsWith(@"%USERPROFILE%\AppData\Local\{dir-", other);
+        Assert.DoesNotContain("SecretTool", other);
+        Assert.DoesNotContain("secret_tool", other);
+        Assert.DoesNotContain("ClientX", other);
+        Assert.DoesNotContain("отчёт", other);
+        Assert.Contains(".docx", other); // расширение остается: видно, что это документ
+
+        // в JSON-строках ядра обратная косая черта бывает двойной
+        Assert.DoesNotContain("Acme", names.Mask(@"C:\\Program Files\\Acme\\tool.exe"));
+        // сетевая папка: и сервер, и папки
+        var unc = names.Mask(@"\\fileserver\finance\report.xlsx");
+        Assert.StartsWith(@"\\{host-", unc);
+        Assert.DoesNotContain("fileserver", unc);
+        Assert.DoesNotContain("finance", unc);
+
+        // одна и та же папка — одна и та же метка
+        Assert.Equal(names.Mask(@"D:\Work\a.txt").Split('\\')[1], names.Mask(@"D:\Work\b.txt").Split('\\')[1]);
+
+        foreach (var kept in new[] { @"C:\Windows\System32\svchost.exe", @"C:\Program Files\SafeLauncher\core\sing-box.exe",
+                     @"%USERPROFILE%\AppData\Local\KillSwitchLauncher\logs", "explorer.exe", "KillSwitchLauncher.exe" })
+            Assert.Equal(kept, names.Mask(kept));
+
+        Assert.StartsWith("{exe-", names.Mask("acmeagent.exe"));
+        Assert.StartsWith("{exe-", names.MaskProcess("acmeagent"));
+        Assert.StartsWith("{pkg-", names.Mask("AcmeCorp.Portal_8wekyb3d8bbwe!App"));
+    }
+
+    [Fact]
+    public void Names_OrdinaryTextStaysReadable()
+    {
+        var names = Names(("Telegram", "{app-11111111}"));
+        foreach (var text in new[] { "Ядро: перезапуск через 3 с", "12:30:05 handshake ok", "версия 2.3.7", "{ip4-pub-abcdef}:51820",
+                     "{srv-12345678} не отвечает", "время 10:15, A: ok" })
+            Assert.Equal(text, names.Mask(text));
+    }
+
+    [Fact]
+    public void Zip_HidesNames_Everywhere_WhenAsked()
+    {
+        var input = Input();
+        input = new ExportInput
+        {
+            Launcher = input.Launcher.Append(L(20, LogSources.Launcher, LogLevel.Info, LogAreas.App, LogCodes.AppLaunch,
+                @"Запущено «Chrome: рабочий»: C:\Program Files\Google\Chrome\Application\chrome.exe")).ToArray(),
+            Service = input.Service,
+            ServiceFiles = input.ServiceFiles,
+            Events = input.Events,
+            Settings = new JsonObject
+            {
+                ["apps"] = new JsonArray(new JsonObject { ["name"] = "Chrome: рабочий", ["exe"] = @"C:\Program Files\Google\Chrome\Application\chrome.exe" }),
+                ["connections"] = new JsonArray(new JsonObject { ["name"] = "Работа" })
+            },
+            Environment = new JsonObject { ["adapters"] = new JsonArray(new JsonObject { ["name"] = "acme-office" }) },
+            State = new JsonObject { ["running"] = new JsonArray(new JsonObject { ["name"] = "Chrome: рабочий" }) },
+            Tags = input.Tags,
+            Dns = input.Dns,
+            Names = new KeyValuePair<string, string>[]
+            {
+                new("Chrome: рабочий", "{app-11111111}"), new("chrome.exe", "{app-11111111}"), new("Работа", "{conn-c0123000}"),
+                new("acme-office", "{adapter-aaaaaa}")
+            }
+        };
+
+        var (_, files) = Export(Options(dns: true, hideNames: true, note: "Работа отвалилась"), input);
+        var all = string.Concat(files.Values) + string.Concat(files.Keys);
+
+        // «работать» в тексте остается: заменяется только название целиком
+        foreach (var secret in new[] { "Chrome: рабочий", "«Работа»", "Работа отвалилась", "\"Работа\"", "chrome", "Google", "acme-office" })
+            Assert.DoesNotContain(secret, all, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("{app-11111111}", files["launcher.log"]);
+        Assert.Contains(@"\{app-11111111}.exe", files["launcher.log"]);
+        Assert.Contains("{conn-c0123000}", files["events.txt"]);
+        Assert.Contains("{adapter-aaaaaa}", files["environment.json"]);
+        Assert.Contains("dns/{app-11111111}.log", files.Keys);
+        Assert.Contains("{app-11111111}", files["dns/{app-11111111}.log"]);
+        var summary = JsonNode.Parse(files["summary.json"])!;
+        Assert.True((bool)summary["masking"]!["names"]!);
+        Assert.Equal("{conn-c0123000}", (string)summary["tags"]!["c0123"]!["name"]!);
+        Assert.Equal("{conn-c0123000} отвалилась", (string)summary["userNote"]!);
+        // без галочки названия как есть
+        Assert.Contains("Работа", Export(Options(), input).Files["events.txt"]);
     }
 
     [Fact]

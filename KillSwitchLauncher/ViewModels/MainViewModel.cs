@@ -35,6 +35,9 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     private Dictionary<string, string> _settingsSnapshot = new();
     private bool? _lastIpv6;
     private string? _keepCoreError;
+
+    // Загрузка перевела настройки с системного VPN: сообщить один раз, когда окно уже показано.
+    private SystemVpnMigration? _movedFromSystemVpn;
     private DispatcherTimer? _logTimer;
 
     // Предупреждение «не удалось взять под полный контроль» показываем один раз на приложение за сеанс.
@@ -83,7 +86,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
     // Страницы окна: плитки, настройки, приложение, мастер первого запуска.
     private MainPage _page = MainPage.Apps;
-    private SettingsSection _section = SettingsSection.Connection;
+    private SettingsSection _section = SettingsSection.Connections;
     private AppSettingsViewModel? _appPage;
     private WelcomeViewModel? _welcome;
     private AddAppsViewModel? _addApps;
@@ -116,18 +119,9 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     private bool _draftKillSwitch;
     private bool _draftHideDns;
     private bool _draftStartWithWindows;
-    private GlobalNetworkMode _draftNetworkMode;
-    private Guid? _draftConnectionId;
-    private VpnRuleMode _draftRuleMode;
     private HideBehavior _draftHideBehavior;
     private OutsideCopies _draftOutsideCopies;
     private string _draftDomainsText = string.Empty;
-    private readonly List<string> _draftSelected = new();
-
-    // Только вид списка, не сохраняется: при каждом запуске выключено.
-    private bool _showAllAdapters;
-    private bool _isRemovedExpanded;
-    private bool _isRefreshingAdapters;
 
     /// <param name="log">Журнал событий; по умолчанию — в папке настроек. Тесты передают свой.</param>
     /// <param name="updates">Обновления; по умолчанию — обычные пути. Тесты передают свои.</param>
@@ -156,6 +150,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         _dialogs = dialogs;
         _dispatcher = dispatcher;
         _settings = storage.Load();
+        _movedFromSystemVpn = _settings.MovedFromSystemVpn;
         if (storage.LoadProblem is { } loadProblem)
         {
             TechLog.Error(LogAreas.Settings, LogCodes.SettingsChange, $"Настройки не прочитаны ({storage.FilePath}): {loadProblem}. Сохранение отключено");
@@ -166,6 +161,13 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         }
         _findStartMenuApps = startMenuApps ?? (() => Task.Run(StartMenuApps.Find));
         ApplyLogSettings();
+        if (_movedFromSystemVpn is not null)
+        {
+            // Переход с системного VPN сохраняем сразу, а сообщаем о нём, когда окно уже показано (ReportSystemVpnRemoved).
+            TechLog.Info(LogAreas.Settings, LogCodes.SettingsChange,
+                $"Системный VPN заменён основным подключением ({_movedFromSystemVpn.Apps.Count} прил.), прежние настройки в settings.json.system-vpn.bak");
+            SaveSettings();
+        }
         _coreProcesses = new CoreAppProcesses(_tracker);
         _network = new LauncherNetwork(_coreProcesses, coreBackend ?? (() => new ServiceCoreBackend(ResolveCoreTag)));
         _checkConnection = checkConnection ?? (c =>
@@ -175,10 +177,6 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         });
         _guard = new VpnGuard(guardBackend ?? (() => new ServiceGuardBackend()));
         _proxy = new SystemProxyWatcher(systemProxy);
-
-        // Адаптеры, выбранные до появления списка «удалённых», тоже должны в нём быть.
-        foreach (var name in _settings.SelectedAdapters.Where(n => FindKnown(n) is null))
-            _settings.KnownAdapters.Add(new KnownAdapter { Name = name, Description = name, Product = name, IsVpnLike = true });
 
         ResetDraft();
         AddConnection = new AddConnectionViewModel(() => _settings.Connections, c => AddConnectionAsync(c, makeDefault: false), _dialogs);
@@ -191,7 +189,6 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             ResetDraft();
             StatusMessage = "Изменения настроек отменены";
         });
-        RefreshAdaptersCommand = new RelayCommand(RefreshAdapters);
         OpenSettingsCommand = new RelayCommand(p => OpenSettings(p is string section && Enum.TryParse<SettingsSection>(section, out var s) ? s : null));
         BackCommand = new RelayCommand(() => GoBack());
         ShowSectionCommand = new RelayCommand(p =>
@@ -244,6 +241,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         });
         _tracker.RelaunchBlocked += (_, name) => _dispatcher.BeginInvoke(() => OnRelaunchBlocked(name));
         _tracker.OutsideLaunched += (appId, contained) => _dispatcher.BeginInvoke(() => OnOutsideLaunched(appId, contained));
+        _tracker.Restarted += (appId, contained) => _dispatcher.BeginInvoke(() => OnAppRestarted(appId, contained));
         _tracker.OutsideRejected += (name, reason) => _dispatcher.BeginInvoke(() => OnOutsideRejected(name, reason));
         _network.CoreLost += (reason, report) => _dispatcher.BeginInvoke(() => OnCoreLost(reason, report));
         _network.CoreRecovered += (reason, apps) => _dispatcher.BeginInvoke(() => OnCoreRecovered(reason, apps));
@@ -268,9 +266,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         if (!_settings.WelcomeDone && _settings.Apps.Count == 0 && _settings.Connections.Count == 0)
             StartWelcome();
 
-        _log.Add(LogKind.Info, $"Лаунчер {UpdateService.Format(UpdateService.CurrentVersion)} запущен · " +
-                                    (_monitor.Current.IsConnected ? $"VPN подключён ({DescribeActive(_monitor.Current)})" : "VPN не подключён") +
-                                    (_settings.KillSwitchEnabled ? string.Empty : " · Kill-Switch выключен"));
+        _log.Add(LogKind.Info, $"Лаунчер {UpdateService.Format(UpdateService.CurrentVersion)} запущен");
         foreach (var names in RepeatedApps())
             _log.Add(LogKind.Info, $"Одна программа добавлена несколько раз: {names}. Ядро VPN узнаёт приложение по программе, поэтому " +
                                    "её копия, открытая мимо лаунчера, пойдёт через подключение одного из них. Лишние удалите через меню плитки.");
@@ -289,19 +285,9 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
     public ObservableCollection<AppTileViewModel> Apps { get; } = new();
 
-    /// <summary>Адаптеры VPN и выбранные в правилах, которые сейчас есть в системе.</summary>
-    public ObservableCollection<VpnAdapterViewModel> Adapters { get; } = new();
-
-    /// <summary>Остальные адаптеры системы: отдельная группа, видна при «Показывать все адаптеры».</summary>
-    public ObservableCollection<VpnAdapterViewModel> OtherAdapters { get; } = new();
-
-    /// <summary>Адаптеры, которые лаунчер уже видел, но сейчас их в системе нет.</summary>
-    public ObservableCollection<VpnAdapterViewModel> RemovedAdapters { get; } = new();
-
     public ICommand AddAppCommand { get; }
     public ICommand ApplySettingsCommand { get; }
     public ICommand CancelSettingsCommand { get; }
-    public ICommand RefreshAdaptersCommand { get; }
 
     /// <summary>Открыть настройки; параметр — раздел (имя из <see cref="SettingsSection"/>), иначе тот, что был открыт.</summary>
     public ICommand OpenSettingsCommand { get; }
@@ -314,7 +300,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
     public ICommand ToggleSummaryCommand { get; }
 
-    /// <summary>Подключения лаунчера: раздел «Подключения лаунчера» и списки выбора подключения.</summary>
+    /// <summary>Подключения лаунчера: раздел «Подключения» и списки выбора подключения.</summary>
     public ObservableCollection<ConnectionItemViewModel> Connections { get; } = new();
 
     /// <summary>Форма «Добавить подключение» в настройках.</summary>
@@ -330,14 +316,8 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     public bool IsVpnConnected
     {
         get => _isVpnConnected;
-        private set
-        {
-            if (SetField(ref _isVpnConnected, value))
-                OnPropertyChanged(nameof(VpnStatusText));
-        }
+        private set => SetField(ref _isVpnConnected, value);
     }
-
-    public string VpnStatusText => IsVpnConnected ? "VPN подключён" : "VPN отключён";
 
     /// <summary>Вторая строка в статусе: какой VPN активен или почему VPN считается отключённым.</summary>
     public string VpnSubtitle
@@ -538,61 +518,17 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     /// <summary>На странице есть изменения, которые ещё не применены.</summary>
     public bool HasPendingChanges =>
         _draftKillSwitch != _settings.KillSwitchEnabled ||
-        _draftNetworkMode != _settings.NetworkMode ||
-        _draftNetworkMode == GlobalNetworkMode.LauncherConnection && _draftConnectionId != _settings.ConnectionId ||
-        _draftRuleMode != _settings.RuleMode ||
         _draftHideBehavior != _settings.HideBehavior ||
         _draftOutsideCopies != _settings.OutsideCopies ||
         _draftHideDns != _settings.HideDns ||
         DomainsDraftChanged ||
         _draftStartWithWindows != _settings.StartWithWindows ||
-        !new HashSet<string>(_draftSelected, StringComparer.OrdinalIgnoreCase).SetEquals(_settings.SelectedAdapters) ||
         HasLogDraftChanges ||
         HasUpdateDraftChanges;
 
-    /// <summary>Общее условие запуска: системный VPN или подключение лаунчера (черновик).</summary>
-    public GlobalNetworkMode NetworkMode
-    {
-        get => _draftNetworkMode;
-        set
-        {
-            if (_draftNetworkMode == value) return;
-            _draftNetworkMode = value;
-
-            // Единственное подключение выбираем сами, чтобы не пришлось искать его в списке.
-            if (value == GlobalNetworkMode.LauncherConnection && _draftConnectionId is null && _settings.Connections.Count == 1)
-            {
-                _draftConnectionId = _settings.Connections[0].Id;
-                OnPropertyChanged(nameof(DraftConnectionId));
-            }
-
-            OnPropertyChanged();
-            OnPropertyChanged(nameof(IsLauncherMode));
-            OnPropertyChanged(nameof(IsSystemMode));
-            OnDraftChanged();
-        }
-    }
-
-    public bool IsLauncherMode => NetworkMode == GlobalNetworkMode.LauncherConnection;
-    public bool IsSystemMode => NetworkMode == GlobalNetworkMode.SystemVpn;
-
-    /// <summary>Подключение в общих настройках (черновик).</summary>
-    public Guid? DraftConnectionId
-    {
-        get => _draftConnectionId;
-        set
-        {
-            if (_draftConnectionId == value) return;
-            _draftConnectionId = value;
-            OnPropertyChanged();
-            OnDraftChanged();
-        }
-    }
-
-    /// <summary>Выбрано подключение лаунчера, а само подключение — нет.</summary>
-    public bool NeedsConnectionSelection =>
-        _draftNetworkMode == GlobalNetworkMode.LauncherConnection &&
-        (_draftConnectionId is not { } id || _settings.Connections.All(c => c.Id != id));
+    /// <summary>Подключения есть, а основное не выбрано (удалили): приложения с «Основное подключение» не запустятся.</summary>
+    public bool NeedsMainConnection =>
+        _settings.Connections.Count > 0 && _settings.Connections.All(c => c.Id != _settings.ConnectionId);
 
     public bool HasConnections => Connections.Count > 0;
 
@@ -622,8 +558,8 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         }
     }
 
-    /// <summary>Для заметного предупреждения на главном экране, раз сам переключатель спрятан в настройках.</summary>
-    public bool IsKillSwitchOff => !_settings.KillSwitchEnabled;
+    /// <summary>Метка «Возможна утечка DNS» на главном экране, раз сам переключатель спрятан в настройках.</summary>
+    public bool IsDnsLeakPossible => !_settings.HideDns;
 
     /// <summary>«Приложения, открытые не из лаунчера» (черновик): через лаунчер, через VPN, без интернета или напрямую.</summary>
     public OutsideCopies OutsideCopies
@@ -662,26 +598,14 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         "Зачем. Чтобы открыть сайт, программа сначала спрашивает его адрес по имени (DNS). В Windows эти вопросы за все " +
         "программы задаёт одна системная служба, поэтому по ним нельзя понять, какая программа спрашивает. Без этой " +
         "настройки трафик приложений идёт через VPN, но имена сайтов, которые они открывают, может видеть провайдер.\n\n" +
-        "Как работает:\n" +
-        "• с подключением лаунчера — пока работает его ядро VPN (а оно работает, пока открыт лаунчер, если хоть одно " +
-        "приложение идёт через подключение лаунчера), на эти вопросы отвечает лаунчер условными адресами (198.18.x.x), а настоящий адрес " +
-        "ищется при соединении: для приложений лаунчера — через VPN, для остальных программ — как обычно;\n" +
-        "• с системным VPN — пока работает приложение лаунчера, эти вопросы Windows и сами приложения лаунчера задают только через VPN (если у VPN указан " +
-        "свой DNS-сервер). Другие программы, которые ищут адреса сами, не ограничиваются: так ваша VPN-программа " +
-        "находит свой сервер.\n\n" +
+        "Как работает. Пока работает ядро VPN лаунчера (а оно работает, пока открыт лаунчер, если хоть одно приложение " +
+        "идёт через подключение), на эти вопросы отвечает лаунчер условными адресами (198.18.x.x), а настоящий адрес " +
+        "ищется при соединении: для приложений лаунчера — через VPN, для остальных программ — как обычно.\n\n" +
         "На что влияет. Это настройка на весь компьютер, а не только на приложения лаунчера:\n" +
-        "• другие программы тоже получают условные адреса или ищут имена через VPN, пока это действует, " +
-        "если спрашивают их у Windows (так делает большинство программ);\n" +
-        "• команды ping и nslookup покажут адреса 198.18.x.x — это нормально;\n" +
-        "• если у VPN нет своего DNS-сервера, лаунчер DNS не ограничивает, чтобы имена не перестали находиться;\n" +
-        "• с системным VPN: если связь VPN оборвалась, а его адаптер остался включённым, имена сайтов не будут находиться " +
-        "на всём компьютере, пока работает приложение лаунчера. Если ваша VPN-программа после обрыва не может " +
-        "переподключиться, закройте это приложение или выключите настройку;\n" +
-        "• если одновременно работают ядро лаунчера и приложение под системным VPN, это приложение может не открывать сайты: " +
-        "условный адрес 198.18.x.x ведёт в ядро, а ему разрешена сеть только через VPN. Тогда выключите настройку или " +
-        "переведите приложение на подключение лаунчера.\n\n" +
-        "Когда это перестаёт действовать (выключено ядро или закрыты приложения под системным VPN), лаунчер очищает " +
-        "кэш DNS Windows, и всё работает как без него.";
+        "• другие программы тоже получают условные адреса, пока это действует, если спрашивают их у Windows " +
+        "(так делает большинство программ);\n" +
+        "• команды ping и nslookup покажут адреса 198.18.x.x — это нормально.\n\n" +
+        "Когда ядро выключается, лаунчер очищает кэш DNS Windows, и всё работает как без него.";
 
     /// <summary>Общие исключения (черновик): домены по одному в строке, как в поле на странице приложения.</summary>
     public string CommonDomainsText
@@ -715,30 +639,6 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         }
     }
 
-    public VpnRuleMode RuleMode
-    {
-        get => _draftRuleMode;
-        set
-        {
-            if (_draftRuleMode == value) return;
-            _draftRuleMode = value;
-            OnPropertyChanged();
-            OnPropertyChanged(nameof(IsAdapterSelectionEnabled));
-
-            // Переключились на «Один из»/«Все», а ничего не отмечено: отмечаем активные сейчас VPN,
-            // иначе после применения VPN тут же стал бы «отключённым» и сработал бы Kill-Switch.
-            if (value != VpnRuleMode.AnyVpn && _draftSelected.Count == 0)
-            {
-                _draftSelected.AddRange(_monitor.Current.Adapters
-                    .Where(a => a.IsVpnLike && a.IsUp)
-                    .Select(a => a.Name));
-                SyncAdapters(_monitor.Current);
-            }
-
-            OnDraftChanged();
-        }
-    }
-
     /// <summary>Что делает кнопка «Закрыть» в заголовке окна (черновик, вступает в силу по «Применить»).</summary>
     public HideBehavior HideBehavior
     {
@@ -752,72 +652,9 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         }
     }
 
-    /// <summary>Режим «Один из»/«Все», но ни один адаптер не отмечен: показываем предупреждение.</summary>
-    public bool NeedsAdapterSelection => _draftRuleMode != VpnRuleMode.AnyVpn && _draftSelected.Count == 0;
-
-    /// <summary>Правило для системного VPN словами (черновик): «Любой активный VPN».</summary>
-    public string RuleDescription
-    {
-        get
-        {
-            var text = AppSettingsViewModel.DescribeRule(_draftRuleMode, _draftSelected.Count);
-            return char.ToUpper(text[0]) + text[1..];
-        }
-    }
-
-    /// <summary>Переключатели адаптеров имеют смысл только в режимах «выбранные».</summary>
-    public bool IsAdapterSelectionEnabled => _draftRuleMode != VpnRuleMode.AnyVpn;
-
-    /// <summary>Показывать все адаптеры, а не только похожие на VPN. Влияет только на список, сразу и без сохранения.</summary>
-    public bool ShowAllAdapters
-    {
-        get => _showAllAdapters;
-        set
-        {
-            if (!SetField(ref _showAllAdapters, value)) return;
-            RememberAdapters(_monitor.Current);
-            SyncAdapters(_monitor.Current);
-            OnPropertyChanged(nameof(OtherToggleText));
-        }
-    }
-
-    /// <summary>Есть адаптеры, не похожие на VPN: группа «Другие адаптеры» (список раскрывается <see cref="ShowAllAdapters"/>).</summary>
-    public bool HasOtherAdapters => OtherAdapters.Count > 0;
-
-    /// <summary>Кнопка справа от «Другие адаптеры»: «Показать (5)» / «Скрыть (5)».</summary>
-    public string OtherToggleText => $"{(ShowAllAdapters ? "Скрыть" : "Показать")} ({OtherAdapters.Count})";
-
-    /// <summary>Идёт обновление списка адаптеров: значок кнопки крутится.</summary>
-    public bool IsRefreshingAdapters
-    {
-        get => _isRefreshingAdapters;
-        private set => SetField(ref _isRefreshingAdapters, value);
-    }
-
-    public bool HasRemovedAdapters => RemovedAdapters.Count > 0;
-
-    /// <summary>Раскрыт ли список «удалённых» адаптеров (по умолчанию свёрнут).</summary>
-    public bool IsRemovedExpanded
-    {
-        get => _isRemovedExpanded;
-        set
-        {
-            if (SetField(ref _isRemovedExpanded, value))
-                OnPropertyChanged(nameof(RemovedToggleText));
-        }
-    }
-
-    public string RemovedToggleText => $"{(IsRemovedExpanded ? "Скрыть" : "Показать")} ({RemovedAdapters.Count})";
-
     // ---------------------------------------------------------------- применение настроек
 
-    private void OnDraftChanged()
-    {
-        OnPropertyChanged(nameof(RuleDescription));
-        OnPropertyChanged(nameof(NeedsAdapterSelection));
-        OnPropertyChanged(nameof(NeedsConnectionSelection));
-        OnPropertyChanged(nameof(HasPendingChanges));
-    }
+    private void OnDraftChanged() => OnPropertyChanged(nameof(HasPendingChanges));
 
     /// <summary>Сбросить черновик к действующим настройкам.</summary>
     private void ResetDraft()
@@ -825,33 +662,19 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         _draftKillSwitch = _settings.KillSwitchEnabled;
         _draftHideDns = _settings.HideDns;
         _draftStartWithWindows = _settings.StartWithWindows;
-        _draftNetworkMode = _settings.NetworkMode;
-        _draftConnectionId = _settings.ConnectionId;
-        _draftRuleMode = _settings.RuleMode;
         _draftHideBehavior = _settings.HideBehavior;
         _draftOutsideCopies = _settings.OutsideCopies;
         _draftDomainsText = string.Join(Environment.NewLine, _settings.DirectDomains);
-        _draftSelected.Clear();
-        _draftSelected.AddRange(_settings.SelectedAdapters);
         ResetLogDraft();
         ResetUpdateDraft();
 
         OnPropertyChanged(nameof(KillSwitchEnabled));
         OnPropertyChanged(nameof(HideDns));
         OnPropertyChanged(nameof(StartWithWindows));
-        OnPropertyChanged(nameof(NetworkMode));
-        OnPropertyChanged(nameof(IsLauncherMode));
-        OnPropertyChanged(nameof(IsSystemMode));
-        OnPropertyChanged(nameof(DraftConnectionId));
-        OnPropertyChanged(nameof(RuleMode));
         OnPropertyChanged(nameof(HideBehavior));
         OnPropertyChanged(nameof(OutsideCopies));
         OnPropertyChanged(nameof(CommonDomainsText));
-        OnPropertyChanged(nameof(IsAdapterSelectionEnabled));
         OnDraftChanged();
-
-        if (_monitor is not null)
-            SyncAdapters(_monitor.Current);
     }
 
     /// <summary>Применить черновик. false — не применено (что исправить, уже показано).</summary>
@@ -859,21 +682,11 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     {
         if (!HasPendingChanges) return true;
 
-        if (NeedsConnectionSelection)
-        {
-            Section = SettingsSection.Connection;
-            _dialogs.ShowWarning(_settings.Connections.Count == 0
-                    ? "Чтобы приложения шли через подключение лаунчера, сначала добавьте подключение в разделе «Подключения лаунчера»."
-                    : "Выберите подключение, через которое пойдут приложения.",
-                "Подключение не выбрано");
-            return false;
-        }
-
         if (HasUpdateDraftChanges && NeedsUpdateConnectionSelection)
         {
             Section = SettingsSection.Updates;
             _dialogs.ShowWarning(_settings.Connections.Count == 0
-                    ? "Чтобы скачивать обновления через подключение лаунчера, сначала добавьте подключение в разделе «Подключения лаунчера»."
+                    ? "Чтобы скачивать обновления через подключение лаунчера, сначала добавьте подключение в разделе «Подключения»."
                     : "Выберите подключение, через которое скачивать обновления.",
                 "Подключение не выбрано");
             return false;
@@ -890,10 +703,6 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             return false;
 
         var killSwitchChanged = _draftKillSwitch != _settings.KillSwitchEnabled;
-        var ruleChanged = _draftRuleMode != _settings.RuleMode ||
-                          !new HashSet<string>(_draftSelected, StringComparer.OrdinalIgnoreCase).SetEquals(_settings.SelectedAdapters);
-        var modeChanged = _draftNetworkMode != _settings.NetworkMode ||
-                          _draftNetworkMode == GlobalNetworkMode.LauncherConnection && _draftConnectionId != _settings.ConnectionId;
         var hideDnsChanged = _draftHideDns != _settings.HideDns;
         var outsideChanged = _draftOutsideCopies != _settings.OutsideCopies;
         var domainsChanged = DomainsDraftChanged;
@@ -908,10 +717,6 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         _settings.KillSwitchEnabled = _draftKillSwitch;
         _settings.HideDns = _draftHideDns;
         _settings.StartWithWindows = _draftStartWithWindows;
-        _settings.NetworkMode = _draftNetworkMode;
-        if (_draftNetworkMode == GlobalNetworkMode.LauncherConnection)
-            _settings.ConnectionId = _draftConnectionId;
-        _settings.RuleMode = _draftRuleMode;
         _settings.HideBehavior = _draftHideBehavior;
         _settings.OutsideCopies = _draftOutsideCopies;
         if (domainsChanged)
@@ -920,17 +725,13 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             _draftDomainsText = string.Join(Environment.NewLine, _settings.DirectDomains);
             OnPropertyChanged(nameof(CommonDomainsText));
         }
-        _settings.SelectedAdapters = new List<string>(_draftSelected);
         ApplyLogDraft();
         ApplyUpdateDraft();
-        // Сначала общее правило монитора, потом правила приложений: если по новому правилу VPN не подключён, итог по
-        // приложениям (кого закрыл Kill-Switch) сообщается последним.
-        _monitor.SetRule(BuildRule());
         ApplyNetworkSettings();
         UnblockWithoutKillSwitch();
         SaveSettings();
 
-        OnPropertyChanged(nameof(IsKillSwitchOff));
+        OnPropertyChanged(nameof(IsDnsLeakPossible));
         OnDraftChanged();
         RebuildConnections();
 
@@ -952,10 +753,6 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
                 : $"Общие исключения: {_settings.DirectDomains.Count} (напрямую, мимо подключения лаунчера)");
         if (autoStartChanged)
             _log.Add(LogKind.Info, _settings.StartWithWindows ? "Лаунчер будет запускаться вместе с Windows" : "Автозапуск лаунчера выключен");
-        if (modeChanged)
-            _log.Add(LogKind.Info, $"Общее условие запуска: {DescribeGlobal()}");
-        if (ruleChanged)
-            _log.Add(LogKind.Info, $"Новое правило: {DescribeRule()}");
 
         if (killSwitchChanged)
         {
@@ -970,12 +767,10 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         else
         {
             StatusMessage = "Настройки применены";
-            Toast("Настройки применены", _settings.NetworkMode == GlobalNetworkMode.LauncherConnection ? "Общее условие: " + DescribeGlobal() : DescribeRule(),
-                GlyphCheck, ToastKind.Success);
+            Toast("Настройки применены", DescribeMain(), GlyphCheck, ToastKind.Success);
         }
 
-        // Новое правило проверяется сразу; если VPN по нему не подключён, сработает обычная логика обрыва (CheckRuleChange).
-        // Условия запуска, «Защита от утечки DNS» и копии мимо лаунчера тоже действуют сразу, и для работающих приложений:
+        // «Защита от утечки DNS» и копии мимо лаунчера действуют сразу, и для работающих приложений:
         // ядро перезапускается (ApplyNetworkSettings → KeepCoreRunning), фильтры Windows меняются.
         RefreshRunningCounts();
 
@@ -1002,10 +797,10 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
               "Уберите лишние здесь или у приложения.";
     }
 
-    /// <summary>Как сейчас настроено общее условие запуска, словами.</summary>
-    private string DescribeGlobal() => _settings.NetworkMode == GlobalNetworkMode.LauncherConnection
-        ? $"подключение лаунчера «{_settings.Connections.FirstOrDefault(c => c.Id == _settings.ConnectionId)?.Name ?? "не выбрано"}»"
-        : "системный VPN";
+    /// <summary>Основное подключение словами: «Основное подключение «Дом»».</summary>
+    private string DescribeMain() => _settings.Connections.FirstOrDefault(c => c.Id == _settings.ConnectionId) is { } main
+        ? $"Основное подключение «{main.Name}»"
+        : "Основное подключение не выбрано";
 
     /// <summary>Работающие приложения, которых касается изменение.</summary>
     private List<string> AffectedRunningApps(Func<AppEntry, bool> affected)
@@ -1018,13 +813,6 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
     /// <summary>Сетевые условия приложения с учётом разового запуска без сети.</summary>
     private NetworkPlan PlanFor(AppEntry entry) => NetworkPlan.For(entry, _settings, _offlineRuns.Contains(entry.Id));
-
-    private string DescribeRule() => _settings.RuleMode switch
-    {
-        VpnRuleMode.AnyOfSelected => $"VPN: один из выбранных ({_settings.SelectedAdapters.Count})",
-        VpnRuleMode.AllOfSelected => $"VPN: все выбранные ({_settings.SelectedAdapters.Count})",
-        _ => "VPN: любой активный"
-    };
 
     // ---------------------------------------------------------------- VPN и Kill-Switch
 
@@ -1561,9 +1349,20 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         }
     }
 
-    /// <summary>Ответ ядру «чей процесс»: метка приложения через подключение лаунчера, иначе null (напрямую). Любой поток.</summary>
-    private string? ResolveCoreTag(uint pid) =>
-        _tracker.TryGetRoutedOwner((int)pid, out var appId) ? _network.TagFor(appId) : null;
+    /// <summary>
+    /// Ответ ядру «чей процесс»: метка приложения через подключение лаунчера, иначе null (напрямую). Процесс вне задания, который
+    /// лаунчер отнёс к приложению (<see cref="ProcessTracker.TryGetKin"/>): помощник копии, открытой не из лаунчера, или
+    /// программа того же издателя в другой папке получает метку копий, а процесс, запущенный приложением под контролем, но
+    /// вне его задания, — метку приложения. Любой поток.
+    /// </summary>
+    private string? ResolveCoreTag(uint pid)
+    {
+        if (_tracker.TryGetRoutedOwner((int)pid, out var appId))
+            return _network.TagFor(appId);
+        if (!_tracker.TryGetKin((int)pid, out appId, out var launched))
+            return null;
+        return launched ? _network.TagFor(appId) : _network.CopyTagFor(appId);
+    }
 
     /// <summary>Приложения, которые закроются вместе с лаунчером: все работающие (фильтры Windows и ядро действуют, только пока он работает).</summary>
     private List<Guid> AppsClosedOnExit()
@@ -1707,6 +1506,24 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         CloseIfLostDuringLaunch(entry, plan);
     }
 
+    /// <summary>
+    /// Приложение перезапустилось само (например, приложение Microsoft Store после обновления), и лаунчер взял новую
+    /// программу под контроль как тот же запуск. Только в UI-потоке.
+    /// </summary>
+    private void OnAppRestarted(Guid appId, bool contained)
+    {
+        if (_settings.Apps.FirstOrDefault(a => a.Id == appId) is not { } entry)
+            return;
+
+        _dns.NoteLaunch(entry.Id);
+        var plan = PlanFor(entry);
+        var via = plan.UsesLauncherCore ? $" через «{plan.Connection?.Name}»" : plan.Kind == NetworkPlanKind.Offline ? " без сети" : string.Empty;
+        TechLog.Info(LogAreas.App, LogCodes.AppStarted, $"«{entry.Name}» перезапустилось само и осталось под контролем: {DescribeLaunch(entry)}");
+        _log.Add(LogKind.Launch, $"Перезапустилось само (например, после обновления) и осталось под защитой: {entry.Name}{via}" +
+                                 (contained ? string.Empty : " · контроль неполный"));
+        CloseIfLostDuringLaunch(entry, plan);
+    }
+
     /// <summary>«Через лаунчер»: копию открыли не из лаунчера, когда приложение запускать нельзя, и она закрыта.</summary>
     private void OnOutsideRejected(string name, string reason)
     {
@@ -1735,172 +1552,10 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         VpnDetailsText = snapshot.ActiveVpnNames.Count > 0
             ? $"{snapshot.Explanation}: {string.Join(", ", snapshot.ActiveVpnNames)}"
             : snapshot.Explanation;
-        RememberAdapters(snapshot);
-        SyncAdapters(snapshot);
         RefreshStatus();
     }
 
     private VpnRule BuildRule() => new(_settings.RuleMode, _settings.SelectedAdapters);
-
-    private KnownAdapter? FindKnown(string name) =>
-        _settings.KnownAdapters.FirstOrDefault(k => string.Equals(k.Name, name, StringComparison.OrdinalIgnoreCase));
-
-    private bool IsSelectedAnywhere(string name) =>
-        _draftSelected.Contains(name, StringComparer.OrdinalIgnoreCase) ||
-        _settings.SelectedAdapters.Contains(name, StringComparer.OrdinalIgnoreCase);
-
-    /// <summary>Показывать ли адаптер в списках: VPN, выбранные, а при «Показывать все адаптеры» — все.</summary>
-    private bool IsListed(string name, bool isVpnLike) => ShowAllAdapters || isVpnLike || IsSelectedAnywhere(name);
-
-    /// <summary>
-    /// Запоминаем каждый замеченный адаптер, который попадает в список. Монитор присылает снимок при любом
-    /// изменении набора адаптеров, поэтому ловятся и те, что существуют только пока VPN подключён.
-    /// </summary>
-    private void RememberAdapters(VpnSnapshot snapshot)
-    {
-        var changed = false;
-        foreach (var a in snapshot.Adapters)
-        {
-            if (!IsListed(a.Name, a.IsVpnLike)) continue;
-
-            var known = FindKnown(a.Name);
-            if (known is null)
-            {
-                _settings.KnownAdapters.Add(new KnownAdapter { Name = a.Name, Description = a.Description, Product = a.Product, IsVpnLike = a.IsVpnLike });
-                changed = true;
-            }
-            else if (known.Description != a.Description || known.Product != a.Product || known.IsVpnLike != a.IsVpnLike)
-            {
-                known.Description = a.Description;
-                known.Product = a.Product;
-                known.IsVpnLike = a.IsVpnLike;
-                changed = true;
-            }
-        }
-
-        if (changed)
-            SaveSettings();
-    }
-
-    private readonly record struct AdapterRow(string Name, string Description, string Product, bool IsVpnLike, bool IsUp);
-
-    /// <summary>
-    /// Раскладывает адаптеры по трём группам и обновляет списки на месте: существующие строки не пересоздаются,
-    /// поэтому переключатели не перерисовываются и не дёргаются, а новые строки просто добавляются.
-    /// </summary>
-    private void SyncAdapters(VpnSnapshot snapshot)
-    {
-        // Основная группа: похожие на VPN и уже выбранные в действующих правилах.
-        // Отметка в черновике группу не меняет, чтобы строка не «прыгала» сразу после клика.
-        bool IsPrimary(string name, bool isVpnLike) =>
-            isVpnLike || _settings.SelectedAdapters.Contains(name, StringComparer.OrdinalIgnoreCase);
-
-        var present = snapshot.Adapters
-            .Select(a => new AdapterRow(a.Name, a.Description, a.Product, a.IsVpnLike, a.IsUp))
-            .ToList();
-
-        var presentNames = new HashSet<string>(snapshot.Adapters.Select(a => a.Name), StringComparer.OrdinalIgnoreCase);
-        var removed = _settings.KnownAdapters
-            .Where(k => !presentNames.Contains(k.Name) && IsListed(k.Name, k.IsVpnLike))
-            .OrderBy(k => k.Product, StringComparer.CurrentCultureIgnoreCase)
-            .Select(k => new AdapterRow(k.Name, k.Description, k.Product, k.IsVpnLike, false))
-            .ToList();
-
-        SyncList(Adapters, present.Where(r => IsPrimary(r.Name, r.IsVpnLike)).ToList(), isPresent: true);
-        SyncList(OtherAdapters, present.Where(r => !IsPrimary(r.Name, r.IsVpnLike)).ToList(), isPresent: true);
-        SyncList(RemovedAdapters, removed, isPresent: false);
-
-        OnPropertyChanged(nameof(HasOtherAdapters));
-        OnPropertyChanged(nameof(OtherToggleText));
-        OnPropertyChanged(nameof(HasRemovedAdapters));
-        OnPropertyChanged(nameof(RemovedToggleText));
-    }
-
-    /// <summary>
-    /// «Обновить список адаптеров». Список обновляется сразу, поэтому значок кнопки делает хотя бы один оборот: видно,
-    /// что нажатие сработало. Потом кнопку можно нажать снова.
-    /// </summary>
-    private async void RefreshAdapters()
-    {
-        if (IsRefreshingAdapters)
-            return;
-        IsRefreshingAdapters = true;
-        try
-        {
-            var started = Stopwatch.StartNew();
-            ApplySnapshot(_monitor!.Evaluate());
-            var rest = 600 - (int)started.ElapsedMilliseconds;
-            if (rest > 0)
-                await Task.Delay(rest);
-        }
-        finally
-        {
-            IsRefreshingAdapters = false;
-        }
-    }
-
-    private void SyncList(ObservableCollection<VpnAdapterViewModel> target, List<AdapterRow> rows, bool isPresent)
-    {
-        static bool Same(string a, string b) => string.Equals(a, b, StringComparison.OrdinalIgnoreCase);
-
-        for (var i = target.Count - 1; i >= 0; i--)
-        {
-            if (!rows.Any(r => Same(r.Name, target[i].Name)))
-                target.RemoveAt(i);
-        }
-
-        for (var i = 0; i < rows.Count; i++)
-        {
-            var r = rows[i];
-            var selected = _draftSelected.Contains(r.Name, StringComparer.OrdinalIgnoreCase);
-
-            var index = -1;
-            for (var j = i; j < target.Count; j++)
-            {
-                if (Same(target[j].Name, r.Name)) { index = j; break; }
-            }
-
-            if (index < 0)
-            {
-                target.Insert(i, new VpnAdapterViewModel(r.Name, r.Description, r.Product, r.IsVpnLike, r.IsUp, isPresent,
-                    selected, OnAdapterSelectionChanged, isPresent ? null : ForgetAdapter));
-                continue;
-            }
-
-            if (index != i)
-                target.Move(index, i);
-
-            var vm = target[i];
-            vm.IsUp = r.IsUp;
-            vm.Description = r.Description;
-            vm.Product = r.Product;
-            vm.SetSelectedSilently(selected);
-        }
-    }
-
-    private void OnAdapterSelectionChanged(VpnAdapterViewModel adapter)
-    {
-        _draftSelected.RemoveAll(n => string.Equals(n, adapter.Name, StringComparison.OrdinalIgnoreCase));
-        if (adapter.IsSelected)
-            _draftSelected.Add(adapter.Name);
-
-        OnDraftChanged();
-    }
-
-    /// <summary>Убрать адаптер из списка «удалённых». Если он появится снова, лаунчер запомнит его заново.</summary>
-    private void ForgetAdapter(VpnAdapterViewModel adapter)
-    {
-        _settings.KnownAdapters.RemoveAll(k => string.Equals(k.Name, adapter.Name, StringComparison.OrdinalIgnoreCase));
-        SaveSettings();
-
-        // Был выбран в правилах: из черновика тоже убираем, в силу это вступит по «Применить».
-        _draftSelected.RemoveAll(n => string.Equals(n, adapter.Name, StringComparison.OrdinalIgnoreCase));
-        OnDraftChanged();
-
-        SyncAdapters(_monitor.Current);
-        if (RemovedAdapters.Count == 0)
-            IsRemovedExpanded = false;
-    }
 
     // ---------------------------------------------------------------- приложения
 
@@ -1982,7 +1637,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
     /// <summary>
     /// Файлы, перетащенные в окно (или программа, выбранная в проводнике в «Добавить приложение»). Один — открываем его страницу, чтобы
-    /// сразу выбрать условие запуска; несколько — добавляем «как в общих», настроить можно потом.
+    /// сразу выбрать условие запуска; несколько — добавляем с основным подключением, настроить можно потом.
     /// </summary>
     public void AddFromPaths(IEnumerable<string> paths)
     {
@@ -2910,40 +2565,32 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
 
         foreach (var item in Connections)
         {
-            var isDefault = _settings.NetworkMode == GlobalNetworkMode.LauncherConnection && _settings.ConnectionId == item.Id;
             var users = _settings.Apps
                 .Where(a => NetworkPlan.For(a, _settings).Connection?.Id == item.Id)
                 .Select(a => a.Name)
                 .ToList();
-            item.IsDefault = isDefault;
-            item.UsedBy = (isDefault ? "Основное" : string.Empty) +
-                          (users.Count > 0 ? (isDefault ? " · " : string.Empty) + string.Join(", ", users)
-                              : isDefault ? string.Empty : "Не используется");
+            item.IsDefault = _settings.NetworkMode == GlobalNetworkMode.LauncherConnection && _settings.ConnectionId == item.Id;
+            item.UsedBy = users.Count > 0 ? "Приложения: " + string.Join(", ", users) : "Не используется";
         }
 
         OnPropertyChanged(nameof(HasConnections));
-        OnPropertyChanged(nameof(NeedsConnectionSelection));
+        OnPropertyChanged(nameof(NeedsMainConnection));
         AppPage?.SyncConnections(Connections);
     }
 
-    /// <summary>Сохранить новое подключение. makeDefault — сделать его общим (мастер первого запуска).</summary>
+    /// <summary>
+    /// Сохранить новое подключение. Оно становится основным, если основного нет (первое подключение или основное удалили)
+    /// или makeDefault (мастер первого запуска).
+    /// </summary>
     private Task AddConnectionAsync(VpnConnection connection, bool makeDefault)
     {
         connection.Name = ConnectionFactory.UniqueName(connection.Name, _settings.Connections);
         _settings.Connections.Add(connection);
 
-        if (makeDefault)
+        if (makeDefault || _settings.Connections.All(c => c.Id != _settings.ConnectionId))
         {
             _settings.NetworkMode = GlobalNetworkMode.LauncherConnection;
             _settings.ConnectionId = connection.Id;
-            ResetDraft();
-        }
-        else if (_settings.Connections.Count == 1 && _draftConnectionId is null)
-        {
-            // Первое подключение: сразу предлагаем его в общем выборе (вступит в силу по «Применить»).
-            _draftConnectionId = connection.Id;
-            OnPropertyChanged(nameof(DraftConnectionId));
-            OnDraftChanged();
         }
 
         SaveSettings();
@@ -2984,6 +2631,22 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         // Строки ядра проверки (через что ушли соединения) пишет технический журнал (ConnectionTester).
     }
 
+    void IConnectionActions.MakeDefault(ConnectionItemViewModel item)
+    {
+        if (_settings.ConnectionId == item.Id)
+            return;
+
+        // Действует сразу, и для работающих приложений: ядро перезапускается с новым маршрутом (ApplyNetworkSettings).
+        _settings.NetworkMode = GlobalNetworkMode.LauncherConnection;
+        _settings.ConnectionId = item.Id;
+        SaveSettings();
+        ApplyNetworkSettings();
+        RebuildConnections();
+        RefreshRunningCounts();
+        _log.Add(LogKind.Info, $"Основное подключение: «{item.Name}»");
+        Toast("Основное подключение", item.Name, GlyphCheck, ToastKind.Success);
+    }
+
     void IConnectionActions.Rename(ConnectionItemViewModel item, string name)
     {
         var old = item.Name;
@@ -3016,6 +2679,8 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         var message = users.Count > 0
             ? $"Им пользуются: {string.Join(", ", users.Select(a => a.Name))}. Они не запустятся, пока им не выберут другое подключение."
             : "Ссылка или подписка будут удалены из лаунчера.";
+        if (_settings.ConnectionId == id && _settings.Connections.Count > 1)
+            message += " Это основное подключение: потом сделайте основным другое.";
         if (!_dialogs.Confirm($"Удалить «{item.Name}»?", message, "Удалить", destructive: true))
             return;
 
@@ -3024,11 +2689,6 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             app.Network.ConnectionId = null;
         if (_settings.ConnectionId == id)
             _settings.ConnectionId = null;
-        if (_draftConnectionId == id)
-        {
-            _draftConnectionId = _settings.ConnectionId;
-            OnPropertyChanged(nameof(DraftConnectionId));
-        }
 
         if (_draftUpdateConnectionId == id)
         {
@@ -3093,7 +2753,7 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             return;
 
         var add = new AddConnectionViewModel(() => _settings.Connections, c => AddConnectionAsync(c, makeDefault: false), _dialogs);
-        AppPage = new AppSettingsViewModel(entry, isNew, _settings, icon, AdapterOptions(), Connections, add, _dialogs,
+        AppPage = new AppSettingsViewModel(entry, isNew, _settings, icon, Connections, add,
             page => SaveAppPage(page, navigate: true),
             _ =>
             {
@@ -3111,31 +2771,10 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         AppPage = null;
     }
 
-    /// <summary>Адаптеры для «Свои адаптеры»: похожие на VPN, которые есть сейчас, и те, что лаунчер уже видел.</summary>
-    private List<(string Name, string Product, string Details, bool IsUp)> AdapterOptions()
-    {
-        var result = new List<(string, string, string, bool)>();
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var a in _monitor.Current.Adapters.Where(a => a.IsVpnLike))
-        {
-            if (seen.Add(a.Name))
-                result.Add((a.Name, a.Product, string.Equals(a.Name, a.Description, StringComparison.OrdinalIgnoreCase) ? a.Name : $"{a.Name} · {a.Description}", a.IsUp));
-        }
-
-        foreach (var k in _settings.KnownAdapters.Where(k => k.IsVpnLike))
-        {
-            if (seen.Add(k.Name))
-                result.Add((k.Name, k.Product, "нет в системе", false));
-        }
-
-        return result;
-    }
-
     /// <summary>«Сохранить» на странице приложения (для нового — «Добавить»). Черновик уже проверен.</summary>
     private void SaveAppPage(AppSettingsViewModel page, bool navigate)
     {
         var entry = page.Entry;
-        var wasTracking = entry.TrackDns;
         var oldNetwork = System.Text.Json.JsonSerializer.Serialize(entry.Network);
         page.ApplyTo(entry);
 
@@ -3146,8 +2785,6 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             ApplyNetworkSettings();
             Apps.Add(CreateTile(entry));
             OnPropertyChanged(nameof(HasNoApps));
-            if (entry.TrackDns)
-                _dns.SetTracking(entry.Id, entry.Name, true);
             StatusMessage = $"Добавлено: {entry.Name} → {(entry.IsPackaged ? "Microsoft Store" : entry.ExePath)}";
             Toast("Приложение добавлено", entry.Name, GlyphAdd, ToastKind.Info);
             _log.Add(LogKind.Info, $"Добавлено приложение «{entry.Name}» · {DescribeApp(entry)}");
@@ -3159,13 +2796,6 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
             UnblockWithoutKillSwitch();
             var tile = Apps.FirstOrDefault(t => t.Entry == entry);
             tile?.RefreshName();
-            if (wasTracking != entry.TrackDns)
-            {
-                _dns.SetTracking(entry.Id, entry.Name, entry.TrackDns);
-                if (!entry.TrackDns)
-                    _dns.StopIfIdle();
-                _log.Add(LogKind.Info, $"Журнал DNS {(entry.TrackDns ? "включён" : "выключен")}: {entry.Name}");
-            }
 
             var networkChanged = oldNetwork != System.Text.Json.JsonSerializer.Serialize(entry.Network);
             if (networkChanged)
@@ -3198,9 +2828,8 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
     private string DescribeApp(AppEntry entry) => entry.Network.Mode switch
     {
         AppNetworkMode.OwnConnection => $"своё подключение «{_settings.Connections.FirstOrDefault(c => c.Id == entry.Network.ConnectionId)?.Name}»",
-        AppNetworkMode.OwnAdapters => $"свои адаптеры, {AppSettingsViewModel.DescribeRule(entry.Network.RuleMode, entry.Network.SelectedAdapters.Count)}",
         AppNetworkMode.Offline => "без сети",
-        _ => "как в общих"
+        _ => "основное подключение"
     } + entry.Network.OutsideCopies switch
     {
         OutsideCopiesOverride.Vpn => ", если открыто не из лаунчера: через VPN",
@@ -3210,6 +2839,44 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         _ => string.Empty
     };
 
+    /// <summary>
+    /// Системного VPN в лаунчере больше нет, и загрузка перевела настройки на основное подключение: один раз сказать, какие
+    /// приложения теперь идут через него. Без подключений такие приложения не запустятся: открываем раздел «Подключения».
+    /// </summary>
+    internal void ReportSystemVpnRemoved()
+    {
+        if (_movedFromSystemVpn is not { } moved)
+            return;
+        _movedFromSystemVpn = null;
+
+        var main = _settings.Connections.FirstOrDefault(c => c.Id == _settings.ConnectionId);
+        _log.Add(LogKind.Info, "Системного VPN в лаунчере больше нет: " + (main is not null
+            ? $"приложения, которые шли через него, идут через основное подключение «{main.Name}»"
+            : "приложения, которые шли через него, ждут основное подключение") +
+            (moved.Apps.Count > 0 ? $" ({string.Join(", ", moved.Apps)})" : string.Empty));
+        if (moved.Apps.Count == 0)
+            return;
+
+        var apps = string.Join(", ", moved.Apps);
+        if (main is not null)
+        {
+            _dialogs.ShowInfo(
+                "Лаунчер больше не работает с VPN-программами, включёнными на весь компьютер. Приложения, которые шли через " +
+                $"системный VPN ({apps}), теперь идут через основное подключение лаунчера «{main.Name}».\n\n" +
+                "Сделать основным другое подключение можно в настройках, раздел «Подключения». Своё подключение для приложения " +
+                "выбирается в его настройках.",
+                "Системного VPN больше нет");
+            return;
+        }
+
+        OpenSettings(SettingsSection.Connections);
+        _dialogs.ShowWarning(
+            "Лаунчер больше не работает с VPN-программами, включёнными на весь компьютер. Приложения, которые шли через " +
+            $"системный VPN ({apps}), теперь идут через подключение лаунчера, а подключений пока нет, поэтому они не запустятся.\n\n" +
+            "Добавьте ссылку на сервер или адрес подписки от вашего VPN-сервиса.",
+            "Системного VPN больше нет");
+    }
+
     // ---------------------------------------------------------------- мастер первого запуска
 
     private void StartWelcome()
@@ -3217,14 +2884,6 @@ public sealed partial class MainViewModel : ObservableObject, IConnectionActions
         var add = new AddConnectionViewModel(() => _settings.Connections, c => AddConnectionAsync(c, makeDefault: true), _dialogs);
         Welcome = new WelcomeViewModel(add, CheckConnectionAsync,
             new StartMenuListViewModel(_findStartMenuApps, exe => IconExtractor.TryGetIcon(exe), IsAdded),
-            useSystemVpn: () =>
-            {
-                _settings.NetworkMode = GlobalNetworkMode.SystemVpn;
-                SaveSettings();
-                ResetDraft();
-                ApplyNetworkSettings(); // подключение, добавленное на первом шаге, больше не общее
-                RebuildConnections();
-            },
             finish: AddFromStartMenu,
             skip: () => GoBack());
         CurrentPage = MainPage.Welcome;

@@ -49,7 +49,7 @@ public sealed class SettingsStorage
         try
         {
             if (!File.Exists(FilePath))
-                return Migrate(new AppSettings());
+                return Migrate(new AppSettings { KillSwitchEnabled = false }); // новая установка: Kill-Switch по умолчанию выключен
             json = ReadWithRetry();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -66,7 +66,11 @@ public sealed class SettingsStorage
                 TryBackup($".v{settings.SettingsVersion}.bak");
                 settings.WelcomeDone = true; // лаунчером уже пользовались: мастер первого запуска не нужен
             }
-            return Migrate(settings);
+
+            Migrate(settings);
+            if (settings.MovedFromSystemVpn is not null)
+                TryBackup(".system-vpn.bak"); // настройки до перехода с системного VPN
+            return settings;
         }
         catch (Exception)
         {
@@ -91,7 +95,9 @@ public sealed class SettingsStorage
 
     /// <summary>
     /// Приводит настройки к текущему формату. Лаунчер 1.x (версия 0): у всех приложений «Как в общих»,
-    /// в общих — «Системный VPN (адаптеры)» с прежним правилом, запуск только с VPN, как и раньше. Поведение не меняется.
+    /// в общих — «Системный VPN (адаптеры)». Системного VPN в лаунчере больше нет: общее условие становится подключением
+    /// лаунчера (основное — выбранное раньше или первое из списка), «Свои адаптеры» — «Основное подключение». Без подключений
+    /// такие приложения не запускаются, пока его не добавят. Что переведено, сообщает <see cref="AppSettings.MovedFromSystemVpn"/>.
     /// Заодно исправляет то, что могло испортиться при ручной правке файла.
     /// </summary>
     internal static AppSettings Migrate(AppSettings settings)
@@ -122,8 +128,35 @@ public sealed class SettingsStorage
                 connection.SubscriptionUpdateHours = 24;
         }
 
+        MoveFromSystemVpn(settings);
+
         settings.SettingsVersion = Math.Max(settings.SettingsVersion, CurrentVersion);
         return settings;
+    }
+
+    /// <summary>
+    /// Всё, что шло через системный VPN, идёт через основное подключение лаунчера. В файле версии 0 поля NetworkMode нет,
+    /// а там был только системный VPN. Проверка адаптеров в коде пока остаётся, но после этого ею никто не пользуется.
+    /// </summary>
+    private static void MoveFromSystemVpn(AppSettings settings)
+    {
+        var fromSystem = settings.NetworkMode == GlobalNetworkMode.SystemVpn || settings.SettingsVersion == 0 && settings.Apps.Count > 0;
+        var moved = settings.Apps
+            .Where(a => a.Network.Mode == AppNetworkMode.OwnAdapters || fromSystem && a.Network.Mode == AppNetworkMode.Inherit)
+            .ToList();
+        if (!fromSystem && moved.Count == 0)
+            return;
+
+        if (fromSystem)
+        {
+            settings.NetworkMode = GlobalNetworkMode.LauncherConnection;
+            if (settings.Connections.All(c => c.Id != settings.ConnectionId))
+                settings.ConnectionId = settings.Connections.FirstOrDefault()?.Id;
+        }
+
+        foreach (var app in moved)
+            app.Network.Mode = AppNetworkMode.Inherit;
+        settings.MovedFromSystemVpn = new SystemVpnMigration(moved.Select(a => a.Name).ToList());
     }
 
     /// <summary>Файл бывает ненадолго занят антивирусом или синхронизацией: несколько попыток.</summary>

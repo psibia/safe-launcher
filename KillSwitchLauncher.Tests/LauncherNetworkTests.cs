@@ -844,6 +844,9 @@ public class LauncherNetworkTests
         Assert.Equal(0, _processes.Frozen);
         Assert.Equal(CoreAppState.Protected, network.StateOf(a.Id));
         Assert.Equal(CorePlan.AppTag(b.Id), network.TagFor(b.Id));
+        // помощники копии, открытой не из лаунчера, идут как её копии: метка копий того же приложения
+        Assert.Equal(CorePlan.AppTag(b.Id) + "-copy", network.CopyTagFor(b.Id));
+        Assert.Null(network.CopyTagFor(Guid.NewGuid()));
     }
 
     [Fact]

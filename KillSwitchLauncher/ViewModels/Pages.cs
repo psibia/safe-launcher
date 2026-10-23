@@ -22,9 +22,7 @@ public enum MainPage
 /// <summary>Разделы страницы настроек (список слева).</summary>
 public enum SettingsSection
 {
-    Connection,
     Connections,
-    Adapters,
     Protection,
     Exclusions,
     Window,
@@ -38,12 +36,12 @@ public enum SummaryTone
     /// <summary>Ничего не запущено и VPN пока не нужен.</summary>
     Idle,
 
-    /// <summary>Всё запущенное защищено (или системный VPN подключён).</summary>
+    /// <summary>Всё запущенное защищено.</summary>
     Ok,
 
     /// <summary>Сервер не отвечает: приложения ждут сеть.</summary>
     Warn,
 
-    /// <summary>Есть приложения без защиты или системный VPN отключён.</summary>
+    /// <summary>Есть приложения без защиты.</summary>
     Danger
 }
